@@ -68,6 +68,7 @@ import type {
   ManifestAuxiliary,
   ManifestSignatures,
 } from './types.js';
+import type { InvoiceStatus } from '../accounting/types.js';
 
 // Logger tag
 const LOG_TAG = 'Swap';
@@ -1679,17 +1680,11 @@ export class SwapModule {
       return returnFalse();
     }
 
-    // Get invoice status for coverage check
-    const status = await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId) as {
-      state: string;
-      targets: Array<{
-        coinAssets: Array<{
-          coin: [string, string];
-          netCoveredAmount: string;
-          isCovered: boolean;
-        }>;
-      }>;
-    };
+    // Get invoice status for coverage check. Use the canonical `InvoiceStatus`
+    // type from accounting/types.ts rather than an inline structural cast —
+    // keeps this consumer in lockstep with upstream field changes (e.g. the
+    // `surplusAmount` field is required, not optional, per the canonical type).
+    const status = (await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId)) as InvoiceStatus;
 
     // Determine expected currency and amount based on our role
     const myDirectAddress = deps.identity.directAddress;
@@ -1738,7 +1733,15 @@ export class SwapModule {
         swap.updatedAt = Date.now();
         this.clearLocalTimer(swap.swapId);
         this.terminalSwapIds.add(swap.swapId);
-        const entryIdx = this._storedTerminalEntries.length;
+        // Append our terminal-entry marker. We deliberately DO NOT capture a
+        // positional index here for rollback — `_storedTerminalEntries` is
+        // shared across all swaps in this module, and a concurrent swap's
+        // own `transitionProgress(*, terminal)` can append to this same array
+        // during the `await persistSwap()` below. A `splice(entryIdx, 1)`
+        // rollback would then remove the WRONG entry, silently corrupting an
+        // unrelated swap's terminal record. Roll back by `(swapId, progress)`
+        // identity instead — uniquely identifies our marker regardless of
+        // intervening appends.
         this._storedTerminalEntries.push({
           swapId: swap.swapId,
           progress: 'failed',
@@ -1748,13 +1751,34 @@ export class SwapModule {
         try {
           await this.persistSwap(swap);
         } catch (persistErr) {
-          // Storage failed — roll back so next load retries fraud detection.
+          // Storage failure rollback. Note the partial-failure window:
+          // `persistSwap` writes the swap record FIRST then the index. If the
+          // record write succeeded and only the index write failed, the on-disk
+          // record already says `'failed'`; rolling back in-memory creates a
+          // brief in-memory/disk skew until either the index write retries on
+          // next save or the next load picks up the on-disk `'failed'`. The
+          // "next load retries fraud detection" story holds when the
+          // record-write itself failed (the most common case for ENOSPC /
+          // permissions / disk-quota errors); for partial-write failures,
+          // the on-disk state is the source of truth on next load and our
+          // in-memory rollback only restores responsiveness for the current
+          // session.
           swap.progress = prevProgress;
           (swap as { payoutVerified?: boolean }).payoutVerified = prevPayoutVerified;
           (swap as { error?: string }).error = prevError;
           swap.updatedAt = prevUpdatedAt;
           this.terminalSwapIds.delete(swap.swapId);
-          this._storedTerminalEntries.splice(entryIdx, 1);
+          // Remove BY IDENTITY (swapId + progress), not positional index, so a
+          // concurrent swap's terminal entry that landed during the await is
+          // not accidentally evicted. Iterate from the end since our marker
+          // was the most recent push for this swap.
+          for (let i = this._storedTerminalEntries.length - 1; i >= 0; i--) {
+            const entry = this._storedTerminalEntries[i]!;
+            if (entry.swapId === swap.swapId && entry.progress === 'failed') {
+              this._storedTerminalEntries.splice(i, 1);
+              break;
+            }
+          }
           logger.warn(LOG_TAG, `failPayout: persistSwap failed for ${swapId}; fraud detection will retry on next load:`, persistErr);
           throw persistErr;
         }
@@ -1811,8 +1835,52 @@ export class SwapModule {
       return returnFalse();
     }
 
-    if (BigInt(targetStatus.coinAssets[0].netCoveredAmount) < BigInt(expectedAmount)) {
+    // Coverage equality check (exact-amount enforcement).
+    //
+    // The accounting layer permits the payout invoice to receive more than the
+    // requested amount (`netCoveredAmount > expectedAmount`) — surplus is tracked
+    // per-payer and refunded by the SDK's auto-return mechanism on closeInvoice.
+    // For *swap settlement*, however, over-coverage indicates one of:
+    //   (a) the escrow paid out twice for the same swap (e.g., a crash-mid-conclude
+    //       race in which crash-recovery's `_resumePayouts` re-issued payInvoice
+    //       because the SDK's provisional ledger entry had not yet been flushed);
+    //   (b) a malicious or buggy third party deposited into the same payout invoice;
+    //   (c) some other settlement-layer fault.
+    // In all three cases the swap should NOT silently complete — the surplus must be
+    // returned (auto-return on the receiver) and the swap explicitly failed so the
+    // application layer can recover with a clear reason. Without this check, the
+    // swap would either continue with `verified=true` (accepting an invalid token
+    // mix that subsequent state transitions would reject) or hang for the trader's
+    // verifyPayout retry budget while `validate()` repeatedly rejects an unrelated
+    // wallet token, producing a 20-min opaque hang instead of a clear failure.
+    // Parse defensively: a malformed `netCoveredAmount` (non-numeric, undefined,
+    // or NaN-like) from a buggy/compromised accounting backend would synchronously
+    // throw `TypeError`/`SyntaxError` from BigInt(). That escapes the gate and is
+    // swallowed by the auto-verify catch, surfacing as an opaque error rather than
+    // a structured SphereError. Treat parse failures as a settlement-layer fault —
+    // consistent with the rest of the over-coverage rationale below.
+    let netCoveredAmount: bigint;
+    let expectedAmountBigInt: bigint;
+    try {
+      netCoveredAmount = BigInt(targetStatus.coinAssets[0].netCoveredAmount);
+      expectedAmountBigInt = BigInt(expectedAmount);
+    } catch (parseErr) {
+      return failPayout(
+        `MALFORMED_AMOUNT: failed to parse coverage amounts (netCoveredAmount=${
+          targetStatus.coinAssets[0].netCoveredAmount
+        }, expectedAmount=${expectedAmount}): ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+      );
+    }
+    if (netCoveredAmount < expectedAmountBigInt) {
+      // Not yet fully covered — keep retrying (transient).
       return returnFalse();
+    }
+    if (netCoveredAmount > expectedAmountBigInt) {
+      // Over-coverage is a settlement fault — fail explicitly.
+      const surplus = netCoveredAmount - expectedAmountBigInt;
+      return failPayout(
+        `OVER_COVERAGE: net=${netCoveredAmount.toString()}, expected=${expectedAmount}, surplus=${surplus.toString()} — surplus refund expected via auto-return; settlement halted`,
+      );
     }
 
     // Verify escrow creator identity
