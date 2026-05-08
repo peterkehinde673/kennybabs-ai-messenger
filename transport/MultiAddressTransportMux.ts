@@ -390,6 +390,20 @@ export class MultiAddressTransportMux {
       }
     } catch (error) {
       this.status = 'error';
+      // Clean up any partial state so a subsequent connect() doesn't
+      // pile a second listener (and a second NostrClient) onto the
+      // first attempt's orphan. Without this, the connect-timeout +
+      // retry path leaks a listener and a half-initialised client per
+      // failed attempt.
+      if (this.connectionListener && this.nostrClient) {
+        try { this.nostrClient.removeConnectionListener(this.connectionListener); } catch { /* ignore */ }
+      }
+      this.connectionListener = null;
+      if (this.nostrClient && !this.usingSharedClient) {
+        try { this.nostrClient.disconnect(); } catch { /* ignore */ }
+      }
+      this.nostrClient = null;
+      this.usingSharedClient = false;
       throw error;
     }
   }
@@ -441,42 +455,52 @@ export class MultiAddressTransportMux {
    * Build the connection listener used by both {@link connect} and
    * {@link rebindToSharedClient}.
    *
-   * Behavioral note (#123 follow-up): when the Mux is sharing a
-   * {@link NostrClient} with the host transport, we deliberately do
-   * NOT emit {@code transport:connected} / {@code transport:reconnecting}
-   * here — the host transport's own listener already emits those for
-   * the same socket event, so emitting again would double-fire the
-   * signal for any consumer wired to both layers. Re-subscribing
-   * after a reconnect IS still our responsibility, since the host
-   * has {@code suppressSubscriptions()}'d its own filters.
+   * Behavioral notes:
+   * - When the Mux is sharing a {@link NostrClient} with the host
+   *   transport (#123), we deliberately do NOT emit
+   *   {@code transport:connected} / {@code transport:reconnecting} here
+   *   — the host transport's own listener already emits those for the
+   *   same socket event. Re-subscribing after a reconnect IS still our
+   *   responsibility, since the host has
+   *   {@code suppressSubscriptions()}'d its own filters.
+   * - Each callback bails out early when the Mux is not in an active
+   *   state ({@code disconnected} / {@code error}). Listeners are
+   *   removed on {@code disconnect()} before the callback can fire,
+   *   so this guard is mainly defense-in-depth against any in-flight
+   *   callback that lands during teardown — but having it at the top
+   *   means we never emit a misleading {@code transport:connected}
+   *   from a Mux that has already torn down.
    */
   private buildConnectionListener(): ConnectionEventListener {
+    const isInactive = (): boolean =>
+      this.status === 'disconnected' || this.status === 'error';
+
     return {
       onConnect: (url) => {
+        if (isInactive()) return;
         logger.debug('Mux', 'Connected to relay:', url);
         if (!this.usingSharedClient) {
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
         }
       },
       onDisconnect: (url, reason) => {
+        // No early-return: a disconnect callback during teardown is
+        // expected and benign; we just log it.
         logger.debug('Mux', 'Disconnected from relay:', url, 'reason:', reason);
       },
       onReconnecting: (url, attempt) => {
+        if (isInactive()) return;
         logger.debug('Mux', 'Reconnecting to relay:', url, 'attempt:', attempt);
         if (!this.usingSharedClient) {
           this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
         }
       },
       onReconnected: (url) => {
+        if (isInactive()) return;
         logger.debug('Mux', 'Reconnected to relay:', url);
         if (!this.usingSharedClient) {
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
         }
-        // Guard against late callbacks after disconnect() — e.g., a
-        // reconnect handshake that landed just after we tore down our
-        // bookkeeping. Without this we'd re-establish subscriptions
-        // on a Mux the caller no longer expects to be live.
-        if (this.status !== 'connected') return;
         // Re-establish subscriptions — the relay drops them on disconnect.
         this.updateSubscriptions().catch((err) => {
           logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
@@ -495,19 +519,39 @@ export class MultiAddressTransportMux {
    * been disconnected by the host, so its server-side subscriptions
    * are gone — we just adopt the new client and re-issue our own.
    *
-   * No-op when this Mux owns its own client (not sharing) or when the
-   * shared client isn't ready yet.
+   * The caller is responsible for ordering: by the time rebind runs,
+   * the host transport's new NostrClient must already be created and
+   * connected. In Sphere this is guaranteed because we await
+   * {@code transport.setIdentity()} before calling rebind.
+   *
+   * Returns silently in two cases that are not caller errors:
+   *   - the Mux owns its own client (not sharing) — nothing to rebind
+   *   - the shared client reference hasn't changed (rebind is a no-op)
+   *
+   * Throws otherwise (rather than silently no-op'ing) so a wiring
+   * mistake — for instance, calling rebind before the host's new
+   * client is ready — surfaces immediately instead of leaving the
+   * Mux pinned to a stale client.
    */
   async rebindToSharedClient(): Promise<void> {
     if (!this.usingSharedClient) return;
     if (!this.sharedNostrClientGetter) return;
 
     const newClient = this.sharedNostrClientGetter();
-    if (!newClient) return;
+    if (!newClient) {
+      throw new SphereError(
+        'rebindToSharedClient: shared client getter returned null. ' +
+        'The host transport must finish (re)creating its NostrClient before rebind is called.',
+        'TRANSPORT_ERROR',
+      );
+    }
     if (this.nostrClient === newClient) return;
     if (!newClient.isConnected()) {
-      logger.debug('Mux', 'rebindToSharedClient: new shared client not yet connected, skipping');
-      return;
+      throw new SphereError(
+        'rebindToSharedClient: new shared client is not connected. ' +
+        'Await transport.setIdentity() / transport.connect() before rebinding.',
+        'TRANSPORT_ERROR',
+      );
     }
 
     // Detach our listener from the old client. It's already been

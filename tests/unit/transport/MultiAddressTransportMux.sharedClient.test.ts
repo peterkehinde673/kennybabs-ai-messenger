@@ -395,6 +395,172 @@ describe('MultiAddressTransportMux shared-NostrClient (#123)', () => {
     expect(NostrClientCtor).toHaveBeenCalledTimes(1);
     expect(mockConnect).not.toHaveBeenCalled(); // Mux did not call connect on the shared client
   });
+
+  it('end-to-end with a real NostrTransportProvider: still exactly one NostrClient ctor call', async () => {
+    // Stronger version of the previous test: instead of stubbing the
+    // host, we instantiate an actual NostrTransportProvider (with the
+    // SDK still mocked at module level), drive it through connect(),
+    // then construct the Mux with the real getNostrClient() accessor.
+    //
+    // This exercises:
+    //   - NostrTransportProvider.getNostrClient() — the accessor I
+    //     added; without it the typeof guard in Sphere.ts silently
+    //     falls through and the Mux opens a second socket.
+    //   - The shared-client wiring as Sphere actually performs it.
+    NostrClientCtor.mockClear();
+
+    const { NostrTransportProvider } = await import('../../../transport/NostrTransportProvider');
+
+    const transport = new NostrTransportProvider({
+      relays: ['wss://relay1.test'],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createWebSocket: (() => {}) as any,
+      timeout: 100,
+      autoReconnect: false,
+    });
+    await transport.connect();
+
+    expect(NostrClientCtor).toHaveBeenCalledTimes(1); // host constructed one
+    expect(typeof transport.getNostrClient).toBe('function'); // accessor exists
+    expect(transport.getNostrClient()).toBeDefined();
+
+    const mux = new MultiAddressTransportMux({
+      relays: ['wss://relay1.test'],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createWebSocket: (() => {}) as any,
+      timeout: 100,
+      autoReconnect: false,
+      sharedNostrClient: () => transport.getNostrClient(),
+    });
+
+    await mux.addAddress(0, TEST_IDENTITY);
+    await mux.connect();
+
+    // Total NostrClient ctor calls across both layers must still be 1.
+    expect(NostrClientCtor).toHaveBeenCalledTimes(1);
+  });
+
+  it('isConnected() reflects shared client losing its connection mid-Mux-life', async () => {
+    // The Mux doesn't observe socket-level lifecycle changes on the
+    // shared client beyond its connection listener. If the host
+    // transport tears down or the underlying socket dies without our
+    // listener firing in time, our internal `status` field stays
+    // `connected` — but isConnected() must still return false because
+    // it ANDs status with the live nostrClient.isConnected() check.
+    const sharedClient = makeStub();
+
+    const mux = new MultiAddressTransportMux({
+      relays: ['wss://relay1.test'],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createWebSocket: (() => {}) as any,
+      timeout: 100,
+      autoReconnect: false,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sharedNostrClient: sharedClient as any,
+    });
+
+    await mux.addAddress(0, TEST_IDENTITY);
+    await mux.connect();
+
+    expect(mux.isConnected()).toBe(true);
+
+    // Shared socket dies under us — host transport hasn't yet called
+    // anything on the Mux.
+    sharedClient.isConnected.mockReturnValue(false);
+
+    expect(mux.isConnected()).toBe(false);
+  });
+
+  it('rebindToSharedClient throws if the shared client getter returns null', async () => {
+    // Wiring contract: by the time rebind is called, the host transport
+    // must have its new NostrClient ready. A null return signals a
+    // caller bug (rebind invoked before transport.setIdentity finished),
+    // and we surface that loudly instead of silently leaving the Mux
+    // pinned to its stale client.
+    let activeClient: ReturnType<typeof makeStub> | null = makeStub();
+
+    const mux = new MultiAddressTransportMux({
+      relays: ['wss://relay1.test'],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createWebSocket: (() => {}) as any,
+      timeout: 100,
+      autoReconnect: false,
+      sharedNostrClient: () => activeClient,
+    });
+
+    await mux.addAddress(0, TEST_IDENTITY);
+    await mux.connect();
+
+    // Simulate "host hasn't (re)built its client yet" at rebind time.
+    activeClient = null;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((mux as any).rebindToSharedClient()).rejects.toThrow(/null|getter/i);
+  });
+
+  it('rebindToSharedClient throws if the new shared client is not connected', async () => {
+    let activeClient = makeStub();
+
+    const mux = new MultiAddressTransportMux({
+      relays: ['wss://relay1.test'],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createWebSocket: (() => {}) as any,
+      timeout: 100,
+      autoReconnect: false,
+      sharedNostrClient: () => activeClient,
+    });
+
+    await mux.addAddress(0, TEST_IDENTITY);
+    await mux.connect();
+
+    // Host has a new client but it hasn't finished connecting.
+    activeClient = makeStub();
+    activeClient.isConnected.mockReturnValue(false);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((mux as any).rebindToSharedClient()).rejects.toThrow(/not connected/i);
+  });
+
+  it('connect() failure cleans up listener and client (no leak across retries)', async () => {
+    // If the inner nostrClient.connect() rejects (e.g., timeout), the
+    // partial state must be torn down so a subsequent retry doesn't
+    // pile a second listener on the orphan or leak a half-initialised
+    // NostrClient.
+    NostrClientCtor.mockClear();
+    mockAddConnectionListener.mockClear();
+
+    // First connect attempt: SDK's connect rejects.
+    mockConnect.mockRejectedValueOnce(new Error('boom'));
+
+    const mux = new MultiAddressTransportMux({
+      relays: ['wss://relay1.test'],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createWebSocket: (() => {}) as any,
+      timeout: 100,
+      autoReconnect: false,
+    });
+
+    await mux.addAddress(0, TEST_IDENTITY);
+    await expect(mux.connect()).rejects.toThrow(/boom/);
+
+    // The listener attached during the failed attempt must have been
+    // removed; the orphan client must have been disconnected.
+    expect(mockAddConnectionListener).toHaveBeenCalledTimes(1);
+    // SDK exposes removeConnectionListener — Mux must have called it.
+    expect(mockRemoveConnectionListener).toHaveBeenCalledTimes(1);
+    // Owned client must be disconnected on failed connect to release the socket.
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
+
+    // Second attempt now works (mockConnect default resolved).
+    await mux.connect();
+
+    // Exactly one listener registered for the second attempt — no
+    // leftover from the first.
+    expect(mockAddConnectionListener).toHaveBeenCalledTimes(2);
+    // Two NostrClient ctor calls total: one for the failed attempt,
+    // one for the successful retry.
+    expect(NostrClientCtor).toHaveBeenCalledTimes(2);
+  });
 });
 
 function makeStub() {
