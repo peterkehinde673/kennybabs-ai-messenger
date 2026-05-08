@@ -24,6 +24,7 @@ import {
   isChatMessage,
   isReadReceipt,
 } from '@unicitylabs/nostr-js-sdk';
+import type { ConnectionEventListener } from '@unicitylabs/nostr-js-sdk';
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
 
@@ -182,6 +183,12 @@ export class MultiAddressTransportMux {
   // True when this Mux is using a shared NostrClient and therefore must
   // not call connect()/disconnect() on it.
   private usingSharedClient = false;
+  // Listener registered on the underlying NostrClient. Tracked so we can
+  // remove it on disconnect / rebind — otherwise a long-lived shared
+  // client accumulates listeners across address switches and (worse)
+  // a "disconnected" Mux still sees onReconnected callbacks fire and
+  // re-establish subscriptions it shouldn't have.
+  private connectionListener: ConnectionEventListener | null = null;
 
   constructor(config: MultiAddressTransportMuxConfig) {
     this.identityPrivateKey = config.identityPrivateKey;
@@ -356,27 +363,8 @@ export class MultiAddressTransportMux {
         });
       }
 
-      this.nostrClient.addConnectionListener({
-        onConnect: (url) => {
-          logger.debug('Mux', 'Connected to relay:', url);
-          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
-        },
-        onDisconnect: (url, reason) => {
-          logger.debug('Mux', 'Disconnected from relay:', url, 'reason:', reason);
-        },
-        onReconnecting: (url, attempt) => {
-          logger.debug('Mux', 'Reconnecting to relay:', url, 'attempt:', attempt);
-          this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
-        },
-        onReconnected: (url) => {
-          logger.debug('Mux', 'Reconnected to relay:', url);
-          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
-          // Re-establish subscriptions — the relay drops them on disconnect.
-          this.updateSubscriptions().catch((err) => {
-            logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
-          });
-        },
-      });
+      this.connectionListener = this.buildConnectionListener();
+      this.nostrClient.addConnectionListener(this.connectionListener);
 
       if (!this.usingSharedClient) {
         await Promise.race([
@@ -423,11 +411,20 @@ export class MultiAddressTransportMux {
       if (this.chatSubscriptionId) {
         try { this.nostrClient.unsubscribe(this.chatSubscriptionId); } catch { /* ignore */ }
       }
+      // Detach our connection listener BEFORE dropping the reference.
+      // For a shared client this is critical — without it the listener
+      // continues firing on every reconnect and would re-establish
+      // subscriptions on a "disconnected" Mux. For an owned client it's
+      // about to be disposed, but removing is cheap and tidy.
+      if (this.connectionListener) {
+        try { this.nostrClient.removeConnectionListener(this.connectionListener); } catch { /* ignore */ }
+      }
       if (!this.usingSharedClient) {
         this.nostrClient.disconnect();
       }
       this.nostrClient = null;
     }
+    this.connectionListener = null;
     this.usingSharedClient = false;
     this.walletSubscriptionId = null;
     this.chatSubscriptionId = null;
@@ -438,6 +435,54 @@ export class MultiAddressTransportMux {
 
   isConnected(): boolean {
     return this.status === 'connected' && this.nostrClient?.isConnected() === true;
+  }
+
+  /**
+   * Build the connection listener used by both {@link connect} and
+   * {@link rebindToSharedClient}.
+   *
+   * Behavioral note (#123 follow-up): when the Mux is sharing a
+   * {@link NostrClient} with the host transport, we deliberately do
+   * NOT emit {@code transport:connected} / {@code transport:reconnecting}
+   * here — the host transport's own listener already emits those for
+   * the same socket event, so emitting again would double-fire the
+   * signal for any consumer wired to both layers. Re-subscribing
+   * after a reconnect IS still our responsibility, since the host
+   * has {@code suppressSubscriptions()}'d its own filters.
+   */
+  private buildConnectionListener(): ConnectionEventListener {
+    return {
+      onConnect: (url) => {
+        logger.debug('Mux', 'Connected to relay:', url);
+        if (!this.usingSharedClient) {
+          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+        }
+      },
+      onDisconnect: (url, reason) => {
+        logger.debug('Mux', 'Disconnected from relay:', url, 'reason:', reason);
+      },
+      onReconnecting: (url, attempt) => {
+        logger.debug('Mux', 'Reconnecting to relay:', url, 'attempt:', attempt);
+        if (!this.usingSharedClient) {
+          this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
+        }
+      },
+      onReconnected: (url) => {
+        logger.debug('Mux', 'Reconnected to relay:', url);
+        if (!this.usingSharedClient) {
+          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+        }
+        // Guard against late callbacks after disconnect() — e.g., a
+        // reconnect handshake that landed just after we tore down our
+        // bookkeeping. Without this we'd re-establish subscriptions
+        // on a Mux the caller no longer expects to be live.
+        if (this.status !== 'connected') return;
+        // Re-establish subscriptions — the relay drops them on disconnect.
+        this.updateSubscriptions().catch((err) => {
+          logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
+        });
+      },
+    };
   }
 
   /**
@@ -465,6 +510,14 @@ export class MultiAddressTransportMux {
       return;
     }
 
+    // Detach our listener from the old client. It's already been
+    // disconnected by the host so it won't fire callbacks anyway, but
+    // removing keeps the SDK's listener list tidy and avoids any
+    // implementation detail where listeners might survive a disconnect.
+    if (this.nostrClient && this.connectionListener && this.nostrClient !== newClient) {
+      try { this.nostrClient.removeConnectionListener(this.connectionListener); } catch { /* ignore */ }
+    }
+
     // Drop stale state. The relay dropped wallet/chat subs when the
     // previous client disconnected, so the IDs are dead — don't try
     // to unsubscribe through the now-disposed client.
@@ -473,26 +526,8 @@ export class MultiAddressTransportMux {
     this.chatSubscriptionId = null;
     this.chatEoseFired = false;
 
-    this.nostrClient.addConnectionListener({
-      onConnect: (url) => {
-        logger.debug('Mux', 'Connected to relay (rebind):', url);
-        this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
-      },
-      onDisconnect: (url, reason) => {
-        logger.debug('Mux', 'Disconnected from relay (rebind):', url, 'reason:', reason);
-      },
-      onReconnecting: (url, attempt) => {
-        logger.debug('Mux', 'Reconnecting (rebind):', url, 'attempt:', attempt);
-        this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
-      },
-      onReconnected: (url) => {
-        logger.debug('Mux', 'Reconnected (rebind):', url);
-        this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
-        this.updateSubscriptions().catch((err) => {
-          logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
-        });
-      },
-    });
+    this.connectionListener = this.buildConnectionListener();
+    this.nostrClient.addConnectionListener(this.connectionListener);
 
     if (this.addresses.size > 0) {
       await this.updateSubscriptions();
