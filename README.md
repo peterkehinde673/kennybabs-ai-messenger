@@ -32,91 +32,19 @@ Choose your platform:
 |----------|-------|----------|----------|
 | **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | IPFS sync (built-in) |
 | **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | IPFS sync (built-in) |
-| **CLI** | See below | SDK + `tsx` | - |
+| **CLI** | [@unicity-sphere/cli](https://github.com/unicity-sphere/sphere-cli) | Separate package | - |
 | **dApp integration** | [CONNECT.md](docs/CONNECT.md) | SDK only | Sphere extension |
 
 ## CLI (Command Line Interface)
 
-The SDK includes a CLI for quick testing and development:
+The CLI has moved to a dedicated package: [`@unicity-sphere/cli`](https://github.com/unicity-sphere/sphere-cli).
 
 ```bash
-# Show help
-npm run cli -- --help
-
-# Initialize new wallet on testnet
-npm run cli -- init --network testnet
-
-# Initialize with nametag (mints token on-chain)
-npm run cli -- init --network testnet --nametag alice
-
-# Import existing wallet
-npm run cli -- init --mnemonic "your 24 words here"
-
-# Check wallet status
-npm run cli -- status
-
-# Check balance
-npm run cli -- balance
-
-# Fetch pending transfers and finalize unconfirmed tokens
-npm run cli -- balance --finalize
-
-# Check for incoming transfers
-npm run cli -- receive
-
-# Check for incoming transfers and finalize unconfirmed tokens
-npm run cli -- receive --finalize
-
-# Send tokens (instant mode, default)
-npm run cli -- send @alice 1 UCT --instant
-
-# Send tokens (conservative mode — collect all proofs first)
-npm run cli -- send @alice 1 UCT --conservative
-
-# Request test tokens from faucet
-npm run cli -- topup
-
-# Register nametag
-npm run cli -- nametag myname
-
-# Show transaction history
-npm run cli -- history 10
-
-# Verify tokens against aggregator (detect spent tokens)
-npm run cli -- verify-balance
+npm install -g @unicity-sphere/cli
+sphere --help
 ```
 
-### Available CLI Commands
-
-| Category | Command | Description |
-|----------|---------|-------------|
-| **Wallet** | `init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]` | Create or import wallet |
-| | `status` | Show wallet identity |
-| | `config` | Show/set configuration |
-| **Profiles** | `wallet list` | List all wallet profiles |
-| | `wallet use <name>` | Switch to a wallet profile |
-| | `wallet create <name> [--network <net>]` | Create a new wallet profile |
-| | `wallet delete <name>` | Delete a wallet profile |
-| | `wallet current` | Show current wallet profile |
-| **Balance** | `balance [--finalize]` | Show L3 token balance (--finalize: fetch pending + resolve) |
-| | `tokens` | List all tokens with details |
-| | `l1-balance` | Show L1 (ALPHA) balance |
-| | `topup [<amount> <symbol>]` | Request test tokens from faucet |
-| | `verify-balance [--remove] [-v]` | Verify tokens against aggregator |
-| **Transfers** | `send <to> <amount> <symbol> [--instant\|--conservative]` | Send tokens |
-| | `receive [--finalize]` | Check for incoming transfers |
-| | `history [limit]` | Show transaction history |
-| **Nametags** | `nametag <name>` | Register a nametag |
-| | `nametag-info <name>` | Lookup nametag info |
-| | `my-nametag` | Show current nametag |
-| | `nametag-sync` | Re-publish nametag with chainPubkey |
-| **Utils** | `generate-key` | Generate random key |
-| | `to-human <amount>` | Convert to human readable |
-| | `parse-wallet <file>` | Parse wallet file |
-
-CLI data is stored in `./.sphere-cli/` directory.
-
-> **Shell completion:** Run `npm link && sphere-cli completions bash >> ~/.bashrc` for tab-completion of all commands. See [CLI Quickstart](docs/QUICKSTART-CLI.md) for details.
+See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md) for the full command reference.
 
 ## Quick Start
 
@@ -229,6 +157,64 @@ sphere.setPriceProvider(createPriceProvider({
   platform: 'coingecko',
   apiKey: 'CG-xxx',
 }));
+```
+
+## Building a Sphere-authenticated backend
+
+If your service needs to authenticate users via their Sphere wallet, use `verifySphereAuth`. It performs signature verification and identity derivation in one misuse-resistant call.
+
+```typescript
+import { randomBytes } from 'crypto';
+import { verifySphereAuth, AuthVerificationError } from '@unicitylabs/sphere-sdk';
+
+const challenges = new Map<string, { challenge: string; expiresAt: number }>();
+
+// POST /auth/challenge — issue a one-shot nonce challenge
+server.post('/auth/challenge', async (req) => {
+  const { chainPubkey } = req.body;
+  const nonce = randomBytes(16).toString('hex');
+  const challenge = `Sign in to MyApp\nPubkey: ${chainPubkey}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`;
+  challenges.set(chainPubkey, { challenge, expiresAt: Date.now() + 5 * 60_000 });
+  return { challenge };
+});
+
+// POST /auth/verify — turn a signed challenge into a session
+server.post('/auth/verify', async (req, reply) => {
+  const { chainPubkey, signature } = req.body;
+  const stored = challenges.get(chainPubkey);
+  if (!stored || Date.now() > stored.expiresAt) {
+    return reply.status(401).send({ error: 'No valid challenge — request a new one' });
+  }
+  challenges.delete(chainPubkey); // one-shot
+
+  try {
+    const { chainPubkey: pk, directAddress } = await verifySphereAuth({
+      challenge: stored.challenge,
+      signature,
+      chainPubkey,
+    });
+    // pk and directAddress are now safe to use as user identifiers —
+    // neither is a client claim, both are derived from cryptographic proof.
+    const token = server.jwt.sign({ sub: pk, addr: directAddress }, { expiresIn: '24h' });
+    return { token };
+  } catch (err) {
+    if (err instanceof AuthVerificationError) {
+      return reply.status(401).send({ error: err.message, code: err.code });
+    }
+    throw err;
+  }
+});
+```
+
+### Why not accept `directAddress` from the client?
+
+`verifySphereAuth` deliberately does not take a `directAddress` parameter. The signature proves that the client owns the privkey to the pubkey they presented — but it does NOT prove that the pubkey corresponds to any particular `directAddress`. If you accept `directAddress` as a separate body field and use it as the user-identifier key, an attacker can pre-bind any unregistered address to their own pubkey — locking the rightful owner out forever. `verifySphereAuth` derives `directAddress` from `chainPubkey` server-side instead, eliminating the bug class.
+
+If you need just the address derivation in a custom flow, use the primitive directly:
+
+```typescript
+import { computeDirectAddressFromChainPubkey } from '@unicitylabs/sphere-sdk';
+const addr = await computeDirectAddressFromChainPubkey(chainPubkey);
 ```
 
 ## Testnet Faucet
