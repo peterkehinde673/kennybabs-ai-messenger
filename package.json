@@ -127,7 +127,8 @@
     "buffer": "^6.0.3",
     "canonicalize": "^3.0.0",
     "crypto-js": "^4.2.0",
-    "elliptic": "^6.6.1"
+    "elliptic": "^6.6.1",
+    "state-transition-sdk-v2": "npm:@unicitylabs/state-transition-sdk@^2.0.0-rc.6027e82"
   },
   "optionalDependencies": {
     "@libp2p/crypto": "^5.1.13",
@@ -183,6 +184,6 @@
     }
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   }
 }

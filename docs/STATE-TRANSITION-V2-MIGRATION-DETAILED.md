@@ -16,86 +16,80 @@
 ## Part A — Token Engine: contract & internals
 
 ### A.1 Supporting DTOs (sphere-domain; no v2 type leaks out of `token-engine/`)
+> **FROZEN in Phase 0** — source of truth is `token-engine/types.ts` (this listing mirrors it).
+> The public surface is sphere-domain only: `Uint8Array` pubkeys, `string` coin ids, `bigint` amounts.
+> The SDK has exactly ONE foothold — `SphereToken.sdkToken`, an **opaque handle** callers never touch
+> (they can't: the ESLint boundary forbids them importing the SDK, so they have no way to call its methods).
+> SDK-typed params (`IPredicate`, `NetworkId`, `TokenType`, `TokenSalt`, `CertificationData`, …) are **internal**
+> to the adapter (see A.2 "granular steps"), not part of the public DTOs.
 ```ts
-/** Engine identity = the wallet's secp256k1 pubkey. The private key is held inside the wrapper, never in a DTO. */
-interface EngineIdentity { chainPubkey: Uint8Array; }            // 33-byte compressed
+/** Engine identity = the wallet's secp256k1 pubkey. The private key is held inside the engine, never in a DTO. */
+interface EngineIdentity { readonly chainPubkey: Uint8Array; }   // 33-byte compressed
 
-/** Recipient = a predicate (v2 has NO "address"). = EncodedPredicate(SignaturePredicate(pubkey)); pure fn of chainPubkey; never published. */
-type ReceivePredicate = EncodedPredicate;
+/** Which Unicity network; maps to SDK NetworkId inside the engine. */
+type SphereNetwork = 'mainnet' | 'testnet' | 'local';
 
-/** Coin id = hex of v2 AssetId. registry.normalizeCoinId resolves symbols ↔ hex. */
+/** Coin id = lowercase hex of v2 AssetId. registry resolves symbols ↔ hex. */
 type CoinId = string;
 
-/** Sphere fungible value, implements v2 IPaymentData; encoded into MintTransaction.data. */
-interface SpherePaymentData extends IPaymentData {
-  assets: PaymentAssetCollection;                                // Asset(AssetId, bigint)[]
-  encode(): Promise<Uint8Array>;                                 // versioned, deterministic CBOR
+/** Decoded, app-defined value carried by a token (v2 Token itself is value-less). */
+interface SphereAsset { readonly coinId: CoinId; readonly amount: bigint; }
+interface SphereValue { readonly assets: readonly SphereAsset[]; }
+
+/** Serializable token form for storage/transport (value is re-derivable, so not stored). */
+interface TokenBlob {
+  readonly v: number;                                            // sphere blob format version
+  readonly network: number;                                      // NetworkId.id (1/2/3)
+  readonly token: Uint8Array;                                    // Token.toCBOR()
 }
 
-/** Storage/UI token = v2 Token + cached blob + decoded value. */
+/** A wallet token. `sdkToken` is the OPAQUE engine handle — never touched by callers. */
 interface SphereToken {
-  sdkToken: Token;                                               // v2 SDK Token (CBOR)
-  blob: TokenBlob;                                               // see Part D
-  owner: ReceivePredicate;                                       // latestTransaction.recipient
-  paymentData: SpherePaymentData | null;
+  readonly sdkToken: Token;                                      // opaque v2 handle (engine-only)
+  readonly blob: TokenBlob;
+  readonly value: SphereValue | null;                            // decoded value (cached)
 }
 
-interface MintParams {
-  networkId: NetworkId;                                          // MAINNET=1/TESTNET=2/LOCAL=3
-  recipient: IPredicate;                                         // SignaturePredicate(recipientChainPubkey)
-  data?: Uint8Array | null;                                     // = await SpherePaymentData.encode()
-  tokenType?: TokenType;                                        // default TokenType.generate()
-  salt?: TokenSalt;                                             // default TokenSalt.generate(); derives tokenId
-  justification?: Uint8Array | null;                           // e.g. SplitMintJustification.toCBOR()
-}
+interface MintParams      { readonly recipientPubkey: Uint8Array; readonly value?: SphereValue | null; }   // issuer/developer mint (app issues tokens to users)
+interface TransferParams  { readonly token: SphereToken; readonly recipientPubkey: Uint8Array; }
+interface SplitOutput     { readonly recipientPubkey: Uint8Array; readonly coinId: CoinId; readonly amount: bigint; }
+interface SplitParams     { readonly token: SphereToken; readonly outputs: readonly SplitOutput[]; }
 
-interface TransferParams {
-  token: SphereToken;
-  recipient: IPredicate;                                         // from recipient chainPubkey
-  stateMask?: Uint8Array;                                       // default random 32B (privacy/uniqueness)
-  data?: Uint8Array | null;
-}
-
-interface SplitParams {
-  token: SphereToken;
-  outputs: Array<{ recipient: IPredicate; coinId: CoinId; amount: bigint }>;
-  decodePaymentData: (bytes: Uint8Array) => Promise<IPaymentData>;   // = SpherePaymentData.fromCBOR
-}
-
-interface PreparedTransfer { transaction: ITransaction; stateId: StateId; certificationData: CertificationData; }
-interface SubmittedTransfer { stateId: StateId; status: CertificationStatus; submittedAt: number; }
-interface SplitResult { burn: { predicate: BurnPredicate; transaction: TransferTransaction }; outputs: SphereToken[]; }
-interface EngineVerifyResult { ok: boolean; status: VerificationStatus; error?: string; details?: VerificationResult<unknown>; }
-type TokenBlob = { /* Part D */ };
-type EngineError = SphereErrorCode;
+interface SplitResult        { readonly outputs: readonly SphereToken[]; }   // one minted token per output, in order
+interface EngineVerifyResult { readonly ok: boolean; readonly reason?: string; }   // SDK VerificationStatus flattened
+interface EngineOpOptions    { readonly signal?: AbortSignal; }              // cancels long ops incl. proof polling
 ```
 
 ### A.2 `ITokenEngine` — two layers
-**Façade** (what callers use — most code only needs these):
+**Public façade** — FROZEN in Phase 0; source of truth `token-engine/engine.ts`. This is the ONLY surface
+callers (Track B) and `FakeTokenEngine` implement. Network / aggregator / signing key / trust base are bound at
+construction (`EngineConfig`), so operations take sphere-domain args only:
 ```ts
 interface ITokenEngine {
-  // identity / recipients
+  // identity
   getIdentity(): EngineIdentity;                                       // sync
-  deriveIdentityAddress(identity?: EngineIdentity): string;            // sync — legacy DIRECT:// (Path A); the ONLY "address"
-  deriveReceivePredicate(pubkey: Uint8Array): ReceivePredicate;        // sync — pure fn of chainPubkey
-  // value
-  readPaymentData(token: SphereToken): SpherePaymentData | null;       // sync (uses cached or decodes)
+  deriveIdentityAddress(pubkey?: Uint8Array): string;                  // sync — legacy DIRECT:// (Path A); the ONLY "address"
+  // value (read)
+  readValue(token: SphereToken): SphereValue | null;                   // sync
   balanceOf(token: SphereToken, coinId: CoinId): bigint;               // sync
-  // lifecycle (sender-driven)
-  mint(params: MintParams): Promise<SphereToken>;                      // build→submit→wait→certify→Token.mint
-  transfer(params: TransferParams): Promise<SphereToken>;             // build→sign→submit→wait→certify→token.transfer
-  split(params: SplitParams): Promise<SplitResult>;                   // TokenSplit.split + per-output mint
-  verify(token: SphereToken): Promise<EngineVerifyResult>;
-  isSpent(token: SphereToken): Promise<boolean>;
+  // lifecycle (sender-driven: build→submit→wait→certify→realize)
+  mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken>;     // issuer/developer: app issues tokens to users (NOT a wallet end-user flow)
+  transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken>;
+  split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult>;   // burn source + internally mint each output
+  // verification
+  verify(token: SphereToken, options?: EngineOpOptions): Promise<EngineVerifyResult>;
+  isSpent(token: SphereToken, options?: EngineOpOptions): Promise<boolean>;
   // serialization
   encodeToken(token: SphereToken): TokenBlob;                          // sync — Token.toCBOR + header
   decodeToken(blob: TokenBlob): Promise<SphereToken>;                  // Token.fromCBOR + decodePaymentData
 }
+// construction: createSphereTokenEngine(config: EngineConfig): Promise<ITokenEngine>   // Track A
 ```
-**Granular steps** (internal + split/background/recovery; same interface, additional methods):
+**Granular steps — INTERNAL to the adapter** (Track A only; NOT on the public port). These take/return SDK
+types and stay inside `token-engine/`. `mint`/`transfer`/`split` compose them; split/recovery reuse them:
 ```ts
-  buildMint(p: MintParams): Promise<MintTransaction>;                  // MintTransaction.create(networkId, recipient, data, tokenType, salt, justification)
-  buildTransfer(p: TransferParams): Promise<TransferTransaction>;      // TransferTransaction.create(token.sdkToken, recipient, stateMask, data)
+  buildMint(recipient: IPredicate, data: Uint8Array|null, tokenType?, salt?, justification?): Promise<MintTransaction>;   // MintTransaction.create(networkId, recipient, data, tokenType, salt, justification)
+  buildTransfer(token: Token, recipient: IPredicate, stateMask: Uint8Array, data?: Uint8Array|null): Promise<TransferTransaction>;  // TransferTransaction.create(...)
   toCertificationData(tx: ITransaction, unlock?: IUnlockScript): Promise<CertificationData>;
                                                                        // mint → CertificationData.fromMintTransaction; transfer → fromTransaction(tx, unlock)
   submit(cert: CertificationData): Promise<SubmittedTransfer>;        // client.submitCertificationRequest
@@ -107,7 +101,7 @@ interface ITokenEngine {
   appendTransfer(t: SphereToken, c: CertifiedTransferTransaction): Promise<SphereToken>;          // token.transfer(...)
   verifyInclusionProof(proof: InclusionProof, tx: ITransaction): Promise<EngineVerifyResult>;
 ```
-Notes: `mint`/`transfer`/`split` are the façade compositions of the granular steps. `SplitTokenRequest`/`SplitToken` internal shapes are finalized in Phase 0 against `TokenSplit.split`.
+Notes: `mint`/`transfer`/`split` are the façade compositions of the granular steps. **S0-verified (6027e82):** `SplitTokenRequest.create(recipient, assets: PaymentAssetCollection, tokenType?, salt?)`; `TokenSplit.split(token, decodePaymentData, SplitTokenRequest[])` → `ISplit{ burn:{ownerPredicate,transaction}, tokens: SplitToken[] }`; `SplitToken{ networkId, recipient, tokenType, salt, assets, proofs: SplitAssetProof[] }`.
 
 ### A.3 `SpherePaymentData` (implements v2 `IPaymentData`) — the value model
 v2 `Token` has **no coins**; value is app-defined in `MintTransaction.data`:
@@ -224,14 +218,17 @@ Granular split: `buildTransfer`(1–3) → `toCertificationData`+`submit`(4–6)
 | `transaction→transition` import resolution | DELETE | recipient predicate is fully specified by sender |
 | `ReceiveOptions.{finalize,timeout,pollInterval,onProgress}` | DELETE | async finalize gone |
 
-### B.4 SPLIT → `engine.split`
+### B.4 SPLIT → `engine.split`  *(signatures verified on 6027e82, Spike S0)*
 ```
-1. requests = outputs grouped into [TokenId(child), PaymentAssetCollection][]   // child tokenId from each mint's salt+networkId
+1. requests = outputs.map(o => SplitTokenRequest.create(o.recipient, PaymentAssetCollection.create(Asset(assetId(o.coinId), o.amount)), tokenType?, salt?))
+              // SplitTokenRequest { recipient, tokenType, assets, salt }; child tokenId is derived = TokenId.fromSalt(networkId, salt)
 2. split   = await TokenSplit.split(token.sdkToken, SpherePaymentData.fromCBOR, requests)
-            // → { burn:{ ownerPredicate: BurnPredicate, transaction: TransferTransaction }, proofs: Map<TokenId, SplitAssetProof[]> }
+            // ISplit → { burn:{ ownerPredicate: BurnPredicate, transaction: TransferTransaction }, tokens: SplitToken[] }
 3. burn    : cert = CertificationData.fromTransaction(split.burn.transaction, unlock); submit; awaitProof; token.transfer(certBurn) → burntToken
-4. per out : just  = SplitMintJustification.create(burntToken, split.proofs.get(tid)).toCBOR()
-             mintTx= await MintTransaction.create(networkId, recipientPredicate, paymentData, tokenType, salt, just)
+4. per out st of split.tokens (SplitToken { networkId, recipient, tokenType, salt, assets, proofs: SplitAssetProof[] }):
+             just  = SplitMintJustification.create(burntToken, st.proofs).toCBOR()                  // CBOR_TAG 39044n
+             data  = await new SpherePaymentData(st.assets).encode()
+             mintTx= await MintTransaction.create(st.networkId, st.recipient, data, st.tokenType, st.salt, just)
              → CertificationData.fromMintTransaction → submit → awaitProof → toCertifiedTransaction → Token.mint
 5. conservation enforced inside TokenSplit: SparseMerkleSumTree root.value === asset.value, else TokenAssetValueMismatchError
 ```
@@ -298,7 +295,7 @@ Sender waits for the inclusion proof **synchronously** (~2.3 s/op; split ≈ (N+
 
 ### C.13 `core/Sphere.ts` — [P2] (identity, B6)
 - **Old:** `SigningService`, `TokenType`, `HashAlgorithm`, `UnmaskedPredicateReference`; dyn `ProxyAddress`.
-- **Changes:** `deriveL3PredicateAddress` → the ported legacy `DIRECT://` helper in `token-engine/identity/` (Path A). `chainPubkey`/L1 derivation (core/crypto) **unchanged** (proven stable). Remove `ProxyAddress` (nametag → Nostr).
+- **Changes (DIRECT:// derivation — REUSE, do not re-implement):** the legacy derivation already exists — `deriveL3PredicateAddress` (`core/Sphere.ts:413`) calls v1 `UnmaskedPredicateReference.create`. Step 1 (now): **extract that private fn into a shared, pubkey-based exported helper** (e.g. `core/address.ts`/`token-engine`) that both `Sphere` and `token-engine.deriveIdentityAddress` call — one source, no parallel copy, still backed by v1. Step 2 (ONLY at final v1-removal): v2 has no `UnmaskedPredicateReference`, so replace the v1 call **inside that one helper** with a vendored, byte-exact derivation, locked by the golden vector (record old output before deleting `1.6.1`; new code must reproduce it byte-for-byte). This is a faithful move of the existing recipe, never a hand-written duplicate. `chainPubkey`/L1 derivation (core/crypto) **unchanged** (proven stable). Remove `ProxyAddress` (nametag → Nostr).
 
 ### C.14 `transport/NostrTransportProvider.ts` — [P2] (B4/B6)
 - **Old:** dyn `ProxyAddress` (nametag resolution).

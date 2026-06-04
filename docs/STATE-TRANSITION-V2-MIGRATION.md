@@ -148,7 +148,7 @@ Since `directAddress` changes under naive v2, a naive migration makes existing u
 ### 4.3 Nostr identity binding — extend, don't break
 Today: `publishIdentityBinding(chainPubkey, l1Address, directAddress, nametag?)`.
 
-- **Anti-bot gate (D6) — keep.** The binding resolution at login filters bots (no binding → no access). The migration must NOT drop it. *Confirm with the team exactly what the gate checks (binding existence vs. nametag/social match) so we don't weaken it.*
+- **Anti-bot gate (D6) — keep.** The binding resolution at login filters bots (no binding → no access). The migration must NOT drop it. *Verified: the gate is `auth.service.verifyAndIssueJwt` → `resolveStrict(chainPubkey)` against the Nostr `kind:30078` binding, rejecting only on a missing `directAddress` (`NO_IDENTITY_BINDING`); `nametag` is an optional, never-on-chain-verified field. So keeping the binding (Path A binds `directAddress`) keeps the gate intact — no nametag token involved.*
 - **Do NOT publish `receivePredicate` in the binding — it's redundant.** `receivePredicate = SignaturePredicate(chainPubkey)` is a *pure function of `chainPubkey`*, which is already the binding key. Any sender derives it itself. The engine builds it on the fly at send time (`deriveReceivePredicate`). The binding stays minimal:
   ```
   chainPubkey → { l1Address, nametag, directAddress? }
@@ -157,11 +157,25 @@ Today: `publishIdentityBinding(chainPubkey, l1Address, directAddress, nametag?)`
 - **New users (SDK+Nostr level):** bind `chainPubkey + l1 + nametag`; **Path A** also binds `directAddress` (identity), **Path B** omits it.
 - **`getAddressId()` storage namespacing:** re-base on `chainPubkey` (not `directAddress`) so it's stable regardless of A/B.
 
-### 4.4 Nametag / Unicity ID = Nostr only (D5)
+### 4.4 Nametag / Unicity ID = transport-resolved name, no on-chain token (D5) — ✅ CONFIRMED
+> **Team confirmation (Martti, 2026-06-04):** *"No unicity id predicate. That is functionality which is in whitepaper but is not used."* → **Do not implement `UnicityIdPredicate` in this migration.** Whether "not used" means *never* or *not yet* is left open — it doesn't change the migration: either way we ship **α** now. Because `token-engine` is an anti-corruption layer, adding `UnicityIdPredicate` later is **purely additive** (export the symbols via the barrel; extend the recipient to accept a name) and does not break the frozen `recipientPubkey` contract. The migration **neither uses nor precludes β**. D5 stands.
+> Also verified independently (adversarial spike, high confidence): nothing in v2 hard-requires the on-chain token.
+- Name resolution is a **transport** concern (Nostr today, but any transport) — `@alice → chainPubkey`. Not Nostr-specific.
 - No on-chain `UnicityIdToken`/`UnicityIdPredicate`; no nametag-token mint (retire `NametagMinter`'s on-chain mint).
 - Unicity ID = `name ↔ pubkey` Nostr binding.
 - **Send by `@alice`:** resolve Nostr binding → `pubkey` → `SignaturePredicate(pubkey)`. There is **one** receive path (key-based); the receive predicate is always derivable from the pubkey.
-- Name-ownership trust = the Nostr binding (+ anti-bot gate), **not** the chain. (v2's on-chain Unicity ID remains available as a future feature if ever wanted.)
+- Name-ownership trust = the Nostr binding (+ anti-bot gate), **not** the chain. (v2's on-chain Unicity ID — `UnicityIdPredicate` type `0x100`, `UnicityIdMintTransaction`, `UnicityIdToken`; name→TokenId = `SHA256("NAMETAG_"+domain+name)` — **exists** in v2 and stays available as a future feature; D5 deliberately does not use it. Earlier "v2 deleted nametag" framing was imprecise — v2 *replaced* `ProxyAddress` with this native predicate.)
+
+**Evidence nothing in v2 hard-requires the on-chain token:**
+- v2 SDK mints/transfers/splits with only `SignaturePredicate(pubkey)`; `UnicityIdPredicateVerifier` is defined but **never registered** in `DefaultBuiltInPredicateVerifier` → unused by the core lifecycle. Genesis verification even *requires* the lock script to be `SignaturePredicate` (from `MintSigningService`).
+- sphere-api anti-bot/login gate (`auth.service.resolveStrict(chainPubkey)` → Nostr `kind:30078`) rejects only on missing `directAddress`; `nametag` is nullable, never on-chain-verified. A base binding **without** a nametag is fully supported.
+- The lone apparent blocker — `PaymentsModule` "Cannot finalize PROXY transfer - no Unicity ID token" (`PaymentsModule.ts:5320`) — is a **false positive**: it lives only in the legacy **PROXY** branch (the on-chain nametag mechanism D5 removes). On the DIRECT path that `@name→pubkey` always yields, `nametagTokens=[]` and finalize needs no token.
+
+**⚠️ Migration-level actions this surfaces (not correctness blockers):**
+- **Kill the PROXY fallback, not just the minter.** `resolveRecipientAddress` falls back to PROXY when a recipient has no stored `directAddress` (`PaymentsModule.ts:5207-5214`). v2 must remove PROXY resolution + `ProxyAddress` derivation entirely so a sender **never** emits a PROXY-addressed transfer (else a Nostr-only recipient can't finalize it). Scope: **B4 (nametag) + C.10 (transport) + the send-path resolver.**
+- **Legacy/in-flight:** already-minted on-chain nametags and inbound PROXY transfers need a transition story or those funds are unfinalizable. (Testnet reset covers testnet; confirm no mainnet exposure.)
+- **Name-claim uniqueness is now off-chain only** (Nostr first-seen + signature; no on-chain atomic claim) → a TOCTOU window on `@name` claims. Acceptable for a name↔pubkey binding but a **conscious product tradeoff**.
+- **Resolution availability:** `@name→pubkey` now depends 100% on Nostr relay liveness at send time (no on-chain oracle fallback).
 
 ### 4.5 Connect & the trust model
 - **Connect already exposes `chainPubkey`** as a required, stable field in `PublicIdentity` → identity works by `chainPubkey` unchanged. **No `receivePredicate` field needed** — it's derivable from `chainPubkey`, and token sends go through the wallet's frozen `payments` API (the dApp passes a recipient identifier; the wallet's engine builds the predicate). dApps key identity on `chainPubkey`.

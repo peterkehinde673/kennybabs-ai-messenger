@@ -1,0 +1,72 @@
+/**
+ * VENDORED (test-only) from @unicitylabs/state-transition-sdk v2
+ * tests/utils/UnicityCertificateFixture.ts. Copied verbatim with imports
+ * re-pointed at the installed lib/ (the package ships only lib/, not tests/).
+ * Faithful relocation, not reimplemented logic — orchestrates installed SDK
+ * classes to build a single-node BFT unicity certificate for the in-memory
+ * aggregator. Keep in sync with upstream.
+ */
+
+import { numberToBytesBE } from '@noble/curves/utils.js';
+
+import { InputRecord } from 'state-transition-sdk-v2/lib/api/bft/InputRecord.js';
+import { ShardId } from 'state-transition-sdk-v2/lib/api/bft/ShardId.js';
+import { ShardTreeCertificate } from 'state-transition-sdk-v2/lib/api/bft/ShardTreeCertificate.js';
+import { UnicityCertificate } from 'state-transition-sdk-v2/lib/api/bft/UnicityCertificate.js';
+import { UnicitySeal } from 'state-transition-sdk-v2/lib/api/bft/UnicitySeal.js';
+import { UnicityTreeCertificate } from 'state-transition-sdk-v2/lib/api/bft/UnicityTreeCertificate.js';
+import { NetworkId } from 'state-transition-sdk-v2/lib/api/NetworkId.js';
+import { DataHash } from 'state-transition-sdk-v2/lib/crypto/hash/DataHash.js';
+import { DataHasher } from 'state-transition-sdk-v2/lib/crypto/hash/DataHasher.js';
+import { HashAlgorithm } from 'state-transition-sdk-v2/lib/crypto/hash/HashAlgorithm.js';
+import { SigningService } from 'state-transition-sdk-v2/lib/crypto/secp256k1/SigningService.js';
+import { CborSerializer } from 'state-transition-sdk-v2/lib/serialization/cbor/CborSerializer.js';
+
+export async function createUnicityCertificate(
+  rootHash: DataHash,
+  signingService: SigningService,
+): Promise<UnicityCertificate> {
+  const inputRecord = new InputRecord(0n, 0n, null, rootHash.data, new Uint8Array(0), 0n, null, 0n, null);
+  const technicalRecordHash = null;
+  const shardConfigurationHash = new Uint8Array(32);
+  const shardTreeCertificate = new ShardTreeCertificate(ShardId.decode(new Uint8Array([0b10000000])), []);
+
+  const shardTreeCertificateRootHash = await UnicityCertificate.calculateShardTreeCertificateRootHash(
+    inputRecord,
+    technicalRecordHash,
+    shardConfigurationHash,
+    shardTreeCertificate,
+  );
+
+  const partitionIdentifier = 0n;
+
+  const key = numberToBytesBE(partitionIdentifier, 4);
+  const shardTreeCertificateRootCborHash = await new DataHasher(HashAlgorithm.SHA256)
+    .update(CborSerializer.encodeByteString(shardTreeCertificateRootHash.data))
+    .digest();
+
+  const unicitySealHash = await new DataHasher(HashAlgorithm.SHA256)
+    .update(CborSerializer.encodeByteString(new Uint8Array([0x01])))
+    .update(CborSerializer.encodeByteString(key))
+    .update(CborSerializer.encodeByteString(shardTreeCertificateRootCborHash.data))
+    .digest();
+
+  const seal = await UnicitySeal.create(
+    NetworkId.LOCAL,
+    0n,
+    0n,
+    0n,
+    null,
+    unicitySealHash.data,
+    new Map([['NODE', signingService]]),
+  );
+
+  return new UnicityCertificate(
+    inputRecord,
+    technicalRecordHash,
+    shardConfigurationHash,
+    shardTreeCertificate,
+    new UnicityTreeCertificate(partitionIdentifier, []),
+    seal,
+  );
+}
