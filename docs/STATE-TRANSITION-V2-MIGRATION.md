@@ -158,7 +158,7 @@ Today: `publishIdentityBinding(chainPubkey, l1Address, directAddress, nametag?)`
 - **`getAddressId()` storage namespacing:** re-base on `chainPubkey` (not `directAddress`) so it's stable regardless of A/B.
 
 ### 4.4 Nametag / Unicity ID = transport-resolved name, no on-chain token (D5) — ✅ CONFIRMED
-> **Team confirmation (Martti, 2026-06-04):** *"No unicity id predicate. That is functionality which is in whitepaper but is not used."* → **β (`UnicityIdPredicate`) is off the table — do not implement it.** D5 stands.
+> **Team confirmation (Martti, 2026-06-04):** *"No unicity id predicate. That is functionality which is in whitepaper but is not used."* → **Do not implement `UnicityIdPredicate` in this migration.** Whether "not used" means *never* or *not yet* is left open — it doesn't change the migration: either way we ship **α** now. Because `token-engine` is an anti-corruption layer, adding `UnicityIdPredicate` later is **purely additive** (export the symbols via the barrel; extend the recipient to accept a name) and does not break the frozen `recipientPubkey` contract. The migration **neither uses nor precludes β**. D5 stands.
 > Also verified independently (adversarial spike, high confidence): nothing in v2 hard-requires the on-chain token.
 - Name resolution is a **transport** concern (Nostr today, but any transport) — `@alice → chainPubkey`. Not Nostr-specific.
 - No on-chain `UnicityIdToken`/`UnicityIdPredicate`; no nametag-token mint (retire `NametagMinter`'s on-chain mint).
