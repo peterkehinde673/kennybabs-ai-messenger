@@ -1,5 +1,5 @@
 /**
- * token-engine/payment-data.ts — the sphere value model.
+ * token-engine/SpherePaymentData.ts — the sphere value model.
  *
  * v2 `Token` carries no coins; value is app-defined and stored in
  * `MintTransaction.data`. `SpherePaymentData` is that payload: it implements the

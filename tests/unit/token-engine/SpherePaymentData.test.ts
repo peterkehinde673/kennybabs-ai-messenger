@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { SpherePaymentData } from '../../../token-engine/payment-data';
+import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { CborError, CborSerializer, PaymentAssetCollection } from '../../../token-engine/sdk';
 import type { SphereValue } from '../../../token-engine/types';
 

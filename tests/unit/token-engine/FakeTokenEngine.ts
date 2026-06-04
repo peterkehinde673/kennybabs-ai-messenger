@@ -32,7 +32,7 @@ import type {
   TokenBlob,
   TransferParams,
 } from '../../../token-engine';
-import { SpherePaymentData } from '../../../token-engine/payment-data';
+import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
 
 const DEFAULT_PUBKEY = new Uint8Array([0x02, ...new Array<number>(32).fill(0)]); // 33 bytes

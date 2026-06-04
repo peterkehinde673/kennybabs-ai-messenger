@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { runEngineContract } from './engine-contract';
-import { FakeTokenEngine } from './fake-engine';
+import { FakeTokenEngine } from './FakeTokenEngine';
 
 // The fake must satisfy the shared port contract.
 runEngineContract('FakeTokenEngine', () => new FakeTokenEngine({ chainPubkey: new Uint8Array(33).fill(0x02) }));
