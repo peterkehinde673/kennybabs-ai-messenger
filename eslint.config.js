@@ -44,5 +44,14 @@ export default tseslint.config(
     rules: {
       'no-restricted-imports': 'off',
     },
+  },
+  {
+    // Vendored v2 test infrastructure (TestAggregatorClient + BFT fixtures).
+    // Copied verbatim from the v2 SDK's own tests (not shipped in its package),
+    // so it imports SDK internals not on the engine barrel. Test-only.
+    files: ['tests/**/token-engine/support/**/*.ts'],
+    rules: {
+      'no-restricted-imports': 'off',
+    },
   }
 );
