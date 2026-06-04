@@ -50,7 +50,7 @@ interface SphereToken {
   readonly value: SphereValue | null;                            // decoded value (cached)
 }
 
-interface MintParams      { readonly recipientPubkey: Uint8Array; readonly value?: SphereValue | null; }
+interface MintParams      { readonly recipientPubkey: Uint8Array; readonly value?: SphereValue | null; }   // issuer/developer mint (app issues tokens to users)
 interface TransferParams  { readonly token: SphereToken; readonly recipientPubkey: Uint8Array; }
 interface SplitOutput     { readonly recipientPubkey: Uint8Array; readonly coinId: CoinId; readonly amount: bigint; }
 interface SplitParams     { readonly token: SphereToken; readonly outputs: readonly SplitOutput[]; }
@@ -73,9 +73,9 @@ interface ITokenEngine {
   readValue(token: SphereToken): SphereValue | null;                   // sync
   balanceOf(token: SphereToken, coinId: CoinId): bigint;               // sync
   // lifecycle (sender-driven: build→submit→wait→certify→realize)
-  mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken>;
+  mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken>;     // issuer/developer: app issues tokens to users (NOT a wallet end-user flow)
   transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken>;
-  split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult>;
+  split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult>;   // burn source + internally mint each output
   // verification
   verify(token: SphereToken, options?: EngineOpOptions): Promise<EngineVerifyResult>;
   isSpent(token: SphereToken, options?: EngineOpOptions): Promise<boolean>;

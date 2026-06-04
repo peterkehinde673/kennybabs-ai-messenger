@@ -51,11 +51,18 @@ export interface ITokenEngine {
   balanceOf(token: SphereToken, coinId: CoinId): bigint;
 
   // ── lifecycle (sender-driven: build → submit → wait → certify → realize) ──
-  /** Mint a new token to a recipient pubkey. */
+  /**
+   * Mint (issue) a new token to a recipient pubkey. NOT a wallet end-user flow —
+   * this is the issuer/developer capability: an app issuing its own tokens
+   * (rewards, in-app currency, tickets) to users, or seeding test balances. v2
+   * makes standalone mint first-class (Token.mint accepts a genesis with a null
+   * justification). Split's per-output mint is a separate, internal path; the
+   * Unicity-ID/nametag mint is a distinct identity surface (see migration plan §4.4).
+   */
   mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken>;
   /** Spend a token wholesale to a recipient pubkey; returns the recipient's finished token. */
   transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken>;
-  /** Split a token into N value-conserving outputs (burn source + mint each output). */
+  /** Split a token into N value-conserving outputs (burn source + internally mint each output). */
   split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult>;
 
   // ── verification ──────────────────────────────────────────────────────────
