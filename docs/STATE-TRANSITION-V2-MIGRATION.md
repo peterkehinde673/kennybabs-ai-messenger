@@ -1,7 +1,7 @@
 # Migration Plan — State Transition SDK v1.6.1 → v2
 
 **Repository:** `sphere-sdk` · **Branch:** `feat/migrate-state-transition-sdk` (cut from `v0.7.2`)
-**Target dependency:** `@unicitylabs/state-transition-sdk@2.0.0-rc.b20e560` (replaces `1.6.1-rc.f37cb85`)
+**Target dependency:** `@unicitylabs/state-transition-sdk@2.0.0-rc.6027e82` (replaces `1.6.1-rc.f37cb85`) — latest RC; the v2 API has been **stable across the recent RCs** (they differ only by packaging/CI), so pinning a newer RC is safe. **Requires Node ≥ 22** (the SDK now declares `engines >=22`, CI on Node 24) — sphere-sdk dev/CI must move to Node 22+ (ideally 24).
 **Status:** Draft for team review · **Owner:** TBD
 
 > This is money/identity code. Correctness, isolation, and continuity of **user identity + Quest XP**
@@ -82,7 +82,7 @@
 
 ## 3. What changed in v2 (verified)
 
-Verified first-hand against the published tarball + source at `b20e560`. Full reference: team memory `state-transition-sdk-v2`.
+Verified first-hand against the published tarball + source at `6027e82`. Full reference: team memory `state-transition-sdk-v2`.
 
 - **No fungible value in the SDK.** `Token` exposes only `genesis/transactions/id/type` — no coins/amount. Value is app-defined via `MintTransaction.data` + an app `IPaymentData` (→ §7.1).
 - **CBOR only** (`toCBOR`/`fromCBOR`; no `toJSON`/`fromJSON`).
@@ -93,7 +93,7 @@ Verified first-hand against the published tarball + source at `b20e560`. Full re
 - **Import path:** `@unicitylabs/state-transition-sdk/lib/<path>.js` (e.g. `…/lib/transaction/Token.js`) — via the `./lib/*` subpath exports. **No root barrel** (import each class by its subpath; there is no `import … from '@unicitylabs/state-transition-sdk'`). *The old `/lib/src/` + broken-`main` packaging bug was fixed in `b20e560`.*
 - **`waitInclusionProof(client, trustBase, predicateVerifier, transaction, signal?, interval?)`** — arg order differs from v1.
 
-> **Spike S0 (blocks the Phase 0 contract freeze):** re-verify exact **transfer** and **split** signatures on `b20e560` (mint already re-verified).
+> **Spike S0 (blocks the Phase 0 contract freeze):** re-verify exact **transfer** and **split** signatures on `6027e82` (mint already re-verified).
 
 ---
 
@@ -177,7 +177,7 @@ Today: `publishIdentityBinding(chainPubkey, l1Address, directAddress, nametag?)`
                                                                               │ SphereTokenEngine (wrapper/adapter)
                                                                               │ SpherePaymentData · domain · errors
                                                                               ▼  the ONLY importer of the SDK
-                                            @unicitylabs/state-transition-sdk@2.0.0-rc.b20e560 (/lib/...)
+                                            @unicitylabs/state-transition-sdk@2.0.0-rc.6027e82 (/lib/...)
 ```
 - **`ITokenEngine`** = the port (contract everyone codes against). **`SphereTokenEngine`** = the wrapper that holds the SDK and implements the port. **`FakeTokenEngine`** = in-memory impl for parallel dev + contract tests.
 - **Enforced boundary:** ESLint `no-restricted-imports` bans `@unicitylabs/state-transition-sdk` outside `token-engine/` (+ a CI grep catching dynamic `import()`); v2 types never appear outside the wrapper.
@@ -252,7 +252,7 @@ Supporting types (Phase 0): `EngineIdentity`, `ReceivePredicate` (wraps v2 `Enco
 **How we avoid it:**
 1. **Run v1 and v2 side-by-side via an npm alias** for the duration:
    ```
-   npm i state-transition-sdk-v2@npm:@unicitylabs/state-transition-sdk@2.0.0-rc.b20e560
+   npm i state-transition-sdk-v2@npm:@unicitylabs/state-transition-sdk@2.0.0-rc.6027e82
    ```
    `token-engine/` imports v2 from `state-transition-sdk-v2/lib/...`; not-yet-migrated callers keep importing v1 from `@unicitylabs/state-transition-sdk@1.6.1`. **Repo compiles throughout.** (ESLint boundary temporarily allows the canonical v1 name in callers; tighten to "no SDK outside token-engine/" once cut-over completes.)
 2. **The engine is additive new code** — it builds on v2 immediately without touching existing callers.
@@ -273,8 +273,9 @@ Structured so **two engineers run in parallel** with one shared seam (the `IToke
 
 ### Phase 0 — Foundation & contract (BOTH, ~2–3 days, pair on it)
 The only step both do together. Output = a frozen contract that decouples the two tracks.
-- Install v2 **side-by-side** via npm alias (`state-transition-sdk-v2@npm:@unicitylabs/state-transition-sdk@2.0.0-rc.b20e560`) so the tree stays green during migration (§7.6) — v1 stays for not-yet-migrated callers; `token-engine/` imports the v2 alias `/lib/...`. ESLint `no-restricted-imports` (engine-only, tightened at final cut-over) + CI grep; NetworkId + trust-base plumbing; bring `TestAggregatorClient` into test utils.
-- **Spike S0** — verify exact transfer/split signatures on b20e560.
+- **Node ≥ 22** (ideally 24): align sphere-sdk dev + CI to Node 22+ (the SDK declares `engines >=22`/CI on Node 24); add `.nvmrc`, bump sphere-sdk `engines` from `>=18`.
+- Install v2 **side-by-side** via npm alias (`state-transition-sdk-v2@npm:@unicitylabs/state-transition-sdk@2.0.0-rc.6027e82`) so the tree stays green during migration (§7.6) — v1 stays for not-yet-migrated callers; `token-engine/` imports the v2 alias `/lib/...`. ESLint `no-restricted-imports` (engine-only, tightened at final cut-over) + CI grep; NetworkId + trust-base plumbing; bring `TestAggregatorClient` into test utils.
+- **Spike S0** — verify exact transfer/split signatures on 6027e82.
 - **Freeze** `ITokenEngine` + all DTOs + `SpherePaymentData` CBOR layout + `TokenBlob` format (Detailed doc Parts A & D).
 - Ship `FakeTokenEngine` (deterministic in-memory).
 - **Exit:** contract reviewed & merged; `FakeTokenEngine` passes the contract test skeleton → tracks split.
@@ -361,8 +362,8 @@ Per D7: build fully on branch → pass the gate → merge → bump npm. **Final 
 |----|----------------|------------|
 | **R0** | 🔴 **Existing users lose Quest XP** (sphere-api keys on `directAddress`, which is token-SDK-derived) | **Resolved by Path A (decided):** freeze the legacy `DIRECT://` derivation in a ported helper + golden-vector test; sphere-api untouched. XP-login test in the merge gate. |
 | **R1** | Anti-bot binding gate weakened by the migration | Preserve the Nostr binding + its login resolution (D6); confirm exactly what it checks before touching it. |
-| S0 | transfer/split sigs on b20e560 not re-verified | Blocking task in Phase 0. |
-| S1 | v2 send-UX latency (sync-wait vs background-send) | Spike in A3 (Track A); decide UX + measure. |
+| S0 | transfer/split sigs on 6027e82 not re-verified | Blocking task in Phase 0. |
+| S1 | v2 send-UX latency: `waitInclusionProof` is **polling-only** (loops `getInclusionProof`, ~2.3s/op) — no push/subscription primitive in v2 | Engine `awaitProof` wraps `getInclusionProof` so **we** own the policy: custom poll/backoff/timeout, or a sender-side **background job + notify** instead of a blocking sync wait. Decide UX + measure in A3. |
 | R2 | v2 trust-base JSON shape / NetworkId per env unconfirmed | Confirm with network team in Phase 0; e2e validates. |
 | R3 | `CoinId` ↔ `AssetId` continuity (registry vs engine) | Define encoding once (§7.1); property tests. |
 | R4 | `waitInclusionProof` default timeout (10s) vs legacy (~60s) | Make timeout/interval engine config; benchmark in A7/B7 tests. |
@@ -373,7 +374,7 @@ Per D7: build fully on branch → pass the gate → merge → bump npm. **Final 
 
 ## Appendix A — Old → New API mapping
 
-| Legacy (v1.6.1) | v2 (b20e560) | Note |
+| Legacy (v1.6.1) | v2 (6027e82) | Note |
 |---|---|---|
 | `Token.coins.get` / `CoinId` / `TokenCoinData` | **none** — `SpherePaymentData` (`Asset`/`AssetId`/`PaymentAssetCollection`) | value app-defined |
 | `TransferCommitment.create` | `TransferTransaction.create` + `CertificationData.fromTransaction` + `submitCertificationRequest` | commitment split |
