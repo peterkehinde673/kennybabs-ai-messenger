@@ -2,7 +2,7 @@
 
 > Companion to **STATE-TRANSITION-V2-MIGRATION.md** (read that first for goals, decisions, identity, the 2-owner split, phasing, risks). This doc is the deep, code-grounded reference: full engine contract, v2 flow sequences, per-file caller migration, serialization/storage, and the test plan.
 >
-> ⚠️ **Accuracy note (read once).** v2 deleted most v1 vocabulary. These v1 symbols **do NOT exist in v2** — every site that used them **changes** (there are no "no-op" migrations): `TransferCommitment`, `MintCommitment`, `MintTransactionData`, `TokenSplitBuilder`, `CoinId`, `TokenCoinData`, `coins.get()`, `TokenState`, `UnmaskedPredicate(Reference)`, `MaskedPredicate`, `DirectAddress`, `ProxyAddress`, `AddressScheme`, `RequestId`, `Token.toJSON()/fromJSON()`, `StateTransitionClient.submitTransferCommitment/submitMintCommitment/finalizeTransaction`. Import paths are `@unicitylabs/state-transition-sdk/lib/src/<...>.js` (note `/src/`). Exact transfer/split signatures are re-verified in Phase 0 (Spike S0) before the contract is frozen.
+> ⚠️ **Accuracy note (read once).** v2 deleted most v1 vocabulary. These v1 symbols **do NOT exist in v2** — every site that used them **changes** (there are no "no-op" migrations): `TransferCommitment`, `MintCommitment`, `MintTransactionData`, `TokenSplitBuilder`, `CoinId`, `TokenCoinData`, `coins.get()`, `TokenState`, `UnmaskedPredicate(Reference)`, `MaskedPredicate`, `DirectAddress`, `ProxyAddress`, `AddressScheme`, `RequestId`, `Token.toJSON()/fromJSON()`, `StateTransitionClient.submitTransferCommitment/submitMintCommitment/finalizeTransaction`. Import paths are `@unicitylabs/state-transition-sdk/lib/<...>.js` (via the `./lib/*` subpath exports; no root barrel — the `/lib/src/`+broken-`main` packaging bug was fixed in `b20e560`). Exact transfer/split signatures are re-verified in Phase 0 (Spike S0) before the contract is frozen.
 
 ## Contents
 - [Part A — Token Engine: contract & internals](#part-a--token-engine-contract--internals)
@@ -155,8 +155,8 @@ One mapper in `token-engine/errors/`. Strict `status === OK` checks; fail closed
 ```ts
 class SphereTokenEngine implements ITokenEngine {
   constructor(private readonly deps: {
-    aggregatorClient: AggregatorClient;                 // lib/src/api/AggregatorClient.js
-    client: StateTransitionClient;                       // lib/src/StateTransitionClient.js
+    aggregatorClient: AggregatorClient;                 // lib/api/AggregatorClient.js
+    client: StateTransitionClient;                       // lib/StateTransitionClient.js
     trustBase: RootTrustBase;                            // RootTrustBase.fromJSON(per-network json)
     predicateVerifier: PredicateVerifierService;         // .create()
     mintJustificationVerifier: MintJustificationVerifierService; // .register(new SplitMintJustificationVerifier(...))
