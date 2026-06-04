@@ -157,7 +157,10 @@ Today: `publishIdentityBinding(chainPubkey, l1Address, directAddress, nametag?)`
 - **New users (SDK+Nostr level):** bind `chainPubkey + l1 + nametag`; **Path A** also binds `directAddress` (identity), **Path B** omits it.
 - **`getAddressId()` storage namespacing:** re-base on `chainPubkey` (not `directAddress`) so it's stable regardless of A/B.
 
-### 4.4 Nametag / Unicity ID = Nostr only (D5) — ✅ VERIFIED sufficient (adversarial spike, high confidence)
+### 4.4 Nametag / Unicity ID = transport-resolved name, no on-chain token (D5) — ✅ CONFIRMED
+> **Team confirmation (Martti, 2026-06-04):** *"No unicity id predicate. That is functionality which is in whitepaper but is not used."* → **β (`UnicityIdPredicate`) is off the table — do not implement it.** D5 stands.
+> Also verified independently (adversarial spike, high confidence): nothing in v2 hard-requires the on-chain token.
+- Name resolution is a **transport** concern (Nostr today, but any transport) — `@alice → chainPubkey`. Not Nostr-specific.
 - No on-chain `UnicityIdToken`/`UnicityIdPredicate`; no nametag-token mint (retire `NametagMinter`'s on-chain mint).
 - Unicity ID = `name ↔ pubkey` Nostr binding.
 - **Send by `@alice`:** resolve Nostr binding → `pubkey` → `SignaturePredicate(pubkey)`. There is **one** receive path (key-based); the receive predicate is always derivable from the pubkey.
