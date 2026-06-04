@@ -244,6 +244,27 @@ Supporting types (Phase 0): `EngineIdentity`, `ReceivePredicate` (wraps v2 `Enco
 - No silent-pass on verification. No silent mis-parse of money/format.
 - Dedicated security review gates Track A (A2 transfer / A3 split / A5 serde).
 
+### 7.6 Migration mechanics — keep the tree green (no broken commits, no TODO-stubs)
+**Goal:** the branch **compiles and tests pass at every commit**, even mid-migration. We do **not** commit knowingly-broken code, and we do **not** replace working code with TODO stubs. A red shared branch blocks the other engineer.
+
+**The trap:** the SDK is a single package — you cannot install v1 and v2 under the same name. Naively removing `1.6.1` in Phase 0 breaks **every** caller at once → the whole repo is red for the entire migration.
+
+**How we avoid it:**
+1. **Run v1 and v2 side-by-side via an npm alias** for the duration:
+   ```
+   npm i state-transition-sdk-v2@npm:@unicitylabs/state-transition-sdk@2.0.0-rc.a57c080
+   ```
+   `token-engine/` imports v2 from `state-transition-sdk-v2/lib/src/...`; not-yet-migrated callers keep importing v1 from `@unicitylabs/state-transition-sdk@1.6.1`. **Repo compiles throughout.** (ESLint boundary temporarily allows the canonical v1 name in callers; tighten to "no SDK outside token-engine/" once cut-over completes.)
+2. **The engine is additive new code** — it builds on v2 immediately without touching existing callers.
+3. **`FakeTokenEngine`** lets Track B write + test caller migrations green **before** the real engine lands.
+4. **Slice-by-slice cut-over:** engine method ready → switch the matching caller to it **with its tests** → green commit. Compiles + tests pass at every step.
+5. **Deletions only when dead:** the intentional sender-driven removals (`InstantSplitProcessor`, `resolveUnconfirmed`, …) are deleted **only after nothing references them**.
+6. **Final cut-over PR** (behind the merge gate): remove v1 + the alias; in `token-engine/` find-replace the alias import back to the canonical `@unicitylabs/state-transition-sdk`; flip the ESLint rule to strict; run the full gate. This is the single moment everything aligns — and it's gated.
+
+**TODO policy:** allowed **only** for genuinely deferred scope (e.g., the Spike S1 background-send path if deferred) — with a tracking note. **Never** a TODO-stub of working behavior we simply haven't finished migrating.
+
+**Two-engineer hygiene:** each works on a sub-branch (`…/track-a`, `…/track-b`) kept green; merge into the integration branch at the sync points (Σ). Combined with the alias, both always sit on a compiling tree.
+
 ---
 
 ## 8. Parallel execution — 2 owners
@@ -252,7 +273,7 @@ Structured so **two engineers run in parallel** with one shared seam (the `IToke
 
 ### Phase 0 — Foundation & contract (BOTH, ~2–3 days, pair on it)
 The only step both do together. Output = a frozen contract that decouples the two tracks.
-- Swap dep → `2.0.0-rc.a57c080` (imports `@unicitylabs/state-transition-sdk/lib/src/...`); ESLint `no-restricted-imports` + CI grep (dynamic import / v2 type leaks); NetworkId + trust-base plumbing; bring `TestAggregatorClient` into test utils.
+- Install v2 **side-by-side** via npm alias (`state-transition-sdk-v2@npm:@unicitylabs/state-transition-sdk@2.0.0-rc.a57c080`) so the tree stays green during migration (§7.6) — v1 stays for not-yet-migrated callers; `token-engine/` imports the v2 alias `/lib/src/...`. ESLint `no-restricted-imports` (engine-only, tightened at final cut-over) + CI grep; NetworkId + trust-base plumbing; bring `TestAggregatorClient` into test utils.
 - **Spike S0** — verify exact transfer/split signatures on a57c080.
 - **Freeze** `ITokenEngine` + all DTOs + `SpherePaymentData` CBOR layout + `TokenBlob` format (Detailed doc Parts A & D).
 - Ship `FakeTokenEngine` (deterministic in-memory).
@@ -330,7 +351,7 @@ Final    [BOTH]  Σ4 — merge gate (§10) → cutover (§11)
 
 ## 11. Rollout & cutover
 
-Per D7: build fully on branch → pass the gate → merge → bump npm. The wrapper makes an optional internal feature-flag trivial if a staged rollout is ever wanted. Coordinate the npm bump with `sphere` (popup), `sphere-quest-frontend`, `sphere-api` (no backend change needed under Path A — they re-pin and smoke). 
+Per D7: build fully on branch → pass the gate → merge → bump npm. **Final cut-over (last PR, behind the gate, §7.6):** remove the v1 dep + the npm alias; find-replace the v2-alias imports in `token-engine/` back to the canonical `@unicitylabs/state-transition-sdk`; flip the ESLint boundary to strict (zero SDK imports outside `token-engine/`); delete the last dead receiver code; run the full merge gate. The wrapper makes an optional internal feature-flag trivial if a staged rollout is ever wanted. Coordinate the npm bump with `sphere` (popup), `sphere-quest-frontend`, `sphere-api` (no backend change needed under Path A — they re-pin and smoke).
 
 ---
 
