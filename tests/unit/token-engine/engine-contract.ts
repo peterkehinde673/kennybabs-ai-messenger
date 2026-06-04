@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { ITokenEngine } from '../../token-engine';
+import type { ITokenEngine } from '../../../token-engine';
 
 export function runEngineContract(name: string, makeEngine: () => ITokenEngine): void {
   describe(`ITokenEngine contract — ${name}`, () => {

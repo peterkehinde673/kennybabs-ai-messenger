@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 
-import { CborError, CborSerializer } from '../../token-engine/sdk';
-import { decodeTokenBlob, encodeTokenBlob, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
-import type { TokenBlob } from '../../token-engine/types';
+import { CborError, CborSerializer } from '../../../token-engine/sdk';
+import { decodeTokenBlob, encodeTokenBlob, TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
+import type { TokenBlob } from '../../../token-engine/types';
 
 describe('TokenBlob codec', () => {
   it('round-trips a blob through encode/decode', () => {

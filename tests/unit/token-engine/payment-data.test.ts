@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 
-import { SpherePaymentData } from '../../token-engine/payment-data';
-import { CborError, CborSerializer, PaymentAssetCollection } from '../../token-engine/sdk';
-import type { SphereValue } from '../../token-engine/types';
+import { SpherePaymentData } from '../../../token-engine/payment-data';
+import { CborError, CborSerializer, PaymentAssetCollection } from '../../../token-engine/sdk';
+import type { SphereValue } from '../../../token-engine/types';
 
 // 32-byte asset ids in hex (canonical lowercase) → these are sphere CoinIds.
 const COIN_A = 'a'.repeat(64);

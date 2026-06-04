@@ -17,7 +17,7 @@ import {
   CborSerializer,
   HexConverter,
   type Token,
-} from '../../token-engine/sdk';
+} from '../../../token-engine/sdk';
 import type {
   CoinId,
   EngineIdentity,
@@ -31,9 +31,9 @@ import type {
   SplitResult,
   TokenBlob,
   TransferParams,
-} from '../../token-engine';
-import { SpherePaymentData } from '../../token-engine/payment-data';
-import { TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
+} from '../../../token-engine';
+import { SpherePaymentData } from '../../../token-engine/payment-data';
+import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
 
 const DEFAULT_PUBKEY = new Uint8Array([0x02, ...new Array<number>(32).fill(0)]); // 33 bytes
 
