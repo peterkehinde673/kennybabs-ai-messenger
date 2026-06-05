@@ -17,6 +17,7 @@ import { deriveDirectAddress } from './identity';
 import {
   CertificationData,
   CertificationStatus,
+  EncodedPredicate,
   type MintJustificationVerifierService,
   MintTransaction,
   type NetworkId,
@@ -86,7 +87,7 @@ export class SphereTokenEngine {
 
   // ── lifecycle ────────────────────────────────────────────────────────────────
 
-  public async mint(params: MintParams, _options?: EngineOpOptions): Promise<SphereToken> {
+  public async mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken> {
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const data = params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
 
@@ -103,6 +104,7 @@ export class SphereTokenEngine {
       this.deps.trustBase,
       this.deps.predicateVerifier,
       mintTx,
+      options?.signal,
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const token = await Token.mint(
@@ -114,7 +116,8 @@ export class SphereTokenEngine {
     return this.wrapToken(token);
   }
 
-  public async transfer(params: TransferParams, _options?: EngineOpOptions): Promise<SphereToken> {
+  public async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
+    this.assertOwned(params.token);
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const stateMask = crypto.getRandomValues(new Uint8Array(32));
 
@@ -132,6 +135,7 @@ export class SphereTokenEngine {
       this.deps.trustBase,
       this.deps.predicateVerifier,
       transferTx,
+      options?.signal,
     );
     const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const transferred = await params.token.sdkToken.transfer(this.deps.trustBase, this.deps.predicateVerifier, certified);
@@ -156,15 +160,42 @@ export class SphereTokenEngine {
   }
 
   public async decodeToken(blob: TokenBlob): Promise<SphereToken> {
-    return this.wrapToken(await Token.fromCBOR(blob.token));
+    const sdkToken = await Token.fromCBOR(blob.token);
+    if (sdkToken.genesis.networkId.id !== this.deps.networkId.id) {
+      throw new SphereError(
+        `Token network mismatch: token is on network ${sdkToken.genesis.networkId.id}, ` +
+          `engine on ${this.deps.networkId.id}`,
+        'VALIDATION_ERROR',
+      );
+    }
+    return this.wrapToken(sdkToken);
   }
 
   // ── internals ────────────────────────────────────────────────────────────────
 
+  /** Fail fast if this engine's key does not own the token's current state. */
+  private assertOwned(token: SphereToken): void {
+    const owner = token.sdkToken.latestTransaction.recipient;
+    const mine = EncodedPredicate.fromPredicate(SignaturePredicate.create(this.deps.signingService.publicKey));
+    if (!EncodedPredicate.equals(owner, mine)) {
+      throw new SphereError('Cannot transfer a token not owned by this engine identity', 'VALIDATION_ERROR');
+    }
+  }
+
   /** Wrap an SDK token into a SphereToken: cache its blob + decoded value. */
   private wrapToken(sdkToken: Token): SphereToken {
     const data = sdkToken.genesis.data;
-    const value = data ? SpherePaymentData.fromCBOR(data).toValue() : null;
+    let value: SphereValue | null = null;
+    if (data) {
+      try {
+        value = SpherePaymentData.fromCBOR(data).toValue();
+      } catch (err) {
+        throw new SphereError(
+          `Failed to decode token payment data: ${err instanceof Error ? err.message : String(err)}`,
+          'VALIDATION_ERROR',
+        );
+      }
+    }
     const blob: TokenBlob = {
       v: TOKEN_BLOB_VERSION,
       network: sdkToken.genesis.networkId.id,
