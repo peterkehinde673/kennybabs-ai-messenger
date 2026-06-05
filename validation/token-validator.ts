@@ -1,14 +1,20 @@
 /**
- * Token Validation Service for SDK2
- * Validates tokens against aggregator and fetches missing proofs
+ * Token Validation Service — engine-based (v2).
  *
- * Platform-independent implementation that accepts dependencies via constructor.
+ * A thin, platform-independent wrapper over `ITokenEngine`: structural validity
+ * via `engine.verify`, spent-status via `engine.isSpent` (with a per-state TTL
+ * cache). It operates on `SphereToken` — the v1 TXF / `RequestId` / direct
+ * aggregator path is gone; the engine owns the aggregator and the trust base.
+ *
+ * NOTE: this is a standalone public utility and is NOT on the live wallet path
+ * (payments validate via the oracle). It is migrated to the engine for
+ * consistency and so callers never touch the SDK.
  */
 
 import { logger } from '../core/logger';
-import type { Token } from '../types';
-import type { TxfTransaction, ValidationIssue, TokenValidationResult } from '../types/txf';
-import { tokenToTxf } from '../serialization/txf-serializer';
+import { bytesToHex, sha256 } from '../core/crypto';
+import type { ITokenEngine, SphereToken } from '../token-engine';
+import type { ValidationIssue, TokenValidationResult } from '../types/txf';
 
 // =============================================================================
 // Types
@@ -20,10 +26,9 @@ export interface ExtendedValidationResult extends TokenValidationResult {
   action?: ValidationAction;
 }
 
+/** Identifies a spent token by its per-state id (SHA-256 of the token's CBOR). */
 export interface SpentTokenInfo {
-  tokenId: string;
-  localId: string;
-  stateHash: string;
+  stateId: string;
 }
 
 export interface SpentTokenResult {
@@ -32,33 +37,17 @@ export interface SpentTokenResult {
 }
 
 export interface ValidationResult {
-  validTokens: Token[];
+  validTokens: SphereToken[];
   issues: ValidationIssue[];
 }
 
 /**
- * Aggregator client interface - must be provided by the platform
+ * Per-state id: SHA-256 over the token's CBOR. Deterministic and unique per
+ * state (the CBOR includes the full transfer chain), so it changes with every
+ * transfer — exactly the right key for a spent-status cache.
  */
-export interface AggregatorClient {
-  getInclusionProof(requestId: unknown): Promise<{
-    inclusionProof?: {
-      authenticator: unknown | null;
-      merkleTreePath: {
-        verify(key: bigint): Promise<{
-          isPathValid: boolean;
-          isPathIncluded: boolean;
-        }>;
-      };
-    };
-  }>;
-  isTokenStateSpent?(trustBase: unknown, token: unknown, pubKey: Buffer): Promise<boolean>;
-}
-
-/**
- * Trust base loader interface
- */
-export interface TrustBaseLoader {
-  load(): Promise<unknown | null>;
+function stateIdOf(token: SphereToken): string {
+  return sha256(bytesToHex(token.blob.token), 'hex');
 }
 
 // =============================================================================
@@ -66,53 +55,26 @@ export interface TrustBaseLoader {
 // =============================================================================
 
 export class TokenValidator {
-  private aggregatorClient: AggregatorClient | null = null;
-  private trustBase: unknown | null = null;
-  private skipVerification: boolean;
+  private readonly engine: ITokenEngine;
 
-  // Cache for spent state verification
-  private spentStateCache = new Map<string, {
-    isSpent: boolean;
-    timestamp: number;
-  }>();
+  // Spent-status cache: SPENT is permanent (immutable), UNSPENT expires after a TTL.
+  private spentStateCache = new Map<string, { isSpent: boolean; timestamp: number }>();
   private readonly UNSPENT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-  constructor(options: {
-    aggregatorClient?: AggregatorClient;
-    trustBase?: unknown;
-    skipVerification?: boolean;
-  } = {}) {
-    this.aggregatorClient = options.aggregatorClient || null;
-    this.trustBase = options.trustBase || null;
-    this.skipVerification = options.skipVerification || false;
+  constructor(engine: ITokenEngine) {
+    this.engine = engine;
   }
 
-  /**
-   * Set the aggregator client
-   */
-  setAggregatorClient(client: AggregatorClient): void {
-    this.aggregatorClient = client;
-  }
-
-  /**
-   * Set the trust base
-   */
-  setTrustBase(trustBase: unknown): void {
-    this.trustBase = trustBase;
-  }
-
-  // =============================================================================
+  // ===========================================================================
   // Public API
-  // =============================================================================
+  // ===========================================================================
 
-  /**
-   * Validate all tokens (parallel with batch limit)
-   */
+  /** Validate all tokens (parallel, with a batch limit). */
   async validateAllTokens(
-    tokens: Token[],
-    options?: { batchSize?: number; onProgress?: (completed: number, total: number) => void }
+    tokens: SphereToken[],
+    options?: { batchSize?: number; onProgress?: (completed: number, total: number) => void },
   ): Promise<ValidationResult> {
-    const validTokens: Token[] = [];
+    const validTokens: SphereToken[] = [];
     const issues: ValidationIssue[] = [];
 
     const batchSize = options?.batchSize ?? 5;
@@ -122,391 +84,98 @@ export class TokenValidator {
     for (let i = 0; i < tokens.length; i += batchSize) {
       const batch = tokens.slice(i, i + batchSize);
 
-      const batchResults = await Promise.allSettled(
-        batch.map(async (token) => {
-          try {
-            const result = await this.validateToken(token);
-            return { token, result };
-          } catch (err) {
-            return {
-              token,
-              result: {
-                isValid: false,
-                reason: err instanceof Error ? err.message : String(err),
-              } as TokenValidationResult,
-            };
-          }
-        })
+      const batchResults = await Promise.all(
+        batch.map(async (token) => ({ token, result: await this.validateToken(token) })),
       );
 
-      for (const settledResult of batchResults) {
+      for (const { token, result } of batchResults) {
         completed++;
-
-        if (settledResult.status === 'fulfilled') {
-          const { token, result } = settledResult.value;
-          if (result.isValid) {
-            validTokens.push(token);
-          } else {
-            issues.push({
-              tokenId: token.id,
-              reason: result.reason || 'Unknown validation error',
-              recoverable: false,
-            });
-          }
+        if (result.isValid) {
+          validTokens.push(token);
         } else {
           issues.push({
-            tokenId: batch[batchResults.indexOf(settledResult)]?.id || 'unknown',
-            reason: String(settledResult.reason),
+            tokenId: stateIdOf(token),
+            reason: result.reason || 'Unknown validation error',
             recoverable: false,
           });
         }
       }
 
-      if (options?.onProgress) {
-        options.onProgress(completed, total);
-      }
+      options?.onProgress?.(completed, total);
     }
 
     return { validTokens, issues };
   }
 
-  /**
-   * Validate a single token
-   */
-  async validateToken(token: Token): Promise<TokenValidationResult> {
-    // Check if token has SDK data
-    if (!token.sdkData) {
-      return {
-        isValid: false,
-        reason: 'Token has no SDK data',
-      };
-    }
-
-    let txfToken: unknown;
-    try {
-      txfToken = JSON.parse(token.sdkData);
-    } catch {
-      return {
-        isValid: false,
-        reason: 'Failed to parse token SDK data as JSON',
-      };
-    }
-
-    // Check basic structure
-    if (!this.hasValidTxfStructure(txfToken)) {
-      return {
-        isValid: false,
-        reason: 'Token data missing required TXF fields (genesis, state)',
-      };
-    }
-
-    // Check for uncommitted transactions
-    const uncommitted = this.getUncommittedTransactions(txfToken);
-    if (uncommitted.length > 0) {
-      // Could try to fetch missing proofs from aggregator
-      return {
-        isValid: false,
-        reason: `${uncommitted.length} uncommitted transaction(s)`,
-      };
-    }
-
-    // Verify with SDK if trust base available and not skipping verification
-    if (this.trustBase && !this.skipVerification) {
-      try {
-        const verificationResult = await this.verifyWithSdk(txfToken);
-        if (!verificationResult.success) {
-          return {
-            isValid: false,
-            reason: verificationResult.error || 'SDK verification failed',
-          };
-        }
-      } catch (err) {
-        // SDK verification is optional
-        logger.warn('Validation', 'SDK verification skipped:', err instanceof Error ? err.message : err);
-      }
-    }
-
-    return { isValid: true };
+  /** Validate a single token's structural integrity against the trust base. */
+  async validateToken(token: SphereToken): Promise<TokenValidationResult> {
+    const result = await this.engine.verify(token);
+    return result.ok ? { isValid: true } : { isValid: false, reason: result.reason || 'Verification failed' };
   }
 
   /**
-   * Check if a token state is spent on the aggregator
+   * Whether a token's current state has been spent on the network. Cached:
+   * SPENT permanently, UNSPENT for `UNSPENT_CACHE_TTL_MS`. Graceful — an engine
+   * error is treated as unspent (and not cached).
    */
-  async isTokenStateSpent(
-    tokenId: string,
-    stateHash: string,
-    publicKey: string
-  ): Promise<boolean> {
-    if (!this.aggregatorClient) {
-      return false;
+  async isSpent(token: SphereToken): Promise<boolean> {
+    const key = stateIdOf(token);
+
+    const cached = this.spentStateCache.get(key);
+    if (cached) {
+      if (cached.isSpent) return true; // SPENT is immutable
+      if (Date.now() - cached.timestamp < this.UNSPENT_CACHE_TTL_MS) return false;
     }
 
-    // Check cache first
-    const cacheKey = `${tokenId}:${stateHash}:${publicKey}`;
-    const cached = this.spentStateCache.get(cacheKey);
-    if (cached !== undefined) {
-      if (cached.isSpent) {
-        return true; // SPENT is immutable
-      }
-      // UNSPENT expires after TTL
-      if (Date.now() - cached.timestamp < this.UNSPENT_CACHE_TTL_MS) {
-        return false;
-      }
-    }
-
+    let spent: boolean;
     try {
-      // Dynamic SDK imports
-      const { RequestId } = await import(
-        '@unicitylabs/state-transition-sdk/lib/api/RequestId'
-      );
-      const { DataHash } = await import(
-        '@unicitylabs/state-transition-sdk/lib/hash/DataHash'
-      );
-
-      const pubKeyBytes = Buffer.from(publicKey, 'hex');
-      const stateHashObj = DataHash.fromJSON(stateHash);
-      const requestId = await RequestId.create(pubKeyBytes, stateHashObj);
-
-      const response = await this.aggregatorClient.getInclusionProof(requestId);
-
-      let isSpent = false;
-
-      if (response.inclusionProof) {
-        const proof = response.inclusionProof;
-        const pathResult = await proof.merkleTreePath.verify(
-          requestId.toBitString().toBigInt()
-        );
-
-        if (pathResult.isPathValid && pathResult.isPathIncluded && proof.authenticator !== null) {
-          isSpent = true;
-        }
-      }
-
-      // Cache result
-      this.spentStateCache.set(cacheKey, {
-        isSpent,
-        timestamp: Date.now(),
-      });
-
-      return isSpent;
+      spent = await this.engine.isSpent(token);
     } catch (err) {
-      logger.warn('Validation', 'Error checking token state:', err);
+      logger.warn('Validation', 'Error checking spent status:', err);
       return false;
     }
+
+    this.spentStateCache.set(key, { isSpent: spent, timestamp: Date.now() });
+    return spent;
   }
 
-  /**
-   * Check which tokens are spent using SDK Token object to calculate state hash.
-   *
-   * Follows the same approach as the Sphere webgui TokenValidationService:
-   * 1. Parse TXF using SDK's Token.fromJSON()
-   * 2. Calculate CURRENT state hash via sdkToken.state.calculateHash()
-   * 3. Create RequestId via RequestId.create(walletPubKey, calculatedHash)
-   *
-   * Uses wallet's own pubkey (not source state predicate key) because "spent" means
-   * the CURRENT OWNER committed this state. Using the source state key would falsely
-   * detect received tokens as "spent" (sender's commitment matches source state).
-   */
+  /** Check which of the given tokens are spent, returning them by per-state id. */
   async checkSpentTokens(
-    tokens: Token[],
-    publicKey: string,
-    options?: { batchSize?: number; onProgress?: (completed: number, total: number) => void }
+    tokens: SphereToken[],
+    options?: { batchSize?: number; onProgress?: (completed: number, total: number) => void },
   ): Promise<SpentTokenResult> {
     const spentTokens: SpentTokenInfo[] = [];
     const errors: string[] = [];
-
-    if (!this.aggregatorClient) {
-      errors.push('Aggregator client not available');
-      return { spentTokens, errors };
-    }
 
     const batchSize = options?.batchSize ?? 3;
     const total = tokens.length;
     let completed = 0;
 
-    // Import SDK modules once
-    const { Token: SdkToken } = await import(
-      '@unicitylabs/state-transition-sdk/lib/token/Token'
-    );
-    const { RequestId } = await import(
-      '@unicitylabs/state-transition-sdk/lib/api/RequestId'
-    );
-
-    const pubKeyBytes = Buffer.from(publicKey, 'hex');
-
     for (let i = 0; i < tokens.length; i += batchSize) {
       const batch = tokens.slice(i, i + batchSize);
 
       const batchResults = await Promise.allSettled(
-        batch.map(async (token) => {
-          try {
-            const txf = tokenToTxf(token);
-            if (!txf) {
-              return { tokenId: token.id, localId: token.id, stateHash: '', spent: false, error: 'Invalid TXF' };
-            }
-
-            const tokenId = txf.genesis?.data?.tokenId || token.id;
-
-            // Parse TXF into SDK Token object (like webgui does)
-            const sdkToken = await SdkToken.fromJSON(txf);
-
-            // Use SDK-calculated state hash + wallet's own public key for spent detection
-            // (matching webgui TokenValidationService approach)
-            //
-            // Key insight: "spent" means the CURRENT OWNER has committed this state as input
-            // for another transition. So we check:
-            //   RequestId = hash(wallet_pubkey + current_state_hash)
-            // If the aggregator has an inclusion proof → we spent this token
-            // If exclusion proof → token is still ours (unspent)
-            //
-            // Using the SOURCE STATE's predicate key would incorrectly detect received tokens
-            // as "spent" (because the sender's commitment matches the source state).
-            const calculatedStateHash = await sdkToken.state.calculateHash();
-            const calculatedStateHashStr = calculatedStateHash.toJSON();
-
-            // Check cache
-            const cacheKey = `${tokenId}:${calculatedStateHashStr}:${publicKey}`;
-            const cached = this.spentStateCache.get(cacheKey);
-            if (cached !== undefined) {
-              if (cached.isSpent) {
-                return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: true };
-              }
-              if (Date.now() - cached.timestamp < this.UNSPENT_CACHE_TTL_MS) {
-                return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: false };
-              }
-            }
-
-            // Create RequestId using wallet's public key + SDK-calculated state hash
-            const { DataHash } = await import(
-              '@unicitylabs/state-transition-sdk/lib/hash/DataHash'
-            );
-            const stateHashObj = DataHash.fromJSON(calculatedStateHashStr);
-            const requestId = await RequestId.create(pubKeyBytes, stateHashObj);
-
-            // Query aggregator
-            const response = await this.aggregatorClient!.getInclusionProof(requestId);
-
-            let isSpent = false;
-
-            if (response.inclusionProof) {
-              const proof = response.inclusionProof;
-              const pathResult = await proof.merkleTreePath.verify(
-                requestId.toBitString().toBigInt()
-              );
-
-              if (pathResult.isPathValid && pathResult.isPathIncluded && proof.authenticator !== null) {
-                isSpent = true;
-              }
-            }
-
-            // Cache result
-            this.spentStateCache.set(cacheKey, {
-              isSpent,
-              timestamp: Date.now(),
-            });
-
-            return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: isSpent };
-          } catch (err) {
-            return {
-              tokenId: token.id,
-              localId: token.id,
-              stateHash: '',
-              spent: false,
-              error: err instanceof Error ? err.message : String(err),
-            };
-          }
-        })
+        batch.map(async (token) => ({ stateId: stateIdOf(token), spent: await this.isSpent(token) })),
       );
 
       for (const result of batchResults) {
         completed++;
         if (result.status === 'fulfilled') {
-          if (result.value.spent) {
-            spentTokens.push({
-              tokenId: result.value.tokenId,
-              localId: result.value.localId,
-              stateHash: result.value.stateHash,
-            });
-          }
-          if (result.value.error) {
-            errors.push(`Token ${result.value.tokenId}: ${result.value.error}`);
-          }
+          if (result.value.spent) spentTokens.push({ stateId: result.value.stateId });
         } else {
           errors.push(String(result.reason));
         }
       }
 
-      if (options?.onProgress) {
-        options.onProgress(completed, total);
-      }
+      options?.onProgress?.(completed, total);
     }
 
     return { spentTokens, errors };
   }
 
-  /**
-   * Clear the spent state cache
-   */
+  /** Clear the spent-status cache. */
   clearSpentStateCache(): void {
     this.spentStateCache.clear();
-  }
-
-  // =============================================================================
-  // Private Helpers
-  // =============================================================================
-
-  private hasValidTxfStructure(obj: unknown): boolean {
-    if (!obj || typeof obj !== 'object') return false;
-
-    const txf = obj as Record<string, unknown>;
-    return !!(
-      txf.genesis &&
-      typeof txf.genesis === 'object' &&
-      txf.state &&
-      typeof txf.state === 'object'
-    );
-  }
-
-  private getUncommittedTransactions(txfToken: unknown): TxfTransaction[] {
-    const txf = txfToken as Record<string, unknown>;
-    const transactions = txf.transactions as TxfTransaction[] | undefined;
-
-    if (!transactions || !Array.isArray(transactions)) {
-      return [];
-    }
-
-    return transactions.filter((tx) => tx.inclusionProof === null);
-  }
-
-  private async verifyWithSdk(txfToken: unknown): Promise<{ success: boolean; error?: string }> {
-    try {
-      const { Token } = await import(
-        '@unicitylabs/state-transition-sdk/lib/token/Token'
-      );
-
-      const sdkToken = await Token.fromJSON(txfToken);
-
-      if (!this.trustBase) {
-        return { success: true };
-      }
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = await sdkToken.verify(this.trustBase as any);
-
-      if (!result.isSuccessful) {
-        return {
-          success: false,
-          error: String(result) || 'Verification failed',
-        };
-      }
-
-      return { success: true };
-    } catch (err) {
-      return {
-        success: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
   }
 }
 
@@ -514,13 +183,7 @@ export class TokenValidator {
 // Factory Function
 // =============================================================================
 
-/**
- * Create a token validator instance
- */
-export function createTokenValidator(options?: {
-  aggregatorClient?: AggregatorClient;
-  trustBase?: unknown;
-  skipVerification?: boolean;
-}): TokenValidator {
-  return new TokenValidator(options);
+/** Create a token validator backed by the given engine. */
+export function createTokenValidator(engine: ITokenEngine): TokenValidator {
+  return new TokenValidator(engine);
 }
