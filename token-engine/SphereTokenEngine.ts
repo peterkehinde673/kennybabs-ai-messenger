@@ -15,9 +15,12 @@
 import { SphereError } from '../core/errors';
 import { deriveDirectAddress } from './identity';
 import {
+  CborDeserializer,
+  CborSerializer,
   CertificationData,
   CertificationStatus,
   EncodedPredicate,
+  HexConverter,
   type MintJustificationVerifierService,
   MintTransaction,
   type NetworkId,
@@ -32,7 +35,9 @@ import {
   StateId,
   type StateTransitionClient,
   Token,
+  TokenSalt,
   TokenSplit,
+  TokenType,
   TransferTransaction,
   VerificationStatus,
   waitInclusionProof,
@@ -44,6 +49,7 @@ import type {
   CoinId,
   EngineIdentity,
   EngineVerifyResult,
+  MintDataTokenParams,
   MintParams,
   SphereToken,
   SphereValue,
@@ -92,6 +98,29 @@ export class SphereTokenEngine implements ITokenEngine {
     return sum;
   }
 
+  public tokenId(token: SphereToken): string {
+    return token.blob.tokenId;
+  }
+
+  public readMemo(token: SphereToken): Uint8Array | null {
+    const sdkToken = token.sdkToken;
+    // A transferred token delivers its memo on the latest transfer.
+    if (sdkToken.transactions.length > 0) {
+      return sdkToken.latestTransaction.data;
+    }
+    // A minted output (e.g. a split output) carries the memo in its value envelope.
+    const data = sdkToken.genesis.data;
+    if (data && this.isSpherePaymentData(data)) {
+      return SpherePaymentData.fromCBOR(data).memo;
+    }
+    return null;
+  }
+
+  public readTokenData(token: SphereToken): Uint8Array | null {
+    const data = token.sdkToken.genesis.data;
+    return data ? new Uint8Array(data) : null;
+  }
+
   // ── lifecycle ────────────────────────────────────────────────────────────────
 
   public async mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken> {
@@ -123,12 +152,45 @@ export class SphereTokenEngine implements ITokenEngine {
     return this.wrapToken(token);
   }
 
+  public async mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken> {
+    const recipient = SignaturePredicate.create(params.recipientPubkey);
+    const tokenType = params.tokenType ? new TokenType(params.tokenType) : TokenType.generate();
+    // A deterministic salt yields a stable, terms-derived tokenId (TokenId.fromSalt).
+    const salt = params.salt
+      ? TokenSalt.fromCBOR(CborSerializer.encodeByteString(params.salt))
+      : TokenSalt.generate();
+
+    const mintTx = await MintTransaction.create(this.deps.networkId, recipient, params.data, tokenType, salt);
+    const certificationData = await CertificationData.fromMintTransaction(mintTx);
+
+    const response = await this.deps.client.submitCertificationRequest(certificationData);
+    if (response.status !== CertificationStatus.SUCCESS) {
+      throw new SphereError(`Data-token mint failed: ${response.status}`, 'AGGREGATOR_ERROR');
+    }
+
+    const proof = await waitInclusionProof(
+      this.deps.client,
+      this.deps.trustBase,
+      this.deps.predicateVerifier,
+      mintTx,
+      options?.signal,
+    );
+    const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
+    const token = await Token.mint(
+      this.deps.trustBase,
+      this.deps.predicateVerifier,
+      this.deps.mintJustificationVerifier,
+      certified,
+    );
+    return this.wrapToken(token);
+  }
+
   public async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
     this.assertOwned(params.token);
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const stateMask = crypto.getRandomValues(new Uint8Array(32));
 
-    const transferTx = await TransferTransaction.create(params.token.sdkToken, recipient, stateMask, null);
+    const transferTx = await TransferTransaction.create(params.token.sdkToken, recipient, stateMask, params.data ?? null);
     const unlockScript = await SignaturePredicateUnlockScript.create(transferTx, this.deps.signingService);
     const certificationData = await CertificationData.fromTransaction(transferTx, unlockScript);
 
@@ -192,8 +254,10 @@ export class SphereTokenEngine implements ITokenEngine {
 
     // 2. Mint each output, justified by the burnt token + its split proofs.
     const outputs: SphereToken[] = [];
-    for (const splitToken of split.tokens) {
-      const data = await SpherePaymentData.create(splitToken.assets).encode();
+    for (let i = 0; i < split.tokens.length; i++) {
+      const splitToken = split.tokens[i];
+      // split.tokens preserves requests order, so the per-output memo maps by index.
+      const data = await SpherePaymentData.create(splitToken.assets, params.outputs[i].data ?? null).encode();
       const justification = SplitMintJustification.create(burntToken, splitToken.proofs).toCBOR();
       const mintTx = await MintTransaction.create(
         splitToken.networkId,
@@ -283,11 +347,13 @@ export class SphereTokenEngine implements ITokenEngine {
     }
   }
 
-  /** Wrap an SDK token into a SphereToken: cache its blob + decoded value. */
+  /** Wrap an SDK token into a SphereToken: cache its blob (incl. stable tokenId) + decoded value. */
   private wrapToken(sdkToken: Token): SphereToken {
     const data = sdkToken.genesis.data;
     let value: SphereValue | null = null;
-    if (data) {
+    // Only value tokens carry a SpherePaymentData envelope; data tokens (e.g. invoices)
+    // leave value === null. A corrupt value envelope still errors loudly.
+    if (data && this.isSpherePaymentData(data)) {
       try {
         value = SpherePaymentData.fromCBOR(data).toValue();
       } catch (err) {
@@ -300,8 +366,18 @@ export class SphereTokenEngine implements ITokenEngine {
     const blob: TokenBlob = {
       v: TOKEN_BLOB_VERSION,
       network: sdkToken.genesis.networkId.id,
+      tokenId: HexConverter.encode(sdkToken.id.bytes),
       token: sdkToken.toCBOR(),
     };
     return { sdkToken, blob, value };
+  }
+
+  /** True if the bytes are a SpherePaymentData envelope (value token) vs a raw data token. */
+  private isSpherePaymentData(data: Uint8Array): boolean {
+    try {
+      return CborDeserializer.decodeTag(data).tag === SpherePaymentData.CBOR_TAG;
+    } catch {
+      return false;
+    }
   }
 }

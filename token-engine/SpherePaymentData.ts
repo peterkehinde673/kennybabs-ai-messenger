@@ -52,17 +52,25 @@ export class SpherePaymentData implements IPaymentData {
   /** Envelope version; bump when the structure changes. */
   public static readonly VERSION = 1n;
 
-  private constructor(public readonly assets: PaymentAssetCollection) {}
+  private constructor(
+    public readonly assets: PaymentAssetCollection,
+    private readonly _memo: Uint8Array | null = null,
+  ) {}
 
-  /** Wrap an existing SDK asset collection. */
-  public static create(assets: PaymentAssetCollection): SpherePaymentData {
-    return new SpherePaymentData(assets);
+  /** Opaque, app-defined memo carried alongside the value (e.g. invoice attribution). */
+  public get memo(): Uint8Array | null {
+    return this._memo ? new Uint8Array(this._memo) : null;
   }
 
-  /** Build from a sphere-domain value (hex coin id → bigint amount). */
-  public static fromValue(value: SphereValue): SpherePaymentData {
+  /** Wrap an existing SDK asset collection (+ optional opaque memo). */
+  public static create(assets: PaymentAssetCollection, memo: Uint8Array | null = null): SpherePaymentData {
+    return new SpherePaymentData(assets, memo);
+  }
+
+  /** Build from a sphere-domain value (hex coin id → bigint amount) + optional opaque memo. */
+  public static fromValue(value: SphereValue, memo: Uint8Array | null = null): SpherePaymentData {
     const assets = value.assets.map((a) => sphereAssetToSdk(a.coinId, a.amount));
-    return new SpherePaymentData(PaymentAssetCollection.create(...assets));
+    return new SpherePaymentData(PaymentAssetCollection.create(...assets), memo);
   }
 
   /** Decode from the CBOR envelope produced by {@link encode}. */
@@ -71,15 +79,16 @@ export class SpherePaymentData implements IPaymentData {
     if (tag.tag !== SpherePaymentData.CBOR_TAG) {
       throw new CborError(`Invalid SpherePaymentData tag: ${tag.tag}`);
     }
-    const fields = CborDeserializer.decodeArray(tag.data, 2);
+    const fields = CborDeserializer.decodeArray(tag.data);
     const version = CborDeserializer.decodeUnsignedInteger(fields[0]);
     if (version !== SpherePaymentData.VERSION) {
       throw new CborError(`Unsupported SpherePaymentData version: ${version}`);
     }
-    return new SpherePaymentData(PaymentAssetCollection.fromCBOR(fields[1]));
+    const memo = fields.length > 2 ? CborDeserializer.decodeNullable(fields[2], CborDeserializer.decodeByteString) : null;
+    return new SpherePaymentData(PaymentAssetCollection.fromCBOR(fields[1]), memo);
   }
 
-  /** Deterministic, versioned, tagged CBOR: `tag(39050)[ version, assets ]`. */
+  /** Deterministic, versioned, tagged CBOR: `tag(39050)[ version, assets, memo? ]`. */
   public encode(): Promise<Uint8Array> {
     return Promise.resolve(
       CborSerializer.encodeTag(
@@ -87,6 +96,7 @@ export class SpherePaymentData implements IPaymentData {
         CborSerializer.encodeArray(
           CborSerializer.encodeUnsignedInteger(SpherePaymentData.VERSION),
           this.assets.toCBOR(),
+          CborSerializer.encodeNullable(this._memo, CborSerializer.encodeByteString),
         ),
       ),
     );

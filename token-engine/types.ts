@@ -57,6 +57,12 @@ export interface TokenBlob {
   readonly v: number;
   /** NetworkId.id the token belongs to (mainnet=1 / testnet=2 / local=3). */
   readonly network: number;
+  /**
+   * Genesis-stable token id — 64-char lowercase hex of the v2 `TokenId.bytes`
+   * (same across every state of the token). Stored on the blob so dedup / listing
+   * / tombstone keys need no engine call. `createTokenStateKey = ${tokenId}_${hash}`.
+   */
+  readonly tokenId: string;
   /** CBOR bytes of the v2 Token (`Token.toCBOR()`). */
   readonly token: Uint8Array;
 }
@@ -83,11 +89,29 @@ export interface MintParams {
   readonly value?: SphereValue | null;
 }
 
+/**
+ * Mint a NON-value (data) token: arbitrary opaque `data` (e.g. serialized invoice
+ * terms), a custom `tokenType`, and a deterministic `salt` → a stable,
+ * terms-derived `tokenId`. The minted token has `value === null` (it carries data,
+ * not coins); read the bytes back with `readTokenData`.
+ */
+export interface MintDataTokenParams {
+  readonly recipientPubkey: Uint8Array;
+  /** Opaque token payload (the engine does not interpret it). */
+  readonly data: Uint8Array;
+  /** Token type bytes; defaults to a random type when omitted. */
+  readonly tokenType?: Uint8Array;
+  /** Salt bytes; deterministic salt → deterministic (terms-derived) tokenId. */
+  readonly salt?: Uint8Array;
+}
+
 export interface TransferParams {
   /** The token to spend (must be owned by this engine's identity). */
   readonly token: SphereToken;
   /** Recipient's 33-byte compressed chain pubkey. */
   readonly recipientPubkey: Uint8Array;
+  /** Optional opaque on-chain memo carried on the transfer (read back via `readMemo`). */
+  readonly data?: Uint8Array;
 }
 
 /**
@@ -100,6 +124,8 @@ export interface SplitOutput {
   readonly recipientPubkey: Uint8Array;
   readonly coinId: CoinId;
   readonly amount: bigint;
+  /** Optional opaque memo carried in this output's value envelope (read back via `readMemo`). */
+  readonly data?: Uint8Array;
 }
 
 export interface SplitParams {

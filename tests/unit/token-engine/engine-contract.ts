@@ -98,5 +98,52 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       // …but now spent.
       expect(await e.isSpent(t)).toBe(true);
     });
+
+    it('exposes a 64-char hex tokenId that is stable across a transfer', async () => {
+      const e = makeEngine();
+      const src = await mintSelf(e, 5n);
+      const id = e.tokenId(src);
+      expect(id).toMatch(/^[0-9a-f]{64}$/);
+      const recv = await e.transfer({ token: src, recipientPubkey: PK_B });
+      expect(e.tokenId(recv)).toBe(id); // same token (genesis), new state
+    });
+
+    it('mints a data token (value === null) with readable data and a salt-derived tokenId', async () => {
+      const e = makeEngine();
+      const data = new Uint8Array([1, 2, 3, 4]);
+      const tokenType = new Uint8Array(32).fill(1);
+      const salt = new Uint8Array(32).fill(7);
+      const t = await e.mintDataToken({ recipientPubkey: PK_A, data, tokenType, salt });
+      expect(e.readValue(t)).toBeNull();
+      expect(e.readTokenData(t)).toEqual(data);
+      expect(e.tokenId(t)).toMatch(/^[0-9a-f]{64}$/);
+      // tokenId is derived from (networkId, salt): the same terms-derived salt re-mints
+      // to the identical, stable tokenId (the invoice-id use case).
+      const again = await e.mintDataToken({ recipientPubkey: PK_A, data, tokenType, salt });
+      expect(e.tokenId(again)).toBe(e.tokenId(t));
+    });
+
+    it('carries an opaque on-chain memo on a whole-token transfer (readMemo)', async () => {
+      const e = makeEngine();
+      const src = await mintSelf(e, 1n);
+      const memo = new Uint8Array([9, 8, 7]);
+      const recv = await e.transfer({ token: src, recipientPubkey: PK_B, data: memo });
+      expect(e.readMemo(recv)).toEqual(memo);
+    });
+
+    it('carries an opaque on-chain memo on a split output (readMemo)', async () => {
+      const e = makeEngine();
+      const src = await mintSelf(e, 10n);
+      const memo = new Uint8Array([4, 2]);
+      const { outputs } = await e.split({
+        token: src,
+        outputs: [
+          { recipientPubkey: PK_B, coinId: COIN, amount: 6n, data: memo },
+          { recipientPubkey: e.getIdentity().chainPubkey, coinId: COIN, amount: 4n },
+        ],
+      });
+      expect(e.readMemo(outputs[0])).toEqual(memo);
+      expect(e.readMemo(outputs[1])).toBeNull();
+    });
   });
 }
