@@ -40,6 +40,12 @@ function assertAsset(coinId: CoinId, amount: bigint): void {
   }
 }
 
+/** Validate a sphere-domain asset and build the SDK Asset — the single validation point. */
+export function sphereAssetToSdk(coinId: CoinId, amount: bigint): Asset {
+  assertAsset(coinId, amount);
+  return new Asset(new AssetId(HexConverter.decode(coinId)), amount);
+}
+
 export class SpherePaymentData implements IPaymentData {
   /** Sphere-private CBOR tag (verified free in the v2 SDK tag space). */
   public static readonly CBOR_TAG = 39050n;
@@ -55,10 +61,7 @@ export class SpherePaymentData implements IPaymentData {
 
   /** Build from a sphere-domain value (hex coin id → bigint amount). */
   public static fromValue(value: SphereValue): SpherePaymentData {
-    const assets = value.assets.map((a) => {
-      assertAsset(a.coinId, a.amount);
-      return new Asset(new AssetId(HexConverter.decode(a.coinId)), a.amount);
-    });
+    const assets = value.assets.map((a) => sphereAssetToSdk(a.coinId, a.amount));
     return new SpherePaymentData(PaymentAssetCollection.create(...assets));
   }
 
@@ -107,4 +110,12 @@ export class SpherePaymentData implements IPaymentData {
     const asset = this.assets.get(new AssetId(HexConverter.decode(coinId)));
     return asset ? asset.value : 0n;
   }
+}
+
+/**
+ * Async payment-data decoder matching the SDK's `decodePaymentData` signature.
+ * Used by `TokenSplit.split` (value conservation) and `SplitMintJustificationVerifier`.
+ */
+export function decodeSpherePaymentData(bytes: Uint8Array): Promise<IPaymentData> {
+  return Promise.resolve(SpherePaymentData.fromCBOR(bytes));
 }

@@ -21,18 +21,22 @@ import {
   type MintJustificationVerifierService,
   MintTransaction,
   type NetworkId,
+  PaymentAssetCollection,
   type PredicateVerifierService,
   type RootTrustBase,
   SignaturePredicate,
   SignaturePredicateUnlockScript,
   type SigningService,
+  SplitMintJustification,
+  SplitTokenRequest,
   type StateTransitionClient,
   Token,
+  TokenSplit,
   TransferTransaction,
   VerificationStatus,
   waitInclusionProof,
 } from './sdk';
-import { SpherePaymentData } from './SpherePaymentData';
+import { decodeSpherePaymentData, SpherePaymentData, sphereAssetToSdk } from './SpherePaymentData';
 import { TOKEN_BLOB_VERSION } from './token-blob';
 import type { EngineOpOptions } from './engine';
 import type {
@@ -42,6 +46,8 @@ import type {
   MintParams,
   SphereToken,
   SphereValue,
+  SplitParams,
+  SplitResult,
   TokenBlob,
   TransferParams,
 } from './types';
@@ -140,6 +146,85 @@ export class SphereTokenEngine {
     const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const transferred = await params.token.sdkToken.transfer(this.deps.trustBase, this.deps.predicateVerifier, certified);
     return this.wrapToken(transferred);
+  }
+
+  public async split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult> {
+    this.assertOwned(params.token);
+    if (params.outputs.length === 0) {
+      throw new SphereError('Split requires at least one output', 'VALIDATION_ERROR');
+    }
+
+    const requests = params.outputs.map((o) =>
+      SplitTokenRequest.create(
+        SignaturePredicate.create(o.recipientPubkey),
+        PaymentAssetCollection.create(sphereAssetToSdk(o.coinId, o.amount)),
+      ),
+    );
+
+    // Value conservation is enforced inside the SDK split (root.value === source value).
+    const split = await TokenSplit.split(params.token.sdkToken, decodeSpherePaymentData, requests);
+
+    // 1. Burn the source: certify the burn transfer and append it -> burntToken.
+    const burnUnlock = await SignaturePredicateUnlockScript.create(split.burn.transaction, this.deps.signingService);
+    const burnCert = await CertificationData.fromTransaction(split.burn.transaction, burnUnlock);
+    const burnResponse = await this.deps.client.submitCertificationRequest(burnCert);
+    if (burnResponse.status !== CertificationStatus.SUCCESS) {
+      throw new SphereError(`Split burn failed: ${burnResponse.status}`, 'TRANSFER_FAILED');
+    }
+    const burnProof = await waitInclusionProof(
+      this.deps.client,
+      this.deps.trustBase,
+      this.deps.predicateVerifier,
+      split.burn.transaction,
+      options?.signal,
+    );
+    const burnCertified = await split.burn.transaction.toCertifiedTransaction(
+      this.deps.trustBase,
+      this.deps.predicateVerifier,
+      burnProof,
+    );
+    const burntToken = await params.token.sdkToken.transfer(
+      this.deps.trustBase,
+      this.deps.predicateVerifier,
+      burnCertified,
+    );
+
+    // 2. Mint each output, justified by the burnt token + its split proofs.
+    const outputs: SphereToken[] = [];
+    for (const splitToken of split.tokens) {
+      const data = await SpherePaymentData.create(splitToken.assets).encode();
+      const justification = SplitMintJustification.create(burntToken, splitToken.proofs).toCBOR();
+      const mintTx = await MintTransaction.create(
+        splitToken.networkId,
+        splitToken.recipient,
+        data,
+        splitToken.tokenType,
+        splitToken.salt,
+        justification,
+      );
+      const certData = await CertificationData.fromMintTransaction(mintTx);
+      const response = await this.deps.client.submitCertificationRequest(certData);
+      if (response.status !== CertificationStatus.SUCCESS) {
+        throw new SphereError(`Split mint failed: ${response.status}`, 'AGGREGATOR_ERROR');
+      }
+      const proof = await waitInclusionProof(
+        this.deps.client,
+        this.deps.trustBase,
+        this.deps.predicateVerifier,
+        mintTx,
+        options?.signal,
+      );
+      const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
+      const token = await Token.mint(
+        this.deps.trustBase,
+        this.deps.predicateVerifier,
+        this.deps.mintJustificationVerifier,
+        certified,
+      );
+      outputs.push(this.wrapToken(token));
+    }
+
+    return { outputs };
   }
 
   // ── verification ─────────────────────────────────────────────────────────────

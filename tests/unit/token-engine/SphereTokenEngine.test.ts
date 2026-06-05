@@ -6,8 +6,10 @@ import {
   NetworkId,
   PredicateVerifierService,
   SigningService,
+  SplitMintJustificationVerifier,
   StateTransitionClient,
 } from '../../../token-engine/sdk';
+import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { type EngineDeps, SphereTokenEngine } from '../../../token-engine/SphereTokenEngine';
 import { TestAggregatorClient } from './support/TestAggregatorClient';
 
@@ -15,18 +17,25 @@ const COIN = 'a'.repeat(64);
 
 function makeEngine(): SphereTokenEngine {
   const aggregator = TestAggregatorClient.create();
+  const trustBase = aggregator.rootTrustBase;
+  const predicateVerifier = PredicateVerifierService.create();
+  const mintJustificationVerifier = new MintJustificationVerifierService();
+  // Required for split-output tokens to verify (their genesis carries a SplitMintJustification).
+  mintJustificationVerifier.register(
+    new SplitMintJustificationVerifier(trustBase, predicateVerifier, decodeSpherePaymentData),
+  );
   const deps: EngineDeps = {
     client: new StateTransitionClient(aggregator),
-    trustBase: aggregator.rootTrustBase,
-    predicateVerifier: PredicateVerifierService.create(),
-    mintJustificationVerifier: new MintJustificationVerifierService(),
+    trustBase,
+    predicateVerifier,
+    mintJustificationVerifier,
     signingService: new SigningService(SigningService.generatePrivateKey()),
     networkId: NetworkId.LOCAL,
   };
   return new SphereTokenEngine(deps);
 }
 
-describe('SphereTokenEngine (real adapter, A1+A2) — via in-memory aggregator', () => {
+describe('SphereTokenEngine (real adapter, A1–A3) — via in-memory aggregator', () => {
   it('mints a token and reflects its value', async () => {
     const e = makeEngine();
     const token = await e.mint({
@@ -74,4 +83,35 @@ describe('SphereTokenEngine (real adapter, A1+A2) — via in-memory aggregator',
     expect(await e.deriveIdentityAddress()).toBe(await deriveDirectAddress(pubkey));
     expect(await e.deriveIdentityAddress(pubkey)).toMatch(/^DIRECT:\/\//);
   });
+
+  it('splits a token into value-conserving outputs (sum preserved, each verifies)', async () => {
+    const e = makeEngine();
+    const self = e.getIdentity().chainPubkey;
+    const other = new SigningService(SigningService.generatePrivateKey()).publicKey;
+    const src = await e.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+
+    const { outputs } = await e.split({
+      token: src,
+      outputs: [
+        { recipientPubkey: self, coinId: COIN, amount: 60n },
+        { recipientPubkey: other, coinId: COIN, amount: 40n },
+      ],
+    });
+
+    expect(outputs).toHaveLength(2);
+    const total = outputs.reduce((sum, o) => sum + e.balanceOf(o, COIN), 0n);
+    expect(total).toBe(100n);
+    for (const o of outputs) {
+      expect((await e.verify(o)).ok).toBe(true);
+    }
+  }, 25000);
+
+  it('rejects a non-conserving split', async () => {
+    const e = makeEngine();
+    const self = e.getIdentity().chainPubkey;
+    const src = await e.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    await expect(
+      e.split({ token: src, outputs: [{ recipientPubkey: self, coinId: COIN, amount: 50n }] }),
+    ).rejects.toThrow();
+  }, 20000);
 });
