@@ -89,6 +89,7 @@ import {
   deriveAddressInfo,
   getPublicKey,
   sha256,
+  hexToBytes,
   publicKeyToAddress,
   signMessage as signMessageCrypto,
   type MasterKey,
@@ -117,10 +118,7 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
-import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
-import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
+import { deriveDirectAddress } from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -403,28 +401,22 @@ export interface SphereInitResult {
 // L3 Predicate Address Derivation
 // =============================================================================
 
-/** Token type for Unicity network (used for L3 predicate address derivation) */
-const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
-
 /**
- * Derive L3 predicate address (DIRECT://...) from private key
- * Uses UnmaskedPredicateReference for stable wallet address
+ * Derive the wallet's legacy L3 identity address (DIRECT://...) from a private key.
+ *
+ * Delegates to the shared, golden-locked `deriveDirectAddress` helper (token-engine,
+ * A6) so the engine and the wallet derive byte-identical addresses from ONE recipe.
+ *
+ * XP-CRITICAL (Path A / D10): Quest XP and Unicity IDs are keyed on this address, so it
+ * MUST stay byte-identical across the v1→v2 migration. The legacy v1 derivation ran the
+ * secret through `SigningService.createFromSecret`, which SHA-256-hashes the secret before
+ * using it as the signing scalar — so the address is a function of
+ * `getPublicKey(SHA256(privateKey))`, NOT of the raw `chainPubkey`. That pre-hash is
+ * reproduced here and locked by tests/unit/core/Sphere.l3-identity-address.golden.test.ts.
  */
 async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
-  const secret = Buffer.from(privateKey, 'hex');
-  const signingService = await SigningService.createFromSecret(secret);
-
-  const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');
-  const tokenType = new TokenType(tokenTypeBytes);
-
-  const predicateRef = UnmaskedPredicateReference.create(
-    tokenType,
-    signingService.algorithm,
-    signingService.publicKey,
-    HashAlgorithm.SHA256
-  );
-
-  return (await (await predicateRef).toAddress()).toString();
+  const prehashedPublicKey = getPublicKey(sha256(privateKey, 'hex'));
+  return deriveDirectAddress(hexToBytes(prehashedPublicKey));
 }
 
 // =============================================================================
