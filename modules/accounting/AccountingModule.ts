@@ -1415,7 +1415,7 @@ export class AccountingModule {
     // tokenData may be plain JSON or hex-encoded UTF-8 JSON
     // (state-transition-sdk stores it as hex via HexConverter.encode).
     let jsonString = tokenData;
-    if (!/^\s*[\[{"]/.test(tokenData)) {
+    if (!/^\s*[[{"]/.test(tokenData)) {
       // Doesn't look like JSON — attempt hex decode
       try {
         const bytes = hexToBytes(tokenData);
