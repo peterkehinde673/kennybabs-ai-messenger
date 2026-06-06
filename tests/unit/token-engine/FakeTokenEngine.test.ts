@@ -27,10 +27,10 @@ describe('FakeTokenEngine specifics', () => {
     expect(e.getIdentity().chainPubkey[0]).toBe(0x09);
   });
 
-  it('mints a value-less token when no value is given', async () => {
+  it('mints a value-less token when no value is given (value === null, like the real engine)', async () => {
     const e = new FakeTokenEngine();
     const t = await e.mint({ recipientPubkey: PK });
-    expect(e.readValue(t)).toEqual({ assets: [] });
+    expect(e.readValue(t)).toBeNull();
     expect(e.balanceOf(t, COIN)).toBe(0n);
   });
 });

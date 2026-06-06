@@ -26,6 +26,7 @@ export type {
   TokenBlob,
   SphereToken,
   MintParams,
+  MintDataTokenParams,
   TransferParams,
   SplitOutput,
   SplitParams,
