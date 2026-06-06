@@ -10,9 +10,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createTestAccountingModule, createTestInvoice } from './accounting-test-helpers.js';
 import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
-import { decodeTokenBlob } from '../../../token-engine/token-blob';
-import { hexToBytes } from '../../../core/crypto';
+import { decodeTokenBlob, encodeTokenBlob } from '../../../token-engine/token-blob';
+import { hexToBytes, bytesToHex } from '../../../core/crypto';
 import { INVOICE_TOKEN_TYPE_HEX } from '../../../constants';
+import type { Token } from '../../../types';
 
 function setup() {
   const engine = new FakeTokenEngine();
@@ -90,5 +91,60 @@ describe('importInvoice — v2 engine path (B2)', () => {
     (importer.mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
 
     await expect(importer.module.importInvoice(created.token)).rejects.toThrow(/proof is invalid/i);
+  });
+});
+
+describe('attribution — v2 engine path (B2)', () => {
+  const PAYER = new Uint8Array([0x02, ...new Array<number>(32).fill(3)]); // 33 bytes
+  const UCT = '11'.repeat(32); // lowercase-hex coin id (matches invoice target)
+
+  it('attributes a v2 payment (blob memo) to the invoice ledger', async () => {
+    const engine = new FakeTokenEngine();
+    const { module, mocks } = createTestAccountingModule({ tokenEngine: engine });
+    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
+
+    // Register an invoice (v2). Its target coin is a symbol (≤20 chars per spec);
+    // the payment carries the real hex coin id — the ledger keys by the payment's.
+    const created = await module.createInvoice(createTestInvoice());
+    const invoiceId = created.invoiceId;
+
+    // Build a v2 payment token that references the invoice in its on-chain memo.
+    const valueToken = await engine.mint({ recipientPubkey: PAYER, value: { assets: [{ coinId: UCT, amount: 1000n }] } });
+    const memo = new TextEncoder().encode(JSON.stringify({ inv: { id: invoiceId, dir: 'F' } }));
+    const paid = await engine.transfer({ token: valueToken, recipientPubkey: PAYER, data: memo });
+    const paymentToken: Token = {
+      id: 'pay-1', coinId: UCT, symbol: 'UCT', name: 'n', decimals: 0,
+      amount: '1000', status: 'confirmed', createdAt: 0, updatedAt: 0,
+      sdkData: bytesToHex(encodeTokenBlob(engine.encodeToken(paid))),
+    };
+
+    // Scan it (full, startIndex 0) — the engine path shims it into _processTokenTransactions.
+    const scanned = await (module as any)._scanTokenForAttribution(paymentToken, 0);
+    expect(scanned).toBe(true);
+
+    // The payment is now in the invoice's ledger (keyed pay-1:0::<coin>).
+    const ledger = (module as any).invoiceLedger.get(invoiceId);
+    expect(ledger).toBeDefined();
+    expect(ledger.size).toBeGreaterThanOrEqual(1);
+    const ref = [...ledger.values()][0];
+    expect(ref.coinId).toBe(UCT);
+    expect(ref.amount).toBe('1000');
+  });
+
+  it('ignores a v2 token with no memo', async () => {
+    const engine = new FakeTokenEngine();
+    const { module, mocks } = createTestAccountingModule({ tokenEngine: engine });
+    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
+
+    // A minted value token has no transfer memo → nothing to attribute.
+    const plain = await engine.mint({ recipientPubkey: PAYER, value: { assets: [{ coinId: UCT, amount: 5n }] } });
+    const token: Token = {
+      id: 'plain-1', coinId: UCT, symbol: 'UCT', name: 'n', decimals: 0,
+      amount: '5', status: 'confirmed', createdAt: 0, updatedAt: 0,
+      sdkData: bytesToHex(encodeTokenBlob(engine.encodeToken(plain))),
+    };
+
+    const scanned = await (module as any)._scanTokenForAttribution(token, 0);
+    expect(scanned).toBe(false);
   });
 });

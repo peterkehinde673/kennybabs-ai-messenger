@@ -20,7 +20,7 @@ import type {
   SphereEventMap,
 } from '../../types/index.js';
 import type { TxfToken } from '../../types/txf.js';
-import type { DirectMessage } from '../../types/index.js';
+import type { DirectMessage, Token } from '../../types/index.js';
 import type {
   AccountingModuleConfig,
   AccountingModuleDependencies,
@@ -1269,19 +1269,8 @@ export class AccountingModule {
       let anyScanDirty = false;
 
       for (const token of allTokens) {
-        if (!token.sdkData) continue;
-        let txf: TxfToken;
-        try {
-          txf = JSON.parse(token.sdkData) as TxfToken;
-        } catch {
-          continue;
-        }
-        // Only scan tokens that have transactions (payment/transfer tokens)
-        const txCount = txf.transactions?.length ?? 0;
-        if (txCount === 0) continue;
-        // Full scan from index 0 for retroactive discovery
-        this._processTokenTransactions(token.id, txf, 0);
-        anyScanDirty = true;
+        // Full scan from index 0 for retroactive discovery (v1 TXF or v2 blob).
+        if (await this._scanTokenForAttribution(token, 0)) anyScanDirty = true;
       }
 
       // Also scan archived tokens (spec §5.4 Phase 2 step 5)
@@ -1774,17 +1763,8 @@ export class AccountingModule {
     const allTokens = deps.payments.getTokens();
     let anyDirty = false;
     for (const existingToken of allTokens) {
-      if (!existingToken.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(existingToken.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const transactions = txf.transactions ?? [];
       const startIndex = this.tokenScanState.get(existingToken.id) ?? 0;
-      if (transactions.length > startIndex) {
-        this._processTokenTransactions(existingToken.id, txf, startIndex);
+      if (await this._scanTokenForAttribution(existingToken, startIndex)) {
         anyDirty = true;
       }
     }
@@ -4409,18 +4389,8 @@ export class AccountingModule {
     let anyDirty = false;
 
     for (const token of allTokens) {
-      if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-
-      const transactions = txf.transactions ?? [];
       const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if (transactions.length > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
+      if (await this._scanTokenForAttribution(token, startIndex)) {
         anyDirty = true;
       }
     }
@@ -4481,6 +4451,62 @@ export class AccountingModule {
    * @param txf        - Parsed TxfToken.
    * @param startIndex - First unprocessed transaction index.
    */
+  /**
+   * Attribute one payment token's invoice memo(s) to the ledger.
+   *
+   * v2 (engine blob): the token carries a single on-chain memo. We decode it and
+   * shim the token into a v1-shaped `txf` (coinData ← engine.readValue, the memo
+   * ← engine.readMemo) so the battle-hardened `_processTokenTransactions` runs
+   * UNCHANGED — same dedup, direction, provisional/synthetic/orphan handling.
+   * v1 (TXF JSON): parse and scan transactions directly.
+   *
+   * `startIndex` is the per-token watermark (0 for a full retroactive scan).
+   * Returns true when the token was scanned. Async because engine.decodeToken is.
+   */
+  private async _scanTokenForAttribution(token: Token, startIndex: number): Promise<boolean> {
+    if (!token.sdkData) return false;
+    const engine = this.deps?.tokenEngine;
+
+    // v2 engine blob: hex (CBOR), not the legacy TXF JSON ('{'-prefixed).
+    const isBlob =
+      token.sdkData.length >= 2 &&
+      token.sdkData.length % 2 === 0 &&
+      token.sdkData[0] !== '{' &&
+      /^[0-9a-f]+$/i.test(token.sdkData);
+
+    if (engine && isBlob) {
+      let syntheticTxf: TxfToken;
+      try {
+        const sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
+        const memo = engine.readMemo(sphereToken);
+        if (!memo) return false; // no memo ⇒ not an invoice-referencing payment
+        const coinData = (engine.readValue(sphereToken)?.assets ?? []).map(
+          (a) => [a.coinId, a.amount.toString()] as [string, string],
+        );
+        syntheticTxf = {
+          genesis: { data: { coinData } },
+          transactions: [{ data: { message: bytesToHex(memo) }, inclusionProof: {} }],
+        } as unknown as TxfToken;
+      } catch {
+        return false;
+      }
+      this._processTokenTransactions(token.id, syntheticTxf, startIndex);
+      return true;
+    }
+
+    let txf: TxfToken;
+    try {
+      txf = JSON.parse(token.sdkData) as TxfToken;
+    } catch {
+      return false;
+    }
+    if ((txf.transactions?.length ?? 0) > startIndex) {
+      this._processTokenTransactions(token.id, txf, startIndex);
+      return true;
+    }
+    return false;
+  }
+
   private _processTokenTransactions(
     tokenId: string,
     txf: TxfToken,
@@ -4901,17 +4927,7 @@ export class AccountingModule {
 
     // Advance token scan watermarks (stub advances counter only — full indexing deferred)
     for (const token of transfer.tokens) {
-      if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if ((txf.transactions?.length ?? 0) > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
-      }
+      await this._scanTokenForAttribution(token, this.tokenScanState.get(token.id) ?? 0);
     }
 
     // W5-R20 fix: Check destroyed before flush — event handler may still be mid-execution
@@ -5168,16 +5184,7 @@ export class AccountingModule {
     // Advance watermarks and invalidate balance caches for all related tokens
     for (const token of result.tokens) {
       if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if ((txf.transactions?.length ?? 0) > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
-      }
+      await this._scanTokenForAttribution(token, this.tokenScanState.get(token.id) ?? 0);
       const relatedInvoices = this.tokenInvoiceMap.get(token.id);
       if (relatedInvoices) {
         for (const invoiceId of relatedInvoices) {
@@ -5285,16 +5292,8 @@ export class AccountingModule {
     const token = tokens.find((t) => t.id === tokenId);
     if (!token?.sdkData) return;
 
-    let txf: TxfToken;
-    try {
-      txf = JSON.parse(token.sdkData) as TxfToken;
-    } catch {
-      return;
-    }
-
     const startIndex = this.tokenScanState.get(tokenId) ?? 0;
-    if ((txf.transactions?.length ?? 0) > startIndex) {
-      this._processTokenTransactions(tokenId, txf, startIndex);
+    if (await this._scanTokenForAttribution(token, startIndex)) {
       if (this.destroyed) return;
       await this._flushDirtyLedgerEntries();
     }
