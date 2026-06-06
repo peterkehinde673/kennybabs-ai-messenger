@@ -68,7 +68,7 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
-import { decodeTokenBlob } from '../../token-engine/token-blob';
+import { decodeTokenBlob, encodeTokenBlob } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // Instant split imports
@@ -1262,7 +1262,36 @@ export class PaymentsModule {
         request.invoiceContact,
       );
 
-      if (transferMode === 'conservative') {
+      if (this.deps?.tokenEngine && peerInfo?.chainPubkey) {
+        // =================================================================
+        // v2 ENGINE MODE (sender-driven): engine.transfer hands the recipient
+        // a FINISHED token — no commitment / inclusion-proof / finalization.
+        // Whole-token (no-split) path; the value-conserving split path is next.
+        // =================================================================
+        if (splitPlan.requiresSplit) {
+          throw new SphereError('v2 engine split path not yet implemented', 'TRANSFER_FAILED');
+        }
+        const engine = this.deps.tokenEngine;
+        const recipientChainPubkey = hexToBytes(peerInfo.chainPubkey);
+        const memoData = request.memo ? new TextEncoder().encode(request.memo) : undefined;
+
+        for (const tw of splitPlan.tokensToTransferDirectly) {
+          const finished = await engine.transfer({
+            token: tw.sdkToken as SphereToken,
+            recipientPubkey: recipientChainPubkey,
+            data: memoData,
+          });
+          const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            type: 'V2_TRANSFER',
+            version: '2.0',
+            tokenBlob,
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+          result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
+          await this.removeToken(tw.uiToken.id, result.id);
+        }
+      } else if (transferMode === 'conservative') {
         // =================================================================
         // CONSERVATIVE MODE: each token sent individually with full proofs
         // =================================================================

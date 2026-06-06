@@ -23,6 +23,7 @@ const FAKE_PUBKEY = '02' + 'b'.repeat(64);
 const SENDER_TRANSPORT_PUBKEY = 'cc'.repeat(32);
 const RECIPIENT = new Uint8Array([0x02, ...new Array<number>(32).fill(7)]); // 33 bytes
 const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
+const BOB_CHAIN_PUBKEY = '02' + 'ee'.repeat(32); // recipient's 33-byte chain pubkey (hex)
 
 function mockIdentity(): FullIdentity {
   return {
@@ -75,7 +76,13 @@ function mockTransport(nametag = 'alice'): TransportProvider {
     onTokenTransfer: vi.fn().mockReturnValue(() => {}),
     onPaymentRequest: vi.fn().mockReturnValue(() => {}),
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
-    resolve: vi.fn().mockResolvedValue(null),
+    resolve: vi.fn().mockResolvedValue({
+      chainPubkey: BOB_CHAIN_PUBKEY,
+      transportPubkey: 'bob-transport-pubkey',
+      // a valid DIRECT address (AddressFactory parses the hex after DIRECT://)
+      directAddress: 'DIRECT://0000b97b4a83dc3fe636d4f21dbfe4c93149e07367539a059a9c8e64ad7d9fdc30644eaaf64b',
+      nametag: 'bob',
+    }),
     resolveNametagInfo: vi.fn().mockResolvedValue(null),
     resolveTransportPubkeyInfo: vi.fn().mockResolvedValue({
       chainPubkey: FAKE_PUBKEY, transportPubkey: SENDER_TRANSPORT_PUBKEY,
@@ -91,7 +98,8 @@ function mockTransport(nametag = 'alice'): TransportProvider {
 function mockOracle(): OracleProvider {
   return {
     validateToken: vi.fn().mockResolvedValue({ valid: true }),
-    getStateTransitionClient: vi.fn().mockReturnValue(undefined),
+    // Stub present so the v1 requirement passes; the v2 engine send path ignores it.
+    getStateTransitionClient: vi.fn().mockReturnValue({ submitTransferCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }) }),
     getTrustBase: vi.fn().mockReturnValue({}),
     isDevMode: () => false,
     waitForProofSdk: vi.fn().mockResolvedValue({ proof: 'mock' }),
@@ -102,13 +110,14 @@ function setup(engine = new FakeTokenEngine()) {
   const tsp = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
   tsp.set('local', mockTokenStorage());
   const emitEvent = vi.fn();
+  const transport = mockTransport();
   const deps: PaymentsModuleDependencies = {
     identity: mockIdentity(), storage: mockStorage(), tokenStorageProviders: tsp,
-    transport: mockTransport(), oracle: mockOracle(), emitEvent, tokenEngine: engine,
+    transport, oracle: mockOracle(), emitEvent, tokenEngine: engine,
   };
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
-  return { module, engine, emitEvent };
+  return { module, engine, emitEvent, transport };
 }
 
 async function v2Payload(
@@ -164,5 +173,46 @@ describe('handleV2Transfer — v2 receiver (B1)', () => {
     await deliver(module, payload, 't2');
 
     expect(module.getTokens()).toHaveLength(1);
+  });
+});
+
+describe('send — v2 engine path, whole-token (B1)', () => {
+  it('round-trips: receive a token, then send it whole via engine.transfer', async () => {
+    const { module, engine, transport } = setup();
+    // Receive a 100-UCT token (exact match → no split).
+    await deliver(module, await v2Payload(engine, UCT, 100n));
+    expect(module.getTokens()).toHaveLength(1);
+
+    const result = await module.send({ recipient: '@bob', amount: '100', coinId: UCT, memo: 'thanks' });
+
+    expect(result.status).toBe('completed');
+    // Source token was consumed by the engine and removed from the wallet.
+    expect(module.getTokens()).toHaveLength(0);
+
+    // A V2_TRANSFER payload (finished token blob) was handed to the recipient.
+    const sent = (transport.sendTokenTransfer as any).mock.calls;
+    expect(sent).toHaveLength(1);
+    expect(sent[0][1].type).toBe('V2_TRANSFER');
+    expect(sent[0][1].memo).toBe('thanks');
+    expect(typeof sent[0][1].tokenBlob).toBe('string');
+
+    // One SENT history entry.
+    const history = module.getHistory().filter((h) => h.type === 'SENT');
+    expect(history).toHaveLength(1);
+    expect(history[0].amount).toBe('100');
+  });
+
+  it('the emitted blob decodes back to a token the recipient can store', async () => {
+    const { module, engine, transport } = setup();
+    await deliver(module, await v2Payload(engine, UCT, 100n));
+    await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+
+    // Feed the emitted V2_TRANSFER into a fresh recipient wallet (same engine fixture).
+    const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
+    const recipient = setup(engine);
+    await deliver(recipient.module, sentPayload);
+
+    expect(recipient.module.getTokens()).toHaveLength(1);
+    expect(recipient.module.getTokens()[0].amount).toBe('100');
   });
 });
