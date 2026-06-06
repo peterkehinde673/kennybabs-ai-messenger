@@ -14,8 +14,9 @@ import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
-import { encodeTokenBlob } from '../../../token-engine/token-blob';
-import { bytesToHex } from '../../../core/crypto';
+import { encodeTokenBlob, decodeTokenBlob } from '../../../token-engine/token-blob';
+import { bytesToHex, hexToBytes } from '../../../core/crypto';
+import { decodeTransferMessage } from '../../../modules/accounting/memo';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
 
 const FAKE_PRIVATE_KEY = 'a'.repeat(64);
@@ -236,5 +237,31 @@ describe('send — v2 engine path, whole-token (B1)', () => {
     const recipient = setup(engine);
     await deliver(recipient.module, sentPayload);
     expect(recipient.module.getTokens()[0].amount).toBe('300');
+  });
+
+  it('carries the structured invoice ref on-chain for an invoice-memo payment', async () => {
+    const { module, engine, transport } = setup();
+    await deliver(module, await v2Payload(engine, UCT, 100n));
+
+    const invoiceId = 'ab'.repeat(32); // 64-char hex invoice id
+    await module.send({ recipient: '@bob', amount: '100', coinId: UCT, memo: `INV:${invoiceId}:F` });
+
+    // The finished token's on-chain memo decodes to the structured invoice ref.
+    const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
+    const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(sentPayload.tokenBlob)));
+    const onChainMemo = engine.readMemo(token);
+    expect(onChainMemo).not.toBeNull();
+    expect(decodeTransferMessage(onChainMemo)?.inv?.id?.toLowerCase()).toBe(invoiceId);
+  });
+
+  it('keeps a plain memo transport-only (no on-chain memo, for privacy)', async () => {
+    const { module, engine, transport } = setup();
+    await deliver(module, await v2Payload(engine, UCT, 100n));
+    await module.send({ recipient: '@bob', amount: '100', coinId: UCT, memo: 'thanks' });
+
+    const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
+    const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(sentPayload.tokenBlob)));
+    expect(engine.readMemo(token)).toBeNull();  // not put on-chain
+    expect(sentPayload.memo).toBe('thanks');    // still on the transport wire
   });
 });

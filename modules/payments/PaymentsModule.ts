@@ -1270,7 +1270,10 @@ export class PaymentsModule {
         // =================================================================
         const engine = this.deps.tokenEngine;
         const recipientChainPubkey = hexToBytes(peerInfo.chainPubkey);
-        const memoData = request.memo ? new TextEncoder().encode(request.memo) : undefined;
+        // On-chain memo: the structured invoice ref ({inv:{id,dir}}) for invoice
+        // payments, else null — plain memos stay transport-only (privacy).
+        // parseInvoiceMemoForOnChain already produced the encoded bytes (or null).
+        const memoData = onChainMessage ?? undefined;
 
         // Hand a finished token to the recipient as a V2_TRANSFER (blob) payload.
         const handToRecipient = async (finished: SphereToken): Promise<void> => {
