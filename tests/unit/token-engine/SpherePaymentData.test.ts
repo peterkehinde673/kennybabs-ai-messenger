@@ -15,6 +15,20 @@ describe('SpherePaymentData', () => {
     expect(SpherePaymentData.fromCBOR(bytes).toValue()).toEqual(value);
   });
 
+  it('round-trips an opaque memo alongside the value', async () => {
+    const value: SphereValue = { assets: [{ coinId: COIN_A, amount: 1n }] };
+    const memo = new Uint8Array([7, 8, 9, 250]);
+    const bytes = await SpherePaymentData.fromValue(value, memo).encode();
+    const decoded = SpherePaymentData.fromCBOR(bytes);
+    expect(decoded.toValue()).toEqual(value);
+    expect(decoded.memo).toEqual(memo);
+  });
+
+  it('has a null memo when none is provided', async () => {
+    const bytes = await SpherePaymentData.fromValue({ assets: [{ coinId: COIN_A, amount: 1n }] }).encode();
+    expect(SpherePaymentData.fromCBOR(bytes).memo).toBeNull();
+  });
+
   it('round-trips multiple coins incl. zero and very large amounts', async () => {
     const value: SphereValue = {
       assets: [
@@ -62,9 +76,21 @@ describe('SpherePaymentData', () => {
   it('rejects an unsupported version', () => {
     const future = CborSerializer.encodeTag(
       SpherePaymentData.CBOR_TAG,
-      CborSerializer.encodeArray(CborSerializer.encodeUnsignedInteger(999n), CborSerializer.encodeArray()),
+      CborSerializer.encodeArray(
+        CborSerializer.encodeUnsignedInteger(999n),
+        CborSerializer.encodeArray(),
+        CborSerializer.encodeNullable(null, CborSerializer.encodeByteString),
+      ),
     );
     expect(() => SpherePaymentData.fromCBOR(future)).toThrow(CborError);
+  });
+
+  it('rejects an envelope with the wrong number of fields', () => {
+    const malformed = CborSerializer.encodeTag(
+      SpherePaymentData.CBOR_TAG,
+      CborSerializer.encodeArray(CborSerializer.encodeUnsignedInteger(1n), CborSerializer.encodeArray()),
+    );
+    expect(() => SpherePaymentData.fromCBOR(malformed)).toThrow(CborError);
   });
 
   it('rejects a negative amount (would silently encode to 0n otherwise)', () => {

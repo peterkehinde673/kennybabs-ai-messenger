@@ -23,6 +23,7 @@ export function encodeTokenBlob(blob: TokenBlob): Uint8Array {
     CborSerializer.encodeArray(
       CborSerializer.encodeUnsignedInteger(BigInt(blob.v)),
       CborSerializer.encodeUnsignedInteger(BigInt(blob.network)),
+      CborSerializer.encodeTextString(blob.tokenId),
       CborSerializer.encodeByteString(blob.token),
     ),
   );
@@ -34,7 +35,7 @@ export function decodeTokenBlob(bytes: Uint8Array): TokenBlob {
   if (tag.tag !== TOKEN_BLOB_TAG) {
     throw new CborError(`Invalid TokenBlob tag: ${tag.tag}`);
   }
-  const fields = CborDeserializer.decodeArray(tag.data, 3);
+  const fields = CborDeserializer.decodeArray(tag.data, 4);
   const v = Number(CborDeserializer.decodeUnsignedInteger(fields[0]));
   if (v !== TOKEN_BLOB_VERSION) {
     throw new CborError(`Unsupported TokenBlob version: ${v}`);
@@ -42,6 +43,7 @@ export function decodeTokenBlob(bytes: Uint8Array): TokenBlob {
   return {
     v,
     network: Number(CborDeserializer.decodeUnsignedInteger(fields[1])),
-    token: CborDeserializer.decodeByteString(fields[2]),
+    tokenId: CborDeserializer.decodeTextString(fields[2]),
+    token: CborDeserializer.decodeByteString(fields[3]),
   };
 }

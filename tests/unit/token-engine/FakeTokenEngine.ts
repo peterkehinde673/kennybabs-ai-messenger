@@ -4,8 +4,14 @@
  * Track B develops + unit-tests callers (PaymentsModule, AccountingModule, …)
  * against the frozen ITokenEngine port using this fake, before the real adapter
  * lands. It does no network/crypto: it models token identity, value, ownership
- * transfer, value-conserving split, and spent-state in memory. Token ids are a
- * monotonic counter, so behaviour is fully deterministic.
+ * transfer, value-conserving split, data tokens, on-chain memos and spent-state
+ * in memory. Token ids are a monotonic counter (or the salt for data tokens), so
+ * behaviour is fully deterministic.
+ *
+ * Its state mirrors the real engine: a token carries raw `genesisData` (a
+ * SpherePaymentData envelope for value tokens, opaque bytes for data tokens) plus
+ * an optional `transferMemo` (the latest transfer's data). value / readMemo /
+ * readTokenData are derived exactly as the real adapter derives them.
  *
  * This is a TEST double (lives under tests/, never shipped). The real adapter
  * puts a genuine v2 Token in SphereToken.sdkToken; here it is an opaque
@@ -16,7 +22,10 @@ import {
   CborDeserializer,
   CborSerializer,
   HexConverter,
+  NetworkId,
   type Token,
+  TokenId,
+  TokenSalt,
 } from '../../../token-engine/sdk';
 import type {
   CoinId,
@@ -24,6 +33,7 @@ import type {
   EngineOpOptions,
   EngineVerifyResult,
   ITokenEngine,
+  MintDataTokenParams,
   MintParams,
   SphereToken,
   SphereValue,
@@ -36,6 +46,18 @@ import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
 
 const DEFAULT_PUBKEY = new Uint8Array([0x02, ...new Array<number>(32).fill(0)]); // 33 bytes
+
+interface FakeState {
+  /** Genesis-stable identity — same across every state of the token (mirrors v2 TokenId). */
+  readonly tokenId: Uint8Array;
+  /** Per-state identity — changes on every transfer; the unit of spent-tracking. */
+  readonly stateId: Uint8Array;
+  readonly owner: Uint8Array;
+  /** Raw mint data: a SpherePaymentData envelope (value token) or opaque bytes (data token). */
+  readonly genesisData: Uint8Array | null;
+  /** The latest transfer's opaque memo, when the token was delivered by transfer. */
+  readonly transferMemo: Uint8Array | null;
+}
 
 export interface FakeEngineConfig {
   readonly chainPubkey?: Uint8Array;
@@ -61,6 +83,10 @@ export class FakeTokenEngine implements ITokenEngine {
     return Promise.resolve(`DIRECT://${HexConverter.encode(pubkey ?? this.identity.chainPubkey)}`);
   }
 
+  public tokenId(token: SphereToken): string {
+    return token.blob.tokenId;
+  }
+
   public readValue(token: SphereToken): SphereValue | null {
     return token.value;
   }
@@ -73,13 +99,56 @@ export class FakeTokenEngine implements ITokenEngine {
     return sum;
   }
 
+  public readMemo(token: SphereToken): Uint8Array | null {
+    const state = decodeFakeState(token.blob.token);
+    if (state.transferMemo) return state.transferMemo;
+    if (state.genesisData && isSpherePaymentData(state.genesisData)) {
+      return SpherePaymentData.fromCBOR(state.genesisData).memo;
+    }
+    return null;
+  }
+
+  public readTokenData(token: SphereToken): Uint8Array | null {
+    return decodeFakeState(token.blob.token).genesisData;
+  }
+
   public async mint(params: MintParams, _options?: EngineOpOptions): Promise<SphereToken> {
-    return this.makeToken(this.nextId(), params.recipientPubkey, params.value ?? { assets: [] });
+    const genesisData = params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
+    return this.makeToken({
+      tokenId: this.nextId(),
+      stateId: this.nextId(),
+      owner: params.recipientPubkey,
+      genesisData,
+      transferMemo: null,
+    });
+  }
+
+  public async mintDataToken(params: MintDataTokenParams, _options?: EngineOpOptions): Promise<SphereToken> {
+    // Derive the tokenId EXACTLY as the real engine does (TokenId.fromSalt = SHA-256 over
+    // [salt, networkId]) so the fake is a faithful double — the id is NOT the raw salt.
+    const tokenId = params.salt
+      ? (await TokenId.fromSalt(networkIdOf(this.network), TokenSalt.fromCBOR(CborSerializer.encodeByteString(params.salt)))).bytes
+      : this.nextId();
+    return this.makeToken({
+      tokenId,
+      stateId: this.nextId(),
+      owner: params.recipientPubkey,
+      genesisData: params.data,
+      transferMemo: null,
+    });
   }
 
   public async transfer(params: TransferParams, _options?: EngineOpOptions): Promise<SphereToken> {
     this.consume(params.token);
-    return this.makeToken(this.nextId(), params.recipientPubkey, params.token.value ?? { assets: [] });
+    const source = decodeFakeState(params.token.blob.token);
+    // A transfer keeps the same token (genesis + tokenId); only the state + owner change.
+    return this.makeToken({
+      tokenId: source.tokenId,
+      stateId: this.nextId(),
+      owner: params.recipientPubkey,
+      genesisData: source.genesisData,
+      transferMemo: params.data ?? null,
+    });
   }
 
   public async split(params: SplitParams, _options?: EngineOpOptions): Promise<SplitResult> {
@@ -87,8 +156,19 @@ export class FakeTokenEngine implements ITokenEngine {
     this.consume(params.token);
     const outputs: SphereToken[] = [];
     for (const o of params.outputs) {
+      // A split output is a fresh mint (new tokenId); its memo rides inside the value envelope.
+      const genesisData = await SpherePaymentData.fromValue(
+        { assets: [{ coinId: o.coinId, amount: o.amount }] },
+        o.data ?? null,
+      ).encode();
       outputs.push(
-        await this.makeToken(this.nextId(), o.recipientPubkey, { assets: [{ coinId: o.coinId, amount: o.amount }] }),
+        await this.makeToken({
+          tokenId: this.nextId(),
+          stateId: this.nextId(),
+          owner: o.recipientPubkey,
+          genesisData,
+          transferMemo: null,
+        }),
       );
     }
     return { outputs };
@@ -108,8 +188,7 @@ export class FakeTokenEngine implements ITokenEngine {
   }
 
   public decodeToken(blob: TokenBlob): Promise<SphereToken> {
-    const { value } = decodeFakeState(blob.token);
-    return Promise.resolve({ sdkToken: handleFor(blob.token), blob, value });
+    return Promise.resolve({ sdkToken: handleFor(blob.token), blob, value: valueOf(decodeFakeState(blob.token)) });
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -124,14 +203,20 @@ export class FakeTokenEngine implements ITokenEngine {
     return id;
   }
 
-  private async makeToken(id: Uint8Array, owner: Uint8Array, value: SphereValue): Promise<SphereToken> {
-    const stateBytes = await encodeFakeState(id, owner, value);
-    const blob: TokenBlob = { v: TOKEN_BLOB_VERSION, network: this.network, token: stateBytes };
-    return { sdkToken: handleFor(stateBytes), blob, value };
+  private async makeToken(state: FakeState): Promise<SphereToken> {
+    const stateBytes = encodeFakeState(state);
+    const blob: TokenBlob = {
+      v: TOKEN_BLOB_VERSION,
+      network: this.network,
+      tokenId: HexConverter.encode(state.tokenId),
+      token: stateBytes,
+    };
+    return { sdkToken: handleFor(stateBytes), blob, value: valueOf(state) };
   }
 
+  /** Spent-tracking key = the per-state id (changes on every transfer). */
   private idOf(token: SphereToken): string {
-    return HexConverter.encode(decodeFakeState(token.blob.token).id);
+    return HexConverter.encode(decodeFakeState(token.blob.token).stateId);
   }
 
   private consume(token: SphereToken): void {
@@ -143,22 +228,49 @@ export class FakeTokenEngine implements ITokenEngine {
   }
 }
 
-// fake-token state: CBOR array[ id, owner, SpherePaymentData(value) ]
-async function encodeFakeState(id: Uint8Array, owner: Uint8Array, value: SphereValue): Promise<Uint8Array> {
+// fake-token state: CBOR array[ tokenId, stateId, owner, genesisData?, transferMemo? ]
+function encodeFakeState(state: FakeState): Uint8Array {
   return CborSerializer.encodeArray(
-    CborSerializer.encodeByteString(id),
-    CborSerializer.encodeByteString(owner),
-    await SpherePaymentData.fromValue(value).encode(),
+    CborSerializer.encodeByteString(state.tokenId),
+    CborSerializer.encodeByteString(state.stateId),
+    CborSerializer.encodeByteString(state.owner),
+    CborSerializer.encodeNullable(state.genesisData, CborSerializer.encodeByteString),
+    CborSerializer.encodeNullable(state.transferMemo, CborSerializer.encodeByteString),
   );
 }
 
-function decodeFakeState(bytes: Uint8Array): { id: Uint8Array; owner: Uint8Array; value: SphereValue } {
-  const [idB, ownerB, valueB] = CborDeserializer.decodeArray(bytes, 3);
+function decodeFakeState(bytes: Uint8Array): FakeState {
+  const [tokenIdB, stateIdB, ownerB, genesisB, memoB] = CborDeserializer.decodeArray(bytes, 5);
   return {
-    id: CborDeserializer.decodeByteString(idB),
+    tokenId: CborDeserializer.decodeByteString(tokenIdB),
+    stateId: CborDeserializer.decodeByteString(stateIdB),
     owner: CborDeserializer.decodeByteString(ownerB),
-    value: SpherePaymentData.fromCBOR(valueB).toValue(),
+    genesisData: CborDeserializer.decodeNullable(genesisB, CborDeserializer.decodeByteString),
+    transferMemo: CborDeserializer.decodeNullable(memoB, CborDeserializer.decodeByteString),
   };
+}
+
+/** Derive the decoded value exactly as the real adapter does (SpherePaymentData envelope only). */
+function valueOf(state: FakeState): SphereValue | null {
+  if (state.genesisData && isSpherePaymentData(state.genesisData)) {
+    return SpherePaymentData.fromCBOR(state.genesisData).toValue();
+  }
+  return null;
+}
+
+function isSpherePaymentData(data: Uint8Array): boolean {
+  try {
+    return CborDeserializer.decodeTag(data).tag === SpherePaymentData.CBOR_TAG;
+  } catch {
+    return false;
+  }
+}
+
+/** Map the fake's numeric network to the SDK NetworkId instance (for TokenId.fromSalt). */
+function networkIdOf(n: number): NetworkId {
+  if (n === NetworkId.MAINNET.id) return NetworkId.MAINNET;
+  if (n === NetworkId.LOCAL.id) return NetworkId.LOCAL;
+  return NetworkId.TESTNET;
 }
 
 // Opaque placeholder for SphereToken.sdkToken — callers never call methods on it.

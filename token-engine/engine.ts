@@ -15,6 +15,7 @@ import type {
   TokenBlob,
   SphereNetwork,
   MintParams,
+  MintDataTokenParams,
   TransferParams,
   SplitParams,
   SplitResult,
@@ -46,10 +47,26 @@ export interface ITokenEngine {
   deriveIdentityAddress(pubkey?: Uint8Array): Promise<string>;
 
   // ── value (read) ─────────────────────────────────────────────────────────
+  /**
+   * Genesis-stable token id — 64-char lowercase hex of the v2 TokenId (same
+   * across every state). Use for dedup / history / tombstone keys. Synchronous.
+   */
+  tokenId(token: SphereToken): string;
   /** Decoded value of a token (cached). Synchronous. */
   readValue(token: SphereToken): SphereValue | null;
   /** Balance of a single coin within a token. Synchronous. */
   balanceOf(token: SphereToken, coinId: CoinId): bigint;
+  /**
+   * The opaque on-chain memo delivered with this token: the latest transfer's
+   * data for a transferred token, else the memo in a minted output's value
+   * envelope (split). Returns `null` when there is no memo — including for data
+   * tokens (no value envelope; use `readTokenData`) and memo-less value tokens.
+   * To tell a data token from a value token, check `readValue` (null ⇒
+   * data/value-less token). Synchronous.
+   */
+  readMemo(token: SphereToken): Uint8Array | null;
+  /** Raw genesis data of a token (e.g. a data-token's terms). `null` when absent. Synchronous. */
+  readTokenData(token: SphereToken): Uint8Array | null;
 
   // ── lifecycle (sender-driven: build → submit → wait → certify → realize) ──
   /**
@@ -61,6 +78,12 @@ export interface ITokenEngine {
    * Unicity-ID/nametag mint is a distinct identity surface (see migration plan §4.4).
    */
   mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken>;
+  /**
+   * Mint a NON-value (data) token: opaque `data` + custom `tokenType` + deterministic
+   * `salt` → a stable, terms-derived `tokenId`. The result has `value === null`;
+   * read its bytes via `readTokenData`. (Used e.g. for on-chain invoice tokens.)
+   */
+  mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken>;
   /** Spend a token wholesale to a recipient pubkey; returns the recipient's finished token. */
   transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken>;
   /** Split a token into N value-conserving outputs (burn source + internally mint each output). */
