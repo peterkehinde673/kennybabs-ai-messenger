@@ -215,4 +215,26 @@ describe('send — v2 engine path, whole-token (B1)', () => {
     expect(recipient.module.getTokens()).toHaveLength(1);
     expect(recipient.module.getTokens()[0].amount).toBe('100');
   });
+
+  it('splits via engine.split: recipient gets the amount, sender keeps the change', async () => {
+    const { module, engine, transport } = setup();
+    // Hold a single 1000-UCT token, send 300 → engine split (300 out, 700 change).
+    await deliver(module, await v2Payload(engine, UCT, 1000n));
+
+    const result = await module.send({ recipient: '@bob', amount: '300', coinId: UCT });
+
+    expect(result.status).toBe('completed');
+    // Source consumed; the 700 change token remains, confirmed.
+    const tokens = module.getTokens();
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0].amount).toBe('700');
+    expect(tokens[0].status).toBe('confirmed');
+
+    // Recipient's V2_TRANSFER decodes to a 300 token.
+    const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
+    expect(sentPayload.type).toBe('V2_TRANSFER');
+    const recipient = setup(engine);
+    await deliver(recipient.module, sentPayload);
+    expect(recipient.module.getTokens()[0].amount).toBe('300');
+  });
 });

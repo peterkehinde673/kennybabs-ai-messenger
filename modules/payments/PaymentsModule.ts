@@ -1268,19 +1268,12 @@ export class PaymentsModule {
         // a FINISHED token — no commitment / inclusion-proof / finalization.
         // Whole-token (no-split) path; the value-conserving split path is next.
         // =================================================================
-        if (splitPlan.requiresSplit) {
-          throw new SphereError('v2 engine split path not yet implemented', 'TRANSFER_FAILED');
-        }
         const engine = this.deps.tokenEngine;
         const recipientChainPubkey = hexToBytes(peerInfo.chainPubkey);
         const memoData = request.memo ? new TextEncoder().encode(request.memo) : undefined;
 
-        for (const tw of splitPlan.tokensToTransferDirectly) {
-          const finished = await engine.transfer({
-            token: tw.sdkToken as SphereToken,
-            recipientPubkey: recipientChainPubkey,
-            data: memoData,
-          });
+        // Hand a finished token to the recipient as a V2_TRANSFER (blob) payload.
+        const handToRecipient = async (finished: SphereToken): Promise<void> => {
           const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
           await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
             type: 'V2_TRANSFER',
@@ -1288,8 +1281,53 @@ export class PaymentsModule {
             tokenBlob,
             memo: request.memo,
           } as unknown as import('../../transport').TokenTransferPayload);
+        };
+
+        // Whole-token direct transfers.
+        for (const tw of splitPlan.tokensToTransferDirectly) {
+          const finished = await engine.transfer({
+            token: tw.sdkToken as SphereToken,
+            recipientPubkey: recipientChainPubkey,
+            data: memoData,
+          });
+          await handToRecipient(finished);
           result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
           await this.removeToken(tw.uiToken.id, result.id);
+        }
+
+        // Value-conserving split: recipient gets splitAmount, this wallet keeps
+        // the remainder. The change token is real + immediate (the engine mints
+        // it) — no placeholder / background-proof step.
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+          const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
+          const { outputs } = await engine.split({
+            token: splitPlan.tokenToSplit.sdkToken as SphereToken,
+            outputs: [
+              { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: splitPlan.splitAmount!, data: memoData },
+              { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
+            ],
+          });
+          await handToRecipient(outputs[0]);
+
+          const changeToken = outputs[1];
+          const changeBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(changeToken)));
+          const changeInfo = await parseTokenInfo(changeBlob, engine);
+          const registry = TokenRegistry.getInstance();
+          await this.addToken({
+            id: `v2_${engine.tokenId(changeToken)}`,
+            coinId: changeInfo.coinId,
+            symbol: registry.getSymbol(changeInfo.coinId) || changeInfo.symbol,
+            name: registry.getName(changeInfo.coinId) || changeInfo.name,
+            decimals: registry.getDecimals(changeInfo.coinId) ?? changeInfo.decimals,
+            amount: changeInfo.amount,
+            status: 'confirmed',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sdkData: changeBlob,
+          });
+
+          result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
         }
       } else if (transferMode === 'conservative') {
         // =================================================================
