@@ -29,7 +29,7 @@ import type {
   NametagData,
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
-import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './TokenSplitCalculator';
+import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -1282,7 +1282,7 @@ export class PaymentsModule {
           const transferTx = commitment.toTransaction(inclusionProof);
 
           await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
+            sourceToken: JSON.stringify((tokenWithAmount.sdkToken as SdkToken<any>).toJSON()),
             transferTx: JSON.stringify(transferTx.toJSON()),
             memo: request.memo,
           } as unknown as import('../../transport').TokenTransferPayload);
@@ -1325,7 +1325,7 @@ export class PaymentsModule {
           });
 
           builtSplit = await executor.buildSplitBundle(
-            splitPlan.tokenToSplit.sdkToken,
+            splitPlan.tokenToSplit.sdkToken as SdkToken<any>,
             splitPlan.splitAmount!,
             splitPlan.remainderAmount!,
             splitPlan.coinId,
@@ -1377,7 +1377,7 @@ export class PaymentsModule {
 
         const directTokenEntries: DirectTokenEntry[] = splitPlan.tokensToTransferDirectly.map(
           (tw: TokenWithAmount, i: number) => ({
-            sourceToken: JSON.stringify(tw.sdkToken.toJSON()),
+            sourceToken: JSON.stringify((tw.sdkToken as SdkToken<any>).toJSON()),
             commitmentData: JSON.stringify(directCommitments[i].toJSON()),
             amount: tw.uiToken.amount,
             coinId: tw.uiToken.coinId,
@@ -1757,7 +1757,7 @@ export class PaymentsModule {
 
       // Execute instant split
       const result = await executor.executeSplitInstant(
-        splitPlan.tokenToSplit.sdkToken,
+        splitPlan.tokenToSplit.sdkToken as SdkToken<any>,
         splitPlan.splitAmount!,
         splitPlan.remainderAmount!,
         splitPlan.coinId,
