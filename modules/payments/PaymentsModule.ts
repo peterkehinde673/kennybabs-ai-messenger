@@ -66,6 +66,8 @@ import {
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
+import { decodeTokenBlob } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // Instant split imports
@@ -378,34 +380,61 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 const sdkDataCache = new Map<string, { tokenId: string | null; stateHash: string }>();
 const SDK_DATA_CACHE_MAX = 2000;
 
+/** A v2 engine blob is hex (CBOR); legacy v1 TXF is JSON (starts with '{'). */
+function looksLikeTokenBlob(sdkData: string): boolean {
+  return sdkData.length >= 2 && sdkData.length % 2 === 0 && sdkData[0] !== '{' && /^[0-9a-f]+$/i.test(sdkData);
+}
+
+/**
+ * Extract keys from a v2 engine blob (hex of CBOR(TokenBlob)). The blob carries
+ * its genesis-stable tokenId; the per-state hash is SHA-256 of the token bytes
+ * (unique per state — it changes on every transfer). No engine needed.
+ * Returns null when the string is not a decodable blob.
+ */
+function tryParseBlobKeys(sdkData: string): { tokenId: string; stateHash: string } | null {
+  try {
+    const blob = decodeTokenBlob(hexToBytes(sdkData));
+    return { tokenId: blob.tokenId, stateHash: sha256(bytesToHex(blob.token), 'hex') };
+  } catch {
+    return null;
+  }
+}
+
 function parseSdkDataCached(sdkData: string): { tokenId: string | null; stateHash: string } {
   const cached = sdkDataCache.get(sdkData);
   if (cached) return cached;
 
-  let tokenId: string | null = null;
-  let stateHash = '';
-  try {
-    const txf = JSON.parse(sdkData);
-    tokenId = txf.genesis?.data?.tokenId || null;
-    stateHash = getCurrentStateHash(txf as TxfToken) || '';
+  // v2 engine blob: self-describing keys (no engine, no JSON).
+  let entry: { tokenId: string | null; stateHash: string } | null =
+    looksLikeTokenBlob(sdkData) ? tryParseBlobKeys(sdkData) : null;
 
-    // Try alternative locations if not found in standard place
-    if (!stateHash) {
-      /* eslint-disable @typescript-eslint/no-explicit-any */
-      if ((txf as any).state?.hash) {
-        stateHash = (txf as any).state.hash;
-      } else if ((txf as any).stateHash) {
-        stateHash = (txf as any).stateHash;
-      } else if ((txf as any).currentStateHash) {
-        stateHash = (txf as any).currentStateHash;
+  if (!entry) {
+    // Legacy v1 TXF JSON.
+    let tokenId: string | null = null;
+    let stateHash = '';
+    try {
+      const txf = JSON.parse(sdkData);
+      tokenId = txf.genesis?.data?.tokenId || null;
+      stateHash = getCurrentStateHash(txf as TxfToken) || '';
+
+      // Try alternative locations if not found in standard place
+      if (!stateHash) {
+        /* eslint-disable @typescript-eslint/no-explicit-any */
+        if ((txf as any).state?.hash) {
+          stateHash = (txf as any).state.hash;
+        } else if ((txf as any).stateHash) {
+          stateHash = (txf as any).stateHash;
+        } else if ((txf as any).currentStateHash) {
+          stateHash = (txf as any).currentStateHash;
+        }
+        /* eslint-enable @typescript-eslint/no-explicit-any */
       }
-      /* eslint-enable @typescript-eslint/no-explicit-any */
+    } catch {
+      // Invalid JSON — return defaults
     }
-  } catch {
-    // Invalid JSON — return defaults
+    entry = { tokenId, stateHash };
   }
 
-  const entry = { tokenId, stateHash };
   // Evict cache if it grows too large (unlikely in normal usage)
   if (sdkDataCache.size >= SDK_DATA_CACHE_MAX) {
     sdkDataCache.clear();
@@ -421,7 +450,7 @@ function clearSdkDataCache(): void {
 /**
  * Extract token ID (genesis tokenId) from sdkData/jsonData
  */
-function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
+export function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
   if (!sdkData) return null;
   return parseSdkDataCached(sdkData).tokenId;
 }
@@ -429,7 +458,7 @@ function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
 /**
  * Extract state hash from sdkData/jsonData
  */
-function extractStateHashFromSdkData(sdkData: string | undefined): string {
+export function extractStateHashFromSdkData(sdkData: string | undefined): string {
   if (!sdkData) return '';
   return parseSdkDataCached(sdkData).stateHash;
 }
@@ -439,7 +468,7 @@ function extractStateHashFromSdkData(sdkData: string | undefined): string {
  * Format: {tokenId}_{stateHash}
  * This uniquely identifies a token at a specific state
  */
-function createTokenStateKey(tokenId: string, stateHash: string): string {
+export function createTokenStateKey(tokenId: string, stateHash: string): string {
   return `${tokenId}_${stateHash}`;
 }
 
@@ -447,7 +476,7 @@ function createTokenStateKey(tokenId: string, stateHash: string): string {
  * Extract composite key (tokenId_stateHash) from token
  * Returns null if token doesn't have valid tokenId and stateHash
  */
-function extractTokenStateKey(token: Token): string | null {
+export function extractTokenStateKey(token: Token): string | null {
   const tokenId = extractTokenIdFromSdkData(token.sdkData);
   const stateHash = extractStateHashFromSdkData(token.sdkData);
   if (!tokenId || !stateHash) return null;
