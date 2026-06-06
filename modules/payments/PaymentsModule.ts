@@ -193,7 +193,7 @@ function enrichWithRegistry(info: ParsedTokenInfo): ParsedTokenInfo {
 /**
  * Parse token info from SDK token data or TXF JSON
  */
-async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
+export async function parseTokenInfo(tokenData: unknown, engine?: ITokenEngine): Promise<ParsedTokenInfo> {
   const defaultInfo: ParsedTokenInfo = {
     coinId: 'ALPHA',
     symbol: 'ALPHA',
@@ -201,6 +201,31 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
     decimals: 0,
     amount: '0',
   };
+
+  // v2 engine path: tokenData is the engine blob (hex of CBOR(TokenBlob)). The
+  // value (coins) requires decoding the payment envelope, so it goes through the
+  // engine; the genesis-stable tokenId comes from engine.tokenId.
+  if (engine && typeof tokenData === 'string' && looksLikeTokenBlob(tokenData)) {
+    try {
+      const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(tokenData)));
+      const first = engine.readValue(token)?.assets[0];
+      if (first) {
+        return enrichWithRegistry({
+          coinId: first.coinId,
+          symbol: first.coinId.slice(0, 8),
+          name: `Token ${first.coinId.slice(0, 8)}`,
+          decimals: 0,
+          amount: String(first.amount),
+          tokenId: engine.tokenId(token),
+        });
+      }
+      // Value-less (data) token: keep defaults but carry the genesis tokenId.
+      return { ...defaultInfo, tokenId: engine.tokenId(token) };
+    } catch (error) {
+      logger.warn('Payments', 'Failed to parse token info via engine:', error);
+      // fall through to legacy parsing
+    }
+  }
 
   try {
     // If it's a string, try to parse as JSON
@@ -1995,7 +2020,7 @@ export class PaymentsModule {
     deferPersistence = false,
     skipGenesisDedup = false,
   ): Promise<Token | null> {
-    const tokenInfo = await parseTokenInfo(sourceTokenInput);
+    const tokenInfo = await parseTokenInfo(sourceTokenInput, this.deps?.tokenEngine);
 
     const sdkData = typeof sourceTokenInput === 'string'
       ? sourceTokenInput
@@ -5546,7 +5571,7 @@ export class PaymentsModule {
       }
 
       // Parse token info from SDK data
-      const tokenInfo = await parseTokenInfo(tokenData);
+      const tokenInfo = await parseTokenInfo(tokenData, this.deps?.tokenEngine);
 
       // Create token entry
       const token: Token = {
