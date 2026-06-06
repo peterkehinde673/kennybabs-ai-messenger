@@ -57,7 +57,8 @@ import type {
 import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage, hashInvoiceId } from './memo.js';
 import { AutoReturnManager } from './auto-return.js';
 import { canonicalSerialize } from './serialization.js';
-import { hexToBytes } from '@noble/hashes/utils.js';
+import { hexToBytes, bytesToHex } from '@noble/hashes/utils.js';
+import { encodeTokenBlob } from '../../token-engine/token-blob.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
 import { TokenRegistry } from '../../registry/index.js';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1016,6 +1017,26 @@ export class AccountingModule {
     // Steps 5–13: Mint token and store (mirrors NametagMinter pattern)
     // ------------------------------------------------------------------
     try {
+      let invoiceId: string;
+      let sdkData: string;
+      const engine = deps.tokenEngine;
+
+      if (engine) {
+        // v2: an invoice IS a data token — a single mintDataToken call replaces
+        // the hand-rolled v1 mint. The deterministic salt → engine.tokenId
+        // (64-char) keeps the invoice id terms-deterministic for dedup.
+        const invoiceToken = await engine.mintDataToken({
+          recipientPubkey: hexToBytes(deps.identity.chainPubkey),
+          data: invoiceBytesEncoded,
+          tokenType: hexToBytes(INVOICE_TOKEN_TYPE_HEX),
+          salt,
+        });
+        invoiceId = engine.tokenId(invoiceToken);
+        if (this.invoiceTermsCache.has(invoiceId)) {
+          throw new SphereError(`Invoice already exists locally: ${invoiceId}`, 'INVOICE_ALREADY_EXISTS');
+        }
+        sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(invoiceToken)));
+      } else {
       const { TokenId } = await import(
         '@unicitylabs/state-transition-sdk/lib/token/TokenId.js'
       );
@@ -1059,7 +1080,7 @@ export class AccountingModule {
         .update(invoiceBytesEncoded)
         .digest();
       const invoiceTokenId = new TokenId(hash.imprint);
-      const invoiceId = invoiceTokenId.toJSON(); // 64-char lowercase hex
+      invoiceId = invoiceTokenId.toJSON(); // v1: imprint-based id (engine path uses engine.tokenId)
 
       // CR-M5 fix: Check for duplicate before submitting to aggregator (matches importInvoice).
       // Same terms → same SHA-256 → same tokenId. Prevents double-mint attempts.
@@ -1209,7 +1230,9 @@ export class AccountingModule {
       // The sdkToken.toJSON() produces a TxfToken-compatible object which is
       // stored as sdkData (JSON string) on the UI Token.
       // ------------------------------------------------------------------
-      const sdkTokenJson = sdkToken.toJSON();
+      sdkData = JSON.stringify(sdkToken.toJSON());
+      } // end v1 (non-engine) mint branch
+
       const uiToken: import('../../types/index.js').Token = {
         id: invoiceId,
         coinId: INVOICE_TOKEN_TYPE_HEX,
@@ -1220,7 +1243,7 @@ export class AccountingModule {
         status: 'confirmed',
         createdAt: terms.createdAt,
         updatedAt: terms.createdAt,
-        sdkData: JSON.stringify(sdkTokenJson),
+        sdkData,
       };
 
       await deps.payments.addToken(uiToken);
@@ -1286,7 +1309,11 @@ export class AccountingModule {
       // ------------------------------------------------------------------
       // Step 15: Return result
       // ------------------------------------------------------------------
-      const txfToken: TxfToken = sdkTokenJson as unknown as TxfToken;
+      // v1: the TxfToken JSON (round-trips from sdkData). v2: the engine blob hex
+      // (the transmittable form; the v2 importInvoice path decodes it).
+      const txfToken: TxfToken = engine
+        ? (sdkData as unknown as TxfToken)
+        : (JSON.parse(sdkData) as TxfToken);
 
       return {
         success: true,
