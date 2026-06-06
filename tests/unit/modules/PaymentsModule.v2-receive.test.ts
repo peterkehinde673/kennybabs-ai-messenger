@@ -1,0 +1,168 @@
+/**
+ * v2 transfer RECEIVER — handleV2Transfer (B1, path B).
+ *
+ * Sender-driven model: the sender hands a FINISHED token (a V2_TRANSFER payload
+ * carrying the token blob), the receiver decodes it via the engine and just
+ * STORES it as a confirmed token — no commitment / inclusion-proof /
+ * finalization round-trip. Clean harness (NO SDK vi.mock) so FakeTokenEngine and
+ * the engine-injected SpendQueue run end-to-end.
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
+import type { FullIdentity } from '../../../types';
+import type { TransportProvider } from '../../../transport';
+import type { OracleProvider } from '../../../oracle';
+import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
+import { encodeTokenBlob } from '../../../token-engine/token-blob';
+import { bytesToHex } from '../../../core/crypto';
+import type { V2TransferPayload } from '../../../types/v2-transfer';
+
+const FAKE_PRIVATE_KEY = 'a'.repeat(64);
+const FAKE_PUBKEY = '02' + 'b'.repeat(64);
+const SENDER_TRANSPORT_PUBKEY = 'cc'.repeat(32);
+const RECIPIENT = new Uint8Array([0x02, ...new Array<number>(32).fill(7)]); // 33 bytes
+const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
+
+function mockIdentity(): FullIdentity {
+  return {
+    chainPubkey: FAKE_PUBKEY, l1Address: 'alpha1x', directAddress: 'DIRECT://x',
+    privateKey: FAKE_PRIVATE_KEY, transportPubkey: 'dd'.repeat(32),
+  };
+}
+
+function mockStorage(): StorageProvider {
+  const s = new Map<string, string>();
+  return {
+    id: 's', name: 's', type: 'local', connect: vi.fn(), disconnect: vi.fn(),
+    isConnected: () => true, getStatus: () => 'connected', setIdentity: vi.fn(),
+    get: vi.fn(async (k: string) => s.get(k) ?? null),
+    set: vi.fn(async (k: string, v: string) => { s.set(k, v); }),
+    remove: vi.fn(async (k: string) => { s.delete(k); }),
+    has: vi.fn(async (k: string) => s.has(k)),
+    keys: vi.fn(async () => [...s.keys()]),
+    clear: vi.fn(async () => { s.clear(); }),
+  } as unknown as StorageProvider;
+}
+
+function mockHistoryStore() {
+  const entries = new Map<string, HistoryRecord>();
+  return {
+    addHistoryEntry: vi.fn(async (e: HistoryRecord) => { entries.set(e.dedupKey, e); }),
+    getHistoryEntries: vi.fn(async () => [...entries.values()]),
+    hasHistoryEntry: vi.fn(async (k: string) => entries.has(k)),
+    clearHistory: vi.fn(async () => entries.clear()),
+    importHistoryEntries: vi.fn(async () => 0),
+  };
+}
+
+function mockTokenStorage(): TokenStorageProvider<TxfStorageDataBase> {
+  return {
+    id: 'ts', name: 'ts', type: 'local',
+    connect: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn().mockResolvedValue(undefined),
+    isConnected: () => true, getStatus: () => 'connected', setIdentity: vi.fn(),
+    initialize: vi.fn().mockResolvedValue(true), shutdown: vi.fn().mockResolvedValue(undefined),
+    save: vi.fn().mockResolvedValue({ success: true, timestamp: 0 }),
+    load: vi.fn().mockResolvedValue({ success: false, source: 'local', timestamp: 0 }),
+    sync: vi.fn().mockResolvedValue({ success: true, added: 0, removed: 0, conflicts: 0 }),
+    ...mockHistoryStore(),
+  } as unknown as TokenStorageProvider<TxfStorageDataBase>;
+}
+
+function mockTransport(nametag = 'alice'): TransportProvider {
+  return {
+    sendTokenTransfer: vi.fn().mockResolvedValue(undefined),
+    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
+    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
+    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
+    resolve: vi.fn().mockResolvedValue(null),
+    resolveNametagInfo: vi.fn().mockResolvedValue(null),
+    resolveTransportPubkeyInfo: vi.fn().mockResolvedValue({
+      chainPubkey: FAKE_PUBKEY, transportPubkey: SENDER_TRANSPORT_PUBKEY,
+      directAddress: 'DIRECT://sender', nametag,
+    }),
+    connect: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn(), isConnected: () => true,
+    publishNametag: vi.fn().mockResolvedValue(undefined),
+    sendPaymentRequest: vi.fn().mockResolvedValue(undefined),
+    sendPaymentRequestResponse: vi.fn().mockResolvedValue(undefined),
+  } as unknown as TransportProvider;
+}
+
+function mockOracle(): OracleProvider {
+  return {
+    validateToken: vi.fn().mockResolvedValue({ valid: true }),
+    getStateTransitionClient: vi.fn().mockReturnValue(undefined),
+    getTrustBase: vi.fn().mockReturnValue({}),
+    isDevMode: () => false,
+    waitForProofSdk: vi.fn().mockResolvedValue({ proof: 'mock' }),
+  } as unknown as OracleProvider;
+}
+
+function setup(engine = new FakeTokenEngine()) {
+  const tsp = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+  tsp.set('local', mockTokenStorage());
+  const emitEvent = vi.fn();
+  const deps: PaymentsModuleDependencies = {
+    identity: mockIdentity(), storage: mockStorage(), tokenStorageProviders: tsp,
+    transport: mockTransport(), oracle: mockOracle(), emitEvent, tokenEngine: engine,
+  };
+  const module = createPaymentsModule({ debug: false });
+  module.initialize(deps);
+  return { module, engine, emitEvent };
+}
+
+async function v2Payload(
+  engine: FakeTokenEngine, coinId: string, amount: bigint, memo?: string,
+): Promise<V2TransferPayload> {
+  const st = await engine.mint({ recipientPubkey: RECIPIENT, value: { assets: [{ coinId, amount }] } });
+  return { type: 'V2_TRANSFER', version: '2.0', tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(st))), memo };
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function deliver(module: ReturnType<typeof setup>['module'], payload: V2TransferPayload, id = 't1') {
+  return (module as any).handleIncomingTransfer({
+    id, senderTransportPubkey: SENDER_TRANSPORT_PUBKEY, payload, timestamp: 0,
+  });
+}
+
+describe('handleV2Transfer — v2 receiver (B1)', () => {
+  it('stores the finished token as confirmed', async () => {
+    const { module, engine } = setup();
+    await deliver(module, await v2Payload(engine, UCT, 100n));
+
+    const tokens = module.getTokens();
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0].coinId).toBe(UCT);
+    expect(tokens[0].amount).toBe('100');
+    expect(tokens[0].status).toBe('confirmed');
+  });
+
+  it('emits transfer:incoming with the token, memo and resolved sender nametag', async () => {
+    const { module, engine, emitEvent } = setup();
+    await deliver(module, await v2Payload(engine, UCT, 250n, 'gm'));
+
+    const call = emitEvent.mock.calls.find((c: any[]) => c[0] === 'transfer:incoming');
+    expect(call).toBeDefined();
+    expect(call![1].tokens).toHaveLength(1);
+    expect(call![1].memo).toBe('gm');
+    expect(call![1].senderNametag).toBe('alice');
+  });
+
+  it('records a single RECEIVED history entry', async () => {
+    const { module, engine } = setup();
+    await deliver(module, await v2Payload(engine, UCT, 100n));
+
+    const received = module.getHistory().filter((h) => h.type === 'RECEIVED');
+    expect(received).toHaveLength(1);
+    expect(received[0].amount).toBe('100');
+  });
+
+  it('dedups a re-delivered identical token (genesis-stable id)', async () => {
+    const { module, engine } = setup();
+    const payload = await v2Payload(engine, UCT, 100n);
+    await deliver(module, payload, 't1');
+    await deliver(module, payload, 't2');
+
+    expect(module.getTokens()).toHaveLength(1);
+  });
+});

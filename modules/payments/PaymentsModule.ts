@@ -30,7 +30,8 @@ import type {
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
-import type { ITokenEngine } from '../../token-engine';
+import type { ITokenEngine, SphereToken } from '../../token-engine';
+import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -5368,6 +5369,76 @@ export class PaymentsModule {
     }
   }
 
+  /**
+   * v2 engine transfer (sender-driven): the sender handed us a FINISHED token.
+   * Decode the blob, dedup by the genesis-stable token id, store it as a
+   * confirmed token, and emit/record the receipt. No commitment / inclusion-proof
+   * / finalization round-trip (contrast the v1 sourceToken+transferTx path).
+   */
+  private async handleV2Transfer(payload: V2TransferPayload, senderPubkey: string): Promise<void> {
+    this.ensureInitialized();
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+
+    const engine = this.deps!.tokenEngine;
+    if (!engine) return;
+
+    let token: SphereToken;
+    try {
+      token = await engine.decodeToken(decodeTokenBlob(hexToBytes(payload.tokenBlob)));
+    } catch (err) {
+      logger.error('Payments', 'V2 transfer: failed to decode token blob:', err);
+      return;
+    }
+
+    // Dedup by genesis-stable id (a re-delivered identical token is ignored).
+    const id = `v2_${engine.tokenId(token)}`;
+    if (this.tokens.has(id)) {
+      logger.debug('Payments', `V2 transfer ${id.slice(0, 16)}... already present, skipping`);
+      return;
+    }
+
+    const info = await parseTokenInfo(payload.tokenBlob, engine);
+    const registry = TokenRegistry.getInstance();
+    const uiToken: Token = {
+      id,
+      coinId: info.coinId,
+      symbol: registry.getSymbol(info.coinId) || info.symbol,
+      name: registry.getName(info.coinId) || info.name,
+      decimals: registry.getDecimals(info.coinId) ?? info.decimals,
+      amount: info.amount,
+      status: 'confirmed',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData: payload.tokenBlob,
+    };
+
+    await this.addToken(uiToken);
+    const senderInfo = await this.resolveSenderInfo(senderPubkey);
+
+    this.deps!.emitEvent('transfer:incoming', {
+      id,
+      senderPubkey,
+      senderNametag: senderInfo.senderNametag,
+      tokens: [uiToken],
+      memo: payload.memo,
+      receivedAt: Date.now(),
+    });
+
+    await this.addToHistory({
+      type: 'RECEIVED',
+      amount: info.amount,
+      coinId: info.coinId,
+      symbol: uiToken.symbol,
+      timestamp: Date.now(),
+      senderPubkey,
+      ...senderInfo,
+      memo: payload.memo,
+      tokenId: id,
+    });
+  }
+
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
     // Ensure load() has completed so dedup checks see all persisted tokens.
     if (!this.loaded && this.loadedPromise) {
@@ -5381,6 +5452,13 @@ export class PaymentsModule {
       // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
       logger.debug('Payments', 'handleIncomingTransfer: keys=', Object.keys(payload).join(','));
+
+      // v2 engine transfer (sender-driven): the sender handed us a FINISHED token.
+      // Decode + store directly — no commitment / proof / finalization round-trip.
+      if (this.deps!.tokenEngine && isV2TransferPayload(transfer.payload)) {
+        await this.handleV2Transfer(transfer.payload, transfer.senderTransportPubkey);
+        return;
+      }
 
       // Check for COMBINED_TRANSFER V6 bundle (single message containing all tokens)
       let combinedBundle: CombinedTransferBundleV6 | null = null;
