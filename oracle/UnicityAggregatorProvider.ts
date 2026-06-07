@@ -141,6 +141,11 @@ export class UnicityAggregatorProvider implements OracleProvider {
     return this.config.url;
   }
 
+  /** The gateway API key (for the v2 token engine); undefined when none is configured. */
+  getApiKey(): string | undefined {
+    return this.config.apiKey || undefined;
+  }
+
   /** Get the state transition client */
   getStateTransitionClient(): StateTransitionClient | null {
     return this.stateTransitionClient;

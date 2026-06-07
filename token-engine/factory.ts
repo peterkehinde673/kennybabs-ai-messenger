@@ -40,7 +40,7 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   );
 
   const deps: EngineDeps = {
-    client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl)),
+    client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl, config.apiKey ?? null)),
     trustBase,
     predicateVerifier,
     mintJustificationVerifier,

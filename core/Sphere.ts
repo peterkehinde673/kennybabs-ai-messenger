@@ -4204,6 +4204,7 @@ export class Sphere {
     const oracle = this._oracle as {
       getTrustBaseJson?: () => unknown;
       getAggregatorUrl?: () => string;
+      getApiKey?: () => string | undefined;
     };
     const trustBaseJson = oracle.getTrustBaseJson?.() ?? null;
     const aggregatorUrl = oracle.getAggregatorUrl?.();
@@ -4214,6 +4215,7 @@ export class Sphere {
     try {
       return await createSphereTokenEngine({
         aggregatorUrl,
+        apiKey: oracle.getApiKey?.(),
         privateKey: hexToBytes(this._identity.privateKey),
         trustBaseJson,
       });

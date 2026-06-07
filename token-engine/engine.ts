@@ -112,6 +112,8 @@ export interface ITokenEngine {
 export interface EngineConfig {
   /** Aggregator (gateway) base URL the StateTransitionClient talks to. */
   readonly aggregatorUrl: string;
+  /** Optional gateway API key (some gateways, e.g. testnet2, require it for auth). */
+  readonly apiKey?: string;
   /** Wallet signing key (secp256k1 private scalar, 32 bytes). Held inside the engine only. */
   readonly privateKey: Uint8Array;
   /**
