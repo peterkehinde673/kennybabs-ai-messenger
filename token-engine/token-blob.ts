@@ -1,11 +1,12 @@
 /**
  * token-engine/token-blob.ts — storage/transport codec for a wallet token.
  *
- * A {@link TokenBlob} is `{ v, network, token }` where `token` is the v2
- * `Token.toCBOR()` bytes. This codec wraps it in a sphere-private CBOR envelope
- * so the wallet's own storage format can version independently of the SDK's
- * token CBOR. The decoded value is re-derivable from `token`, so it is NOT
- * stored here.
+ * A {@link TokenBlob} is `{ v, network, tokenId, token }` where `token` is the v2
+ * `Token.toCBOR()` bytes and `tokenId` is the genesis-stable id (stored so dedup /
+ * listing / tombstone keys need no engine call). This codec wraps it in a
+ * sphere-private CBOR envelope so the wallet's own storage format can version
+ * independently of the SDK's token CBOR. The decoded value is re-derivable from
+ * `token`, so it is NOT stored here.
  */
 
 import { CborDeserializer, CborError, CborSerializer } from './sdk';
@@ -16,7 +17,7 @@ const TOKEN_BLOB_TAG = 39051n;
 /** Current blob envelope version. */
 export const TOKEN_BLOB_VERSION = 1;
 
-/** Encode a blob as `tag(39051)[ v, network, token ]`. */
+/** Encode a blob as `tag(39051)[ v, network, tokenId, token ]`. */
 export function encodeTokenBlob(blob: TokenBlob): Uint8Array {
   return CborSerializer.encodeTag(
     TOKEN_BLOB_TAG,

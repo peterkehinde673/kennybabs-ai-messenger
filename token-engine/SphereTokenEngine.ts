@@ -16,7 +16,6 @@ import { SphereError } from '../core/errors';
 import { deriveDirectAddress } from './identity';
 import {
   CborDeserializer,
-  CborSerializer,
   CertificationData,
   CertificationStatus,
   EncodedPredicate,
@@ -156,9 +155,7 @@ export class SphereTokenEngine implements ITokenEngine {
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const tokenType = params.tokenType ? new TokenType(params.tokenType) : TokenType.generate();
     // A deterministic salt yields a stable, terms-derived tokenId (TokenId.fromSalt).
-    const salt = params.salt
-      ? TokenSalt.fromCBOR(CborSerializer.encodeByteString(params.salt))
-      : TokenSalt.generate();
+    const salt = params.salt ? TokenSalt.fromBytes(params.salt) : TokenSalt.generate();
 
     const mintTx = await MintTransaction.create(this.deps.networkId, recipient, params.data, tokenType, salt);
     const certificationData = await CertificationData.fromMintTransaction(mintTx);

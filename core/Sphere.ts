@@ -445,6 +445,8 @@ export interface AddressModuleSet {
   market: MarketModule | null;
   transportAdapter: AddressTransportAdapter | null;
   tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
+  /** v2 token engine for THIS address (bound to its signing key). */
+  tokenEngine: ITokenEngine | undefined;
   initialized: boolean;
 }
 
@@ -2294,7 +2296,8 @@ export class Sphere {
         moduleSet.identity = newIdentity;
         // Use per-address transport if available
         const addressTransport: TransportProvider = moduleSet.transportAdapter ?? this._transport;
-        // Re-initialize with updated identity (nametag change)
+        // Re-initialize with updated identity (nametag change). The signing key is
+        // unchanged (only the nametag label), so reuse this address's token engine.
         moduleSet.payments.initialize({
           identity: newIdentity,
           storage: this._storage,
@@ -2304,6 +2307,7 @@ export class Sphere {
           emitEvent: this.emitEvent.bind(this),
           chainCode: this._masterKey?.chainCode || undefined,
           price: this._priceProvider ?? undefined,
+          tokenEngine: moduleSet.tokenEngine,
         });
       }
     }
@@ -2425,6 +2429,9 @@ export class Sphere {
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
 
+    // v2 token engine for THIS address (bound to its signing key).
+    const tokenEngine = await this.buildTokenEngine(identity);
+
     // Initialize with address-specific identity and per-address transport
     payments.initialize({
       identity,
@@ -2435,6 +2442,7 @@ export class Sphere {
       emitEvent,
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
+      tokenEngine,
     });
 
     communications.initialize({
@@ -2478,6 +2486,7 @@ export class Sphere {
           on: this.on.bind(this),
           storage: this._storage,
           communications,
+          tokenEngine,
         });
       } else {
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
@@ -2543,6 +2552,7 @@ export class Sphere {
       market,
       transportAdapter: adapter,
       tokenStorageProviders: new Map(tokenStorageProviders),
+      tokenEngine,
       initialized: true,
     };
 
@@ -4193,22 +4203,24 @@ export class Sphere {
   }
 
   /**
-   * Construct the v2 token engine for the active address from the oracle's gateway
-   * URL + trust base and this address's signing key. The trust base is the single
-   * source of truth for the network id (so any id works — e.g. testnet2 = 4 — with
-   * no enum entry). Returns undefined (modules keep their legacy path) when the
-   * oracle can't supply a trust base / url, or construction fails — a misconfigured
-   * oracle never breaks initialization.
+   * Construct the v2 token engine for a given address identity (defaults to the
+   * active one) from the oracle's gateway URL + trust base and that address's
+   * signing key. The engine is per-address — each address signs with its own key.
+   * The trust base is the single source of truth for the network id (so any id
+   * works — e.g. testnet2 = 4 — with no enum entry). Returns undefined (modules
+   * keep their legacy path) when the oracle can't supply a trust base / url, or
+   * construction fails — a misconfigured oracle never breaks initialization.
    */
-  private async buildTokenEngine(): Promise<ITokenEngine | undefined> {
+  private async buildTokenEngine(identity?: FullIdentity): Promise<ITokenEngine | undefined> {
     const oracle = this._oracle as {
       getTrustBaseJson?: () => unknown;
       getAggregatorUrl?: () => string;
       getApiKey?: () => string | undefined;
     };
+    const privateKey = (identity ?? this._identity)?.privateKey;
     const trustBaseJson = oracle.getTrustBaseJson?.() ?? null;
     const aggregatorUrl = oracle.getAggregatorUrl?.();
-    if (!trustBaseJson || !aggregatorUrl || !this._identity?.privateKey) {
+    if (!trustBaseJson || !aggregatorUrl || !privateKey) {
       logger.warn('Sphere', 'v2 token engine not constructed (oracle has no trust base / url, or no identity) — legacy path');
       return undefined;
     }
@@ -4216,7 +4228,7 @@ export class Sphere {
       return await createSphereTokenEngine({
         aggregatorUrl,
         apiKey: oracle.getApiKey?.(),
-        privateKey: hexToBytes(this._identity.privateKey),
+        privateKey: hexToBytes(privateKey),
         trustBaseJson,
       });
     } catch (err) {
@@ -4364,6 +4376,7 @@ export class Sphere {
       market: this._market,
       transportAdapter: adapter,
       tokenStorageProviders: new Map(this._tokenStorageProviders),
+      tokenEngine: this._tokenEngine,
       initialized: true,
     });
   }
