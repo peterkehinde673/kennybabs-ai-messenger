@@ -14,7 +14,6 @@
  */
 
 import { SphereError } from '../core/errors';
-import { toNetworkId } from './network';
 import {
   AggregatorClient,
   MintJustificationVerifierService,
@@ -41,12 +40,14 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   );
 
   const deps: EngineDeps = {
-    client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl)),
+    client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl, config.apiKey ?? null)),
     trustBase,
     predicateVerifier,
     mintJustificationVerifier,
     signingService: new SigningService(config.privateKey),
-    networkId: toNetworkId(config.network),
+    // The trust base is the single source of truth for the network id (it carries
+    // NetworkId.fromId, so any id works — e.g. testnet2 = 4 — with no enum entry).
+    networkId: trustBase.networkId,
   };
 
   return new SphereTokenEngine(deps);
