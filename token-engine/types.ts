@@ -137,8 +137,13 @@ export interface SplitParams {
 
 // ── results ───────────────────────────────────────────────────────────────────
 
-/** Result of a split: one minted token per requested output, in input order. */
 export interface SplitResult {
+  /**
+   * One minted token per requested output, **index-aligned with
+   * `SplitParams.outputs`** — `outputs[i]` is the token for `params.outputs[i]`
+   * (so a payee/change split can rely on positional order). Guaranteed by both
+   * the real engine and FakeTokenEngine.
+   */
   readonly outputs: readonly SphereToken[];
 }
 

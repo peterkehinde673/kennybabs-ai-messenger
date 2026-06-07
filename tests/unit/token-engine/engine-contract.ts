@@ -142,6 +142,9 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
           { recipientPubkey: e.getIdentity().chainPubkey, coinId: COIN, amount: 4n },
         ],
       });
+      // Outputs are index-aligned with the requested outputs (positional contract).
+      expect(e.balanceOf(outputs[0], COIN)).toBe(6n);
+      expect(e.balanceOf(outputs[1], COIN)).toBe(4n);
       expect(e.readMemo(outputs[0])).toEqual(memo);
       expect(e.readMemo(outputs[1])).toBeNull();
     });
