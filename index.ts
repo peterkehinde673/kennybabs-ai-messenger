@@ -373,8 +373,6 @@ export type {
   SpentTokenInfo,
   SpentTokenResult,
   ValidationResult as TokenValidationResult,
-  AggregatorClient,
-  TrustBaseLoader,
 } from './validation';
 
 // =============================================================================

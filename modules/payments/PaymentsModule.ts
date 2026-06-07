@@ -29,7 +29,9 @@ import type {
   NametagData,
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
-import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './TokenSplitCalculator';
+import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
+import type { ITokenEngine, SphereToken } from '../../token-engine';
+import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -65,6 +67,8 @@ import {
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
+import { decodeTokenBlob, encodeTokenBlob } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // Instant split imports
@@ -190,7 +194,7 @@ function enrichWithRegistry(info: ParsedTokenInfo): ParsedTokenInfo {
 /**
  * Parse token info from SDK token data or TXF JSON
  */
-async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
+export async function parseTokenInfo(tokenData: unknown, engine?: ITokenEngine): Promise<ParsedTokenInfo> {
   const defaultInfo: ParsedTokenInfo = {
     coinId: 'ALPHA',
     symbol: 'ALPHA',
@@ -198,6 +202,31 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
     decimals: 0,
     amount: '0',
   };
+
+  // v2 engine path: tokenData is the engine blob (hex of CBOR(TokenBlob)). The
+  // value (coins) requires decoding the payment envelope, so it goes through the
+  // engine; the genesis-stable tokenId comes from engine.tokenId.
+  if (engine && typeof tokenData === 'string' && looksLikeTokenBlob(tokenData)) {
+    try {
+      const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(tokenData)));
+      const first = engine.readValue(token)?.assets[0];
+      if (first) {
+        return enrichWithRegistry({
+          coinId: first.coinId,
+          symbol: first.coinId.slice(0, 8),
+          name: `Token ${first.coinId.slice(0, 8)}`,
+          decimals: 0,
+          amount: String(first.amount),
+          tokenId: engine.tokenId(token),
+        });
+      }
+      // Value-less (data) token: keep defaults but carry the genesis tokenId.
+      return { ...defaultInfo, tokenId: engine.tokenId(token) };
+    } catch (error) {
+      logger.warn('Payments', 'Failed to parse token info via engine:', error);
+      // fall through to legacy parsing
+    }
+  }
 
   try {
     // If it's a string, try to parse as JSON
@@ -377,34 +406,61 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 const sdkDataCache = new Map<string, { tokenId: string | null; stateHash: string }>();
 const SDK_DATA_CACHE_MAX = 2000;
 
+/** A v2 engine blob is hex (CBOR); legacy v1 TXF is JSON (starts with '{'). */
+function looksLikeTokenBlob(sdkData: string): boolean {
+  return sdkData.length >= 2 && sdkData.length % 2 === 0 && sdkData[0] !== '{' && /^[0-9a-f]+$/i.test(sdkData);
+}
+
+/**
+ * Extract keys from a v2 engine blob (hex of CBOR(TokenBlob)). The blob carries
+ * its genesis-stable tokenId; the per-state hash is SHA-256 of the token bytes
+ * (unique per state — it changes on every transfer). No engine needed.
+ * Returns null when the string is not a decodable blob.
+ */
+function tryParseBlobKeys(sdkData: string): { tokenId: string; stateHash: string } | null {
+  try {
+    const blob = decodeTokenBlob(hexToBytes(sdkData));
+    return { tokenId: blob.tokenId, stateHash: sha256(bytesToHex(blob.token), 'hex') };
+  } catch {
+    return null;
+  }
+}
+
 function parseSdkDataCached(sdkData: string): { tokenId: string | null; stateHash: string } {
   const cached = sdkDataCache.get(sdkData);
   if (cached) return cached;
 
-  let tokenId: string | null = null;
-  let stateHash = '';
-  try {
-    const txf = JSON.parse(sdkData);
-    tokenId = txf.genesis?.data?.tokenId || null;
-    stateHash = getCurrentStateHash(txf as TxfToken) || '';
+  // v2 engine blob: self-describing keys (no engine, no JSON).
+  let entry: { tokenId: string | null; stateHash: string } | null =
+    looksLikeTokenBlob(sdkData) ? tryParseBlobKeys(sdkData) : null;
 
-    // Try alternative locations if not found in standard place
-    if (!stateHash) {
-      /* eslint-disable @typescript-eslint/no-explicit-any */
-      if ((txf as any).state?.hash) {
-        stateHash = (txf as any).state.hash;
-      } else if ((txf as any).stateHash) {
-        stateHash = (txf as any).stateHash;
-      } else if ((txf as any).currentStateHash) {
-        stateHash = (txf as any).currentStateHash;
+  if (!entry) {
+    // Legacy v1 TXF JSON.
+    let tokenId: string | null = null;
+    let stateHash = '';
+    try {
+      const txf = JSON.parse(sdkData);
+      tokenId = txf.genesis?.data?.tokenId || null;
+      stateHash = getCurrentStateHash(txf as TxfToken) || '';
+
+      // Try alternative locations if not found in standard place
+      if (!stateHash) {
+        /* eslint-disable @typescript-eslint/no-explicit-any */
+        if ((txf as any).state?.hash) {
+          stateHash = (txf as any).state.hash;
+        } else if ((txf as any).stateHash) {
+          stateHash = (txf as any).stateHash;
+        } else if ((txf as any).currentStateHash) {
+          stateHash = (txf as any).currentStateHash;
+        }
+        /* eslint-enable @typescript-eslint/no-explicit-any */
       }
-      /* eslint-enable @typescript-eslint/no-explicit-any */
+    } catch {
+      // Invalid JSON — return defaults
     }
-  } catch {
-    // Invalid JSON — return defaults
+    entry = { tokenId, stateHash };
   }
 
-  const entry = { tokenId, stateHash };
   // Evict cache if it grows too large (unlikely in normal usage)
   if (sdkDataCache.size >= SDK_DATA_CACHE_MAX) {
     sdkDataCache.clear();
@@ -420,7 +476,7 @@ function clearSdkDataCache(): void {
 /**
  * Extract token ID (genesis tokenId) from sdkData/jsonData
  */
-function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
+export function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
   if (!sdkData) return null;
   return parseSdkDataCached(sdkData).tokenId;
 }
@@ -428,7 +484,7 @@ function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
 /**
  * Extract state hash from sdkData/jsonData
  */
-function extractStateHashFromSdkData(sdkData: string | undefined): string {
+export function extractStateHashFromSdkData(sdkData: string | undefined): string {
   if (!sdkData) return '';
   return parseSdkDataCached(sdkData).stateHash;
 }
@@ -438,7 +494,7 @@ function extractStateHashFromSdkData(sdkData: string | undefined): string {
  * Format: {tokenId}_{stateHash}
  * This uniquely identifies a token at a specific state
  */
-function createTokenStateKey(tokenId: string, stateHash: string): string {
+export function createTokenStateKey(tokenId: string, stateHash: string): string {
   return `${tokenId}_${stateHash}`;
 }
 
@@ -446,7 +502,7 @@ function createTokenStateKey(tokenId: string, stateHash: string): string {
  * Extract composite key (tokenId_stateHash) from token
  * Returns null if token doesn't have valid tokenId and stateHash
  */
-function extractTokenStateKey(token: Token): string | null {
+export function extractTokenStateKey(token: Token): string | null {
   const tokenId = extractTokenIdFromSdkData(token.sdkData);
   const stateHash = extractStateHashFromSdkData(token.sdkData);
   if (!tokenId || !stateHash) return null;
@@ -652,6 +708,12 @@ export interface PaymentsModuleDependencies {
   tokenStorageProviders?: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
   transport: TransportProvider;
   oracle: OracleProvider;
+  /**
+   * Token engine (v2). Optional during migration (path B): when provided, value
+   * reads / lifecycle go through the engine; otherwise the legacy v1 SDK path is
+   * used. Wired by Sphere once the engine is constructed (A4-int).
+   */
+  tokenEngine?: ITokenEngine;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
   /** Chain code for BIP32 HD derivation (for L1 multi-address support) */
   chainCode?: string;
@@ -872,6 +934,8 @@ export class PaymentsModule {
 
     this.deps = deps;
     this.priceProvider = deps.price ?? null;
+    // Path B: wire the engine into the planner (value reads use it when present).
+    this.spendPlanner.setEngine(deps.tokenEngine);
 
     // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
     if (this.l1) {
@@ -1198,7 +1262,77 @@ export class PaymentsModule {
         request.invoiceContact,
       );
 
-      if (transferMode === 'conservative') {
+      if (this.deps?.tokenEngine && peerInfo?.chainPubkey) {
+        // =================================================================
+        // v2 ENGINE MODE (sender-driven): engine.transfer hands the recipient
+        // a FINISHED token — no commitment / inclusion-proof / finalization.
+        // Whole-token (no-split) path; the value-conserving split path is next.
+        // =================================================================
+        const engine = this.deps.tokenEngine;
+        const recipientChainPubkey = hexToBytes(peerInfo.chainPubkey);
+        // On-chain memo: the structured invoice ref ({inv:{id,dir}}) for invoice
+        // payments, else null — plain memos stay transport-only (privacy).
+        // parseInvoiceMemoForOnChain already produced the encoded bytes (or null).
+        const memoData = onChainMessage ?? undefined;
+
+        // Hand a finished token to the recipient as a V2_TRANSFER (blob) payload.
+        const handToRecipient = async (finished: SphereToken): Promise<void> => {
+          const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            type: 'V2_TRANSFER',
+            version: '2.0',
+            tokenBlob,
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+        };
+
+        // Whole-token direct transfers.
+        for (const tw of splitPlan.tokensToTransferDirectly) {
+          const finished = await engine.transfer({
+            token: tw.sdkToken as SphereToken,
+            recipientPubkey: recipientChainPubkey,
+            data: memoData,
+          });
+          await handToRecipient(finished);
+          result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
+          await this.removeToken(tw.uiToken.id, result.id);
+        }
+
+        // Value-conserving split: recipient gets splitAmount, this wallet keeps
+        // the remainder. The change token is real + immediate (the engine mints
+        // it) — no placeholder / background-proof step.
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+          const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
+          const { outputs } = await engine.split({
+            token: splitPlan.tokenToSplit.sdkToken as SphereToken,
+            outputs: [
+              { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: splitPlan.splitAmount!, data: memoData },
+              { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
+            ],
+          });
+          await handToRecipient(outputs[0]);
+
+          const changeToken = outputs[1];
+          const changeBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(changeToken)));
+          const changeInfo = await parseTokenInfo(changeBlob, engine);
+          const registry = TokenRegistry.getInstance();
+          await this.addToken({
+            id: `v2_${engine.tokenId(changeToken)}`,
+            coinId: changeInfo.coinId,
+            symbol: registry.getSymbol(changeInfo.coinId) || changeInfo.symbol,
+            name: registry.getName(changeInfo.coinId) || changeInfo.name,
+            decimals: registry.getDecimals(changeInfo.coinId) ?? changeInfo.decimals,
+            amount: changeInfo.amount,
+            status: 'confirmed',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sdkData: changeBlob,
+          });
+
+          result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
+        }
+      } else if (transferMode === 'conservative') {
         // =================================================================
         // CONSERVATIVE MODE: each token sent individually with full proofs
         // =================================================================
@@ -1282,7 +1416,7 @@ export class PaymentsModule {
           const transferTx = commitment.toTransaction(inclusionProof);
 
           await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
+            sourceToken: JSON.stringify((tokenWithAmount.sdkToken as SdkToken<any>).toJSON()),
             transferTx: JSON.stringify(transferTx.toJSON()),
             memo: request.memo,
           } as unknown as import('../../transport').TokenTransferPayload);
@@ -1325,7 +1459,7 @@ export class PaymentsModule {
           });
 
           builtSplit = await executor.buildSplitBundle(
-            splitPlan.tokenToSplit.sdkToken,
+            splitPlan.tokenToSplit.sdkToken as SdkToken<any>,
             splitPlan.splitAmount!,
             splitPlan.remainderAmount!,
             splitPlan.coinId,
@@ -1377,7 +1511,7 @@ export class PaymentsModule {
 
         const directTokenEntries: DirectTokenEntry[] = splitPlan.tokensToTransferDirectly.map(
           (tw: TokenWithAmount, i: number) => ({
-            sourceToken: JSON.stringify(tw.sdkToken.toJSON()),
+            sourceToken: JSON.stringify((tw.sdkToken as SdkToken<any>).toJSON()),
             commitmentData: JSON.stringify(directCommitments[i].toJSON()),
             amount: tw.uiToken.amount,
             coinId: tw.uiToken.coinId,
@@ -1757,7 +1891,7 @@ export class PaymentsModule {
 
       // Execute instant split
       const result = await executor.executeSplitInstant(
-        splitPlan.tokenToSplit.sdkToken,
+        splitPlan.tokenToSplit.sdkToken as SdkToken<any>,
         splitPlan.splitAmount!,
         splitPlan.remainderAmount!,
         splitPlan.coinId,
@@ -1957,7 +2091,7 @@ export class PaymentsModule {
     deferPersistence = false,
     skipGenesisDedup = false,
   ): Promise<Token | null> {
-    const tokenInfo = await parseTokenInfo(sourceTokenInput);
+    const tokenInfo = await parseTokenInfo(sourceTokenInput, this.deps?.tokenEngine);
 
     const sdkData = typeof sourceTokenInput === 'string'
       ? sourceTokenInput
@@ -5305,6 +5439,76 @@ export class PaymentsModule {
     }
   }
 
+  /**
+   * v2 engine transfer (sender-driven): the sender handed us a FINISHED token.
+   * Decode the blob, dedup by the genesis-stable token id, store it as a
+   * confirmed token, and emit/record the receipt. No commitment / inclusion-proof
+   * / finalization round-trip (contrast the v1 sourceToken+transferTx path).
+   */
+  private async handleV2Transfer(payload: V2TransferPayload, senderPubkey: string): Promise<void> {
+    this.ensureInitialized();
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+
+    const engine = this.deps!.tokenEngine;
+    if (!engine) return;
+
+    let token: SphereToken;
+    try {
+      token = await engine.decodeToken(decodeTokenBlob(hexToBytes(payload.tokenBlob)));
+    } catch (err) {
+      logger.error('Payments', 'V2 transfer: failed to decode token blob:', err);
+      return;
+    }
+
+    // Dedup by genesis-stable id (a re-delivered identical token is ignored).
+    const id = `v2_${engine.tokenId(token)}`;
+    if (this.tokens.has(id)) {
+      logger.debug('Payments', `V2 transfer ${id.slice(0, 16)}... already present, skipping`);
+      return;
+    }
+
+    const info = await parseTokenInfo(payload.tokenBlob, engine);
+    const registry = TokenRegistry.getInstance();
+    const uiToken: Token = {
+      id,
+      coinId: info.coinId,
+      symbol: registry.getSymbol(info.coinId) || info.symbol,
+      name: registry.getName(info.coinId) || info.name,
+      decimals: registry.getDecimals(info.coinId) ?? info.decimals,
+      amount: info.amount,
+      status: 'confirmed',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData: payload.tokenBlob,
+    };
+
+    await this.addToken(uiToken);
+    const senderInfo = await this.resolveSenderInfo(senderPubkey);
+
+    this.deps!.emitEvent('transfer:incoming', {
+      id,
+      senderPubkey,
+      senderNametag: senderInfo.senderNametag,
+      tokens: [uiToken],
+      memo: payload.memo,
+      receivedAt: Date.now(),
+    });
+
+    await this.addToHistory({
+      type: 'RECEIVED',
+      amount: info.amount,
+      coinId: info.coinId,
+      symbol: uiToken.symbol,
+      timestamp: Date.now(),
+      senderPubkey,
+      ...senderInfo,
+      memo: payload.memo,
+      tokenId: id,
+    });
+  }
+
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
     // Ensure load() has completed so dedup checks see all persisted tokens.
     if (!this.loaded && this.loadedPromise) {
@@ -5318,6 +5522,13 @@ export class PaymentsModule {
       // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
       logger.debug('Payments', 'handleIncomingTransfer: keys=', Object.keys(payload).join(','));
+
+      // v2 engine transfer (sender-driven): the sender handed us a FINISHED token.
+      // Decode + store directly — no commitment / proof / finalization round-trip.
+      if (this.deps!.tokenEngine && isV2TransferPayload(transfer.payload)) {
+        await this.handleV2Transfer(transfer.payload, transfer.senderTransportPubkey);
+        return;
+      }
 
       // Check for COMBINED_TRANSFER V6 bundle (single message containing all tokens)
       let combinedBundle: CombinedTransferBundleV6 | null = null;
@@ -5508,7 +5719,7 @@ export class PaymentsModule {
       }
 
       // Parse token info from SDK data
-      const tokenInfo = await parseTokenInfo(tokenData);
+      const tokenInfo = await parseTokenInfo(tokenData, this.deps?.tokenEngine);
 
       // Create token entry
       const token: Token = {

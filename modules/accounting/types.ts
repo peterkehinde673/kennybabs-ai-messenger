@@ -11,6 +11,7 @@ import type { FullIdentity, TrackedAddress, SphereEventType, SphereEventMap, Tra
 import type { TxfToken } from '../../types/txf';
 import type { StorageProvider, TokenStorageProvider } from '../../storage/storage-provider';
 import type { OracleProvider } from '../../oracle/oracle-provider';
+import type { ITokenEngine } from '../../token-engine';
 import type { PaymentsModule } from '../payments/PaymentsModule';
 import type { CommunicationsModule } from '../communications/CommunicationsModule';
 
@@ -641,6 +642,12 @@ export interface AccountingModuleDependencies {
   trustBase: unknown;
   /** Current wallet identity */
   identity: FullIdentity;
+  /**
+   * Token engine (v2). Optional during migration (path B): when provided,
+   * invoice tokens are minted via engine.mintDataToken (a data token); otherwise
+   * the legacy v1 hand-rolled mint is used. Wired by Sphere once A4-int lands.
+   */
+  tokenEngine?: ITokenEngine;
   /**
    * All tracked wallet addresses — used for target check in close/cancel/return.
    * Target validation compares TrackedAddress.directAddress against

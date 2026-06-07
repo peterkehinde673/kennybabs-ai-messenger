@@ -20,7 +20,7 @@ import type {
   SphereEventMap,
 } from '../../types/index.js';
 import type { TxfToken } from '../../types/txf.js';
-import type { DirectMessage } from '../../types/index.js';
+import type { DirectMessage, Token } from '../../types/index.js';
 import type {
   AccountingModuleConfig,
   AccountingModuleDependencies,
@@ -57,7 +57,8 @@ import type {
 import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage, hashInvoiceId } from './memo.js';
 import { AutoReturnManager } from './auto-return.js';
 import { canonicalSerialize } from './serialization.js';
-import { hexToBytes } from '@noble/hashes/utils.js';
+import { hexToBytes, bytesToHex } from '@noble/hashes/utils.js';
+import { encodeTokenBlob, decodeTokenBlob } from '../../token-engine/token-blob.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
 import { TokenRegistry } from '../../registry/index.js';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1016,6 +1017,26 @@ export class AccountingModule {
     // Steps 5–13: Mint token and store (mirrors NametagMinter pattern)
     // ------------------------------------------------------------------
     try {
+      let invoiceId: string;
+      let sdkData: string;
+      const engine = deps.tokenEngine;
+
+      if (engine) {
+        // v2: an invoice IS a data token — a single mintDataToken call replaces
+        // the hand-rolled v1 mint. The deterministic salt → engine.tokenId
+        // (64-char) keeps the invoice id terms-deterministic for dedup.
+        const invoiceToken = await engine.mintDataToken({
+          recipientPubkey: hexToBytes(deps.identity.chainPubkey),
+          data: invoiceBytesEncoded,
+          tokenType: hexToBytes(INVOICE_TOKEN_TYPE_HEX),
+          salt,
+        });
+        invoiceId = engine.tokenId(invoiceToken);
+        if (this.invoiceTermsCache.has(invoiceId)) {
+          throw new SphereError(`Invoice already exists locally: ${invoiceId}`, 'INVOICE_ALREADY_EXISTS');
+        }
+        sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(invoiceToken)));
+      } else {
       const { TokenId } = await import(
         '@unicitylabs/state-transition-sdk/lib/token/TokenId.js'
       );
@@ -1059,7 +1080,7 @@ export class AccountingModule {
         .update(invoiceBytesEncoded)
         .digest();
       const invoiceTokenId = new TokenId(hash.imprint);
-      const invoiceId = invoiceTokenId.toJSON(); // 64-char lowercase hex
+      invoiceId = invoiceTokenId.toJSON(); // v1: imprint-based id (engine path uses engine.tokenId)
 
       // CR-M5 fix: Check for duplicate before submitting to aggregator (matches importInvoice).
       // Same terms → same SHA-256 → same tokenId. Prevents double-mint attempts.
@@ -1209,7 +1230,9 @@ export class AccountingModule {
       // The sdkToken.toJSON() produces a TxfToken-compatible object which is
       // stored as sdkData (JSON string) on the UI Token.
       // ------------------------------------------------------------------
-      const sdkTokenJson = sdkToken.toJSON();
+      sdkData = JSON.stringify(sdkToken.toJSON());
+      } // end v1 (non-engine) mint branch
+
       const uiToken: import('../../types/index.js').Token = {
         id: invoiceId,
         coinId: INVOICE_TOKEN_TYPE_HEX,
@@ -1220,7 +1243,7 @@ export class AccountingModule {
         status: 'confirmed',
         createdAt: terms.createdAt,
         updatedAt: terms.createdAt,
-        sdkData: JSON.stringify(sdkTokenJson),
+        sdkData,
       };
 
       await deps.payments.addToken(uiToken);
@@ -1246,19 +1269,8 @@ export class AccountingModule {
       let anyScanDirty = false;
 
       for (const token of allTokens) {
-        if (!token.sdkData) continue;
-        let txf: TxfToken;
-        try {
-          txf = JSON.parse(token.sdkData) as TxfToken;
-        } catch {
-          continue;
-        }
-        // Only scan tokens that have transactions (payment/transfer tokens)
-        const txCount = txf.transactions?.length ?? 0;
-        if (txCount === 0) continue;
-        // Full scan from index 0 for retroactive discovery
-        this._processTokenTransactions(token.id, txf, 0);
-        anyScanDirty = true;
+        // Full scan from index 0 for retroactive discovery (v1 TXF or v2 blob).
+        if (await this._scanTokenForAttribution(token, 0)) anyScanDirty = true;
       }
 
       // Also scan archived tokens (spec §5.4 Phase 2 step 5)
@@ -1286,7 +1298,11 @@ export class AccountingModule {
       // ------------------------------------------------------------------
       // Step 15: Return result
       // ------------------------------------------------------------------
-      const txfToken: TxfToken = sdkTokenJson as unknown as TxfToken;
+      // v1: the TxfToken JSON (round-trips from sdkData). v2: the engine blob hex
+      // (the transmittable form; the v2 importInvoice path decodes it).
+      const txfToken: TxfToken = engine
+        ? (sdkData as unknown as TxfToken)
+        : (JSON.parse(sdkData) as TxfToken);
 
       return {
         success: true,
@@ -1334,6 +1350,35 @@ export class AccountingModule {
 
     const deps = this.deps!;
 
+    let terms: InvoiceTerms;
+    let tokenId: string | undefined;
+    let sdkDataForStore: string;
+    const engine = deps.tokenEngine;
+    const isV2 = !!engine && typeof (token as unknown) === 'string';
+
+    if (isV2) {
+      // v2: `token` is the engine blob (hex). The proof chain (engine.verify)
+      // binds the genesis data (= the invoice terms) to the on-chain commitment,
+      // replacing the v1 terms→tokenId re-hash + SDK proof check. The data token's
+      // type is established at mint (mintDataToken), so no separate type check.
+      const sphereToken = await engine!.decodeToken(decodeTokenBlob(hexToBytes(token as unknown as string)));
+      const verifyResult = await engine!.verify(sphereToken);
+      if (!verifyResult.ok) {
+        throw new SphereError('Invoice import failed: inclusion proof is invalid.', 'INVOICE_INVALID_PROOF');
+      }
+      tokenId = engine!.tokenId(sphereToken);
+      const data = engine!.readTokenData(sphereToken);
+      if (!data) {
+        throw new SphereError('Invoice import failed: missing or invalid tokenData field.', 'INVOICE_INVALID_DATA');
+      }
+      try {
+        terms = JSON.parse(new TextDecoder().decode(data)) as InvoiceTerms;
+      } catch {
+        throw new SphereError('Invoice import failed: tokenData is not valid JSON.', 'INVOICE_INVALID_DATA');
+      }
+      sdkDataForStore = token as unknown as string;
+    } else {
+
     // ------------------------------------------------------------------
     // Step 1: Validate token type
     // ------------------------------------------------------------------
@@ -1359,7 +1404,7 @@ export class AccountingModule {
     // tokenData may be plain JSON or hex-encoded UTF-8 JSON
     // (state-transition-sdk stores it as hex via HexConverter.encode).
     let jsonString = tokenData;
-    if (!/^\s*[\[{"]/.test(tokenData)) {
+    if (!/^\s*[[{"]/.test(tokenData)) {
       // Doesn't look like JSON — attempt hex decode
       try {
         const bytes = hexToBytes(tokenData);
@@ -1368,7 +1413,6 @@ export class AccountingModule {
         // not valid hex — fall through to JSON.parse which will produce the proper error
       }
     }
-    let terms: InvoiceTerms;
     try {
       terms = JSON.parse(jsonString) as InvoiceTerms;
     } catch {
@@ -1377,6 +1421,8 @@ export class AccountingModule {
         'INVOICE_INVALID_DATA',
       );
     }
+    sdkDataForStore = JSON.stringify(token);
+    } // end v1 (TXF) extraction branch
 
     // ------------------------------------------------------------------
     // Step 3: Business validation of InvoiceTerms (§8.2)
@@ -1504,7 +1550,7 @@ export class AccountingModule {
     // ------------------------------------------------------------------
     // Step 4: Check for duplicate (token already imported)
     // ------------------------------------------------------------------
-    const tokenId = token.genesis?.data?.tokenId;
+    if (!isV2) tokenId = token.genesis?.data?.tokenId;
     if (!tokenId || typeof tokenId !== 'string') {
       throw new SphereError(
         'Invoice import failed: missing tokenId in genesis data.',
@@ -1529,7 +1575,8 @@ export class AccountingModule {
     // [32-byte SHA-256] = 34 bytes → TokenId.toJSON() = 68-char hex.
     // crypto.subtle.digest produces only the 32-byte SHA-256 (64-char hex) which
     // does NOT match the 68-char tokenId stored on-chain.
-    {
+    // v2: skipped — the proof chain (engine.verify) already binds terms↔token.
+    if (!isV2) {
       const { DataHasher } = await import(
         '@unicitylabs/state-transition-sdk/lib/hash/DataHasher.js'
       );
@@ -1559,6 +1606,9 @@ export class AccountingModule {
     // verify() performs the cryptographic proof check.
     // ------------------------------------------------------------------
 
+    // v2 verified the proof via engine.verify above; the v1 SDK proof path below
+    // runs only for legacy TXF imports.
+    if (!isV2) {
     // C2/C6 fix: Reject imports when trustBase is empty — without a valid trust
     // base, verify() may silently accept forged proofs depending on SDK behavior.
     if (!deps.trustBase || (deps.trustBase instanceof Uint8Array && deps.trustBase.length === 0)) {
@@ -1602,6 +1652,7 @@ export class AccountingModule {
         'INVOICE_INVALID_PROOF',
       );
     }
+    } // end v1-only SDK proof verification
 
     // ------------------------------------------------------------------
     // Step 6: Store the token via PaymentsModule.addToken()
@@ -1620,7 +1671,7 @@ export class AccountingModule {
         status: 'confirmed',
         createdAt: terms.createdAt,
         updatedAt: terms.createdAt,
-        sdkData: JSON.stringify(token),
+        sdkData: sdkDataForStore,
       };
       await deps.payments.addToken(uiToken);
     } catch (err) {
@@ -1712,17 +1763,8 @@ export class AccountingModule {
     const allTokens = deps.payments.getTokens();
     let anyDirty = false;
     for (const existingToken of allTokens) {
-      if (!existingToken.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(existingToken.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const transactions = txf.transactions ?? [];
       const startIndex = this.tokenScanState.get(existingToken.id) ?? 0;
-      if (transactions.length > startIndex) {
-        this._processTokenTransactions(existingToken.id, txf, startIndex);
+      if (await this._scanTokenForAttribution(existingToken, startIndex)) {
         anyDirty = true;
       }
     }
@@ -4347,18 +4389,8 @@ export class AccountingModule {
     let anyDirty = false;
 
     for (const token of allTokens) {
-      if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-
-      const transactions = txf.transactions ?? [];
       const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if (transactions.length > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
+      if (await this._scanTokenForAttribution(token, startIndex)) {
         anyDirty = true;
       }
     }
@@ -4419,6 +4451,62 @@ export class AccountingModule {
    * @param txf        - Parsed TxfToken.
    * @param startIndex - First unprocessed transaction index.
    */
+  /**
+   * Attribute one payment token's invoice memo(s) to the ledger.
+   *
+   * v2 (engine blob): the token carries a single on-chain memo. We decode it and
+   * shim the token into a v1-shaped `txf` (coinData ← engine.readValue, the memo
+   * ← engine.readMemo) so the battle-hardened `_processTokenTransactions` runs
+   * UNCHANGED — same dedup, direction, provisional/synthetic/orphan handling.
+   * v1 (TXF JSON): parse and scan transactions directly.
+   *
+   * `startIndex` is the per-token watermark (0 for a full retroactive scan).
+   * Returns true when the token was scanned. Async because engine.decodeToken is.
+   */
+  private async _scanTokenForAttribution(token: Token, startIndex: number): Promise<boolean> {
+    if (!token.sdkData) return false;
+    const engine = this.deps?.tokenEngine;
+
+    // v2 engine blob: hex (CBOR), not the legacy TXF JSON ('{'-prefixed).
+    const isBlob =
+      token.sdkData.length >= 2 &&
+      token.sdkData.length % 2 === 0 &&
+      token.sdkData[0] !== '{' &&
+      /^[0-9a-f]+$/i.test(token.sdkData);
+
+    if (engine && isBlob) {
+      let syntheticTxf: TxfToken;
+      try {
+        const sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
+        const memo = engine.readMemo(sphereToken);
+        if (!memo) return false; // no memo ⇒ not an invoice-referencing payment
+        const coinData = (engine.readValue(sphereToken)?.assets ?? []).map(
+          (a) => [a.coinId, a.amount.toString()] as [string, string],
+        );
+        syntheticTxf = {
+          genesis: { data: { coinData } },
+          transactions: [{ data: { message: bytesToHex(memo) }, inclusionProof: {} }],
+        } as unknown as TxfToken;
+      } catch {
+        return false;
+      }
+      this._processTokenTransactions(token.id, syntheticTxf, startIndex);
+      return true;
+    }
+
+    let txf: TxfToken;
+    try {
+      txf = JSON.parse(token.sdkData) as TxfToken;
+    } catch {
+      return false;
+    }
+    if ((txf.transactions?.length ?? 0) > startIndex) {
+      this._processTokenTransactions(token.id, txf, startIndex);
+      return true;
+    }
+    return false;
+  }
+
   private _processTokenTransactions(
     tokenId: string,
     txf: TxfToken,
@@ -4839,17 +4927,7 @@ export class AccountingModule {
 
     // Advance token scan watermarks (stub advances counter only — full indexing deferred)
     for (const token of transfer.tokens) {
-      if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if ((txf.transactions?.length ?? 0) > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
-      }
+      await this._scanTokenForAttribution(token, this.tokenScanState.get(token.id) ?? 0);
     }
 
     // W5-R20 fix: Check destroyed before flush — event handler may still be mid-execution
@@ -5106,16 +5184,7 @@ export class AccountingModule {
     // Advance watermarks and invalidate balance caches for all related tokens
     for (const token of result.tokens) {
       if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if ((txf.transactions?.length ?? 0) > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
-      }
+      await this._scanTokenForAttribution(token, this.tokenScanState.get(token.id) ?? 0);
       const relatedInvoices = this.tokenInvoiceMap.get(token.id);
       if (relatedInvoices) {
         for (const invoiceId of relatedInvoices) {
@@ -5223,16 +5292,8 @@ export class AccountingModule {
     const token = tokens.find((t) => t.id === tokenId);
     if (!token?.sdkData) return;
 
-    let txf: TxfToken;
-    try {
-      txf = JSON.parse(token.sdkData) as TxfToken;
-    } catch {
-      return;
-    }
-
     const startIndex = this.tokenScanState.get(tokenId) ?? 0;
-    if ((txf.transactions?.length ?? 0) > startIndex) {
-      this._processTokenTransactions(tokenId, txf, startIndex);
+    if (await this._scanTokenForAttribution(token, startIndex)) {
       if (this.destroyed) return;
       await this._flushDirtyLedgerEntries();
     }
