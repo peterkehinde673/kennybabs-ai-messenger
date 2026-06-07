@@ -67,7 +67,9 @@ describe.runIf(!!API_KEY)('token-engine e2e — live testnet2 (networkId 4)', ()
     const engine = await makeEngine();
     const self = engine.getIdentity().chainPubkey;
     const data = new TextEncoder().encode(JSON.stringify({ inv: 'sphere-e2e' }));
-    const salt = new Uint8Array(32).fill(9);
+    // Unique salt per run: the salt → a stable tokenId, so a fixed salt would collide
+    // with a previous run's token on the persistent testnet (TRANSACTION_HASH_MISMATCH).
+    const salt = crypto.getRandomValues(new Uint8Array(32));
 
     const t = await engine.mintDataToken({ recipientPubkey: self, data, salt });
     expect(engine.readValue(t)).toBeNull();
