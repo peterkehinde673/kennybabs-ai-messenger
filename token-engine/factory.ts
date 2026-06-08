@@ -14,6 +14,7 @@
  */
 
 import { SphereError } from '../core/errors';
+import { logger } from '../core/logger';
 import {
   AggregatorClient,
   MintJustificationVerifierService,
@@ -30,6 +31,13 @@ import type { EngineConfig, ITokenEngine } from './engine';
 export async function createSphereTokenEngine(config: EngineConfig): Promise<ITokenEngine> {
   if (config.trustBaseJson == null) {
     throw new SphereError('Engine config requires a trust base (trustBaseJson)', 'INVALID_CONFIG');
+  }
+
+  if (!config.apiKey) {
+    logger.warn(
+      'TokenEngine',
+      'No aggregator apiKey — pass config.oracle.apiKey (testnet2 value in .env.example; mainnet from a secret env var). Gateway requests will be unauthenticated.',
+    );
   }
 
   const trustBase = RootTrustBase.fromJSON(config.trustBaseJson);
