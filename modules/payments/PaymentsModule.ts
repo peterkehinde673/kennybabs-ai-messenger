@@ -1312,22 +1312,7 @@ export class PaymentsModule {
           });
           await handToRecipient(outputs[0]);
 
-          const changeToken = outputs[1];
-          const changeBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(changeToken)));
-          const changeInfo = await parseTokenInfo(changeBlob, engine);
-          const registry = TokenRegistry.getInstance();
-          await this.addToken({
-            id: `v2_${engine.tokenId(changeToken)}`,
-            coinId: changeInfo.coinId,
-            symbol: registry.getSymbol(changeInfo.coinId) || changeInfo.symbol,
-            name: registry.getName(changeInfo.coinId) || changeInfo.name,
-            decimals: registry.getDecimals(changeInfo.coinId) ?? changeInfo.decimals,
-            amount: changeInfo.amount,
-            status: 'confirmed',
-            createdAt: Date.now(),
-            updatedAt: Date.now(),
-            sdkData: changeBlob,
-          });
+          await this.storeEngineToken(engine, outputs[1]); // change token, confirmed
 
           result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
@@ -4567,32 +4552,10 @@ export class PaymentsModule {
 
 
   /**
-   * Mint a fungible token directly to this wallet (genesis mint).
-   *
-   * Useful for test setups that need to seed a wallet with specific token
-   * balances WITHOUT depending on the testnet faucet HTTP service. The
-   * resulting token has the canonical CoinId bytes (passed in `coinIdHex`)
-   * — when those bytes match a registered symbol in the TokenRegistry,
-   * the token shows up under the symbol's name (e.g. "UCT"). There is no
-   * cryptographic restriction on which key may issue a given CoinId; the
-   * aggregator records the mint regardless of issuer identity.
-   *
-   * The flow:
-   *   1. Generate a random TokenId.
-   *   2. Build TokenCoinData with [(coinId, amount)].
-   *   3. Build MintTransactionData with recipient = self (UnmaskedPredicate
-   *      from this wallet's signing service).
-   *   4. Submit MintCommitment to the aggregator.
-   *   5. Wait for the inclusion proof.
-   *   6. Construct an SDK Token via Token.mint().
-   *   7. Convert to wallet Token format and call addToken().
-   *
-   * @param coinIdHex - 64-char lowercase hex CoinId. Must match the bytes
-   *   used by the registered symbol if you want the wallet to recognize
-   *   the token as that symbol (e.g. UCT's coinId from the public registry).
-   * @param amount - Amount in smallest units (multiply by 10^decimals
-   *   when converting from human values).
-   * @returns Result with the resulting wallet Token and its on-chain id.
+   * Self-mint fungible tokens to this wallet (no faucet). When a v2 token engine
+   * is present, mints via the engine (engine.mint, no commitment round-trip);
+   * otherwise falls back to the legacy v1 mint flow. Returns the stored token and
+   * its genesis-stable id, or an error result.
    */
   async mintFungibleToken(
     coinIdHex: string,
@@ -4600,6 +4563,14 @@ export class PaymentsModule {
   ): Promise<{ success: true; token: Token; tokenId: string } | { success: false; error: string }> {
     this.ensureInitialized();
 
+    // v2 engine present -> self-mint via the engine (no faucet, no v1 round-trip).
+    // Same if/else shape as send(): engine path when present, else v1 fallback.
+    const engine = this.deps?.tokenEngine;
+    if (engine) {
+      return this.mintFungibleTokenV2(engine, coinIdHex, amount);
+    }
+
+    // V1-FALLBACK (removable on v2 cutover): the whole body below goes when v1 is cut.
     const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
     if (!stClient) {
       return { success: false, error: 'State transition client not available' };
@@ -4717,6 +4688,64 @@ export class PaymentsModule {
     }
   }
 
+  /**
+   * Persist a realized v2 engine token as a confirmed wallet Token and return it.
+   * Single source of truth for "engine SphereToken -> stored UI Token": serialize
+   * with the wallet blob codec, derive coin/amount via parseTokenInfo, apply
+   * registry overrides, key it v2_<genesis-stable tokenId>, and addToken. Reused
+   * by self-mint, the send change-token path, and the v2 receive path.
+   */
+  private async storeEngineToken(engine: ITokenEngine, token: SphereToken): Promise<Token> {
+    // Re-encode from the decoded blob; byte-identical to the wire blob (canonical CBOR).
+    const sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(token)));
+    const info = await parseTokenInfo(sdkData, engine);
+    const registry = TokenRegistry.getInstance();
+    const uiToken: Token = {
+      id: `v2_${engine.tokenId(token)}`,
+      coinId: info.coinId,
+      symbol: registry.getSymbol(info.coinId) || info.symbol,
+      name: registry.getName(info.coinId) || info.name,
+      decimals: registry.getDecimals(info.coinId) ?? info.decimals,
+      amount: info.amount,
+      status: 'confirmed',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    await this.addToken(uiToken);
+    return uiToken;
+  }
+
+  /**
+   * v2 engine self-mint (no faucet): build a FINISHED token via engine.mint and
+   * store it (storeEngineToken) as a confirmed wallet token — no commitment /
+   * inclusion-proof / finalization round-trip. Lets a fresh wallet be topped up
+   * on networks where the v1 mint path is unavailable (e.g. testnet2).
+   */
+  private async mintFungibleTokenV2(
+    engine: ITokenEngine,
+    coinIdHex: string,
+    amount: bigint,
+  ): Promise<{ success: true; token: Token; tokenId: string } | { success: false; error: string }> {
+    if (amount <= 0n) {
+      return { success: false, error: 'Mint amount must be greater than zero' };
+    }
+    if (!/^([0-9a-f]{2})+$/.test(coinIdHex)) {
+      return { success: false, error: `Invalid coin id (expected even-length lowercase hex): ${coinIdHex}` };
+    }
+
+    try {
+      const minted = await engine.mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: coinIdHex, amount }] },
+      });
+      const uiToken = await this.storeEngineToken(engine, minted);
+      return { success: true, token: uiToken, tokenId: engine.tokenId(minted) };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { success: false, error: `V2 mint failed: ${msg}` };
+    }
+  }
 
   // ===========================================================================
   // Public API - Sync & Validate
@@ -5469,22 +5498,7 @@ export class PaymentsModule {
       return;
     }
 
-    const info = await parseTokenInfo(payload.tokenBlob, engine);
-    const registry = TokenRegistry.getInstance();
-    const uiToken: Token = {
-      id,
-      coinId: info.coinId,
-      symbol: registry.getSymbol(info.coinId) || info.symbol,
-      name: registry.getName(info.coinId) || info.name,
-      decimals: registry.getDecimals(info.coinId) ?? info.decimals,
-      amount: info.amount,
-      status: 'confirmed',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      sdkData: payload.tokenBlob,
-    };
-
-    await this.addToken(uiToken);
+    const uiToken = await this.storeEngineToken(engine, token);
     const senderInfo = await this.resolveSenderInfo(senderPubkey);
 
     this.deps!.emitEvent('transfer:incoming', {
@@ -5498,8 +5512,8 @@ export class PaymentsModule {
 
     await this.addToHistory({
       type: 'RECEIVED',
-      amount: info.amount,
-      coinId: info.coinId,
+      amount: uiToken.amount,
+      coinId: uiToken.coinId,
       symbol: uiToken.symbol,
       timestamp: Date.now(),
       senderPubkey,
