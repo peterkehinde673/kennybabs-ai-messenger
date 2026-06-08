@@ -152,6 +152,14 @@ describe('mintFungibleToken — v2 engine self-mint (top-up)', () => {
     expect(res.success).toBe(false);
     expect(module.getTokens()).toHaveLength(0);
   });
+
+  it('rejects an odd-length hex coin id without minting', async () => {
+    const { module } = setup();
+    const res = await module.mintFungibleToken('abc', 100n);
+
+    expect(res.success).toBe(false);
+    expect(module.getTokens()).toHaveLength(0);
+  });
 });
 
 describe('mintFungibleToken — v1 fallback when no engine', () => {
