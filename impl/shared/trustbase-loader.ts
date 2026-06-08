@@ -3,7 +3,7 @@
  * Common embedded trustbase data and base loader
  */
 
-import { TRUSTBASE_TESTNET, TRUSTBASE_MAINNET, TRUSTBASE_DEV } from '../../assets/trustbase';
+import { TRUSTBASE_TESTNET, TRUSTBASE_TESTNET2, TRUSTBASE_MAINNET, TRUSTBASE_DEV } from '../../assets/trustbase';
 import type { NetworkType } from '../../constants';
 
 export interface TrustBaseLoader {
@@ -19,6 +19,8 @@ export function getEmbeddedTrustBase(network: NetworkType): unknown | null {
       return TRUSTBASE_MAINNET;
     case 'testnet':
       return TRUSTBASE_TESTNET;
+    case 'testnet2':
+      return TRUSTBASE_TESTNET2;
     case 'dev':
       return TRUSTBASE_DEV;
     default:
