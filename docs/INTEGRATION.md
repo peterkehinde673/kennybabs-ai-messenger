@@ -50,6 +50,34 @@ const providers = createNodeProviders({
 });
 ```
 
+### Aggregator API key
+
+The SDK does **not** ship a default aggregator API key. Pass it explicitly via
+`oracle.apiKey` when creating providers:
+
+```typescript
+createBrowserProviders({
+  network: 'testnet',
+  oracle: {
+    url: 'https://gateway.testnet2.unicity.network',
+    apiKey: import.meta.env.VITE_AGGREGATOR_API_KEY, // browser: build-time env
+    // trustBaseUrl: '<testnet2 trustbase url>',
+  },
+});
+```
+
+The SDK itself reads no environment variables (it runs in browsers too) — your app injects the
+key from its own environment (`import.meta.env.*` in Vite apps, `process.env.*` in node/bots).
+
+- **testnet / testnet2 keys are NOT secret** — safe to commit in `.env.example` and show in docs.
+- **mainnet keys ARE secret** — keep them only in your deploy environment, never committed. Note
+  that a browser app bundles `VITE_*` vars into shipped JS, so a key delivered that way is visible
+  to clients; for a truly secret mainnet key, proxy aggregator calls through a backend (the browser
+  then passes `oracle.url = <proxy>` and no key) or use per-user gateway auth.
+
+If no `apiKey` is provided, the v2 token engine still constructs, but its gateway requests are
+unauthenticated and the SDK logs a `TokenEngine` warning.
+
 ### Initialize Wallet
 
 ```typescript
