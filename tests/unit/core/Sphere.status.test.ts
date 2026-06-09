@@ -171,6 +171,7 @@ describe('Sphere Status & Provider Management', () => {
       transport: transport as unknown as TransportProvider,
       oracle: oracle as unknown as OracleProvider,
       tokenStorage,
+      network: 'testnet2',
       autoGenerate: true,
     };
     if (options?.l1) {

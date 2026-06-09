@@ -10,13 +10,14 @@
  *
  * const storage = createLocalStorageProvider();
  * const transport = createNostrTransportProvider();
- * const oracle = createUnicityAggregatorProvider({ url: '/rpc' });
+ * const oracle = createUnicityAggregatorProvider({ url: '/rpc', network: 'testnet2' });
  *
  * // Option 1: Unified init (recommended)
  * const { sphere, created, generatedMnemonic } = await Sphere.init({
  *   storage,
  *   transport,
  *   oracle,
+ *   network: 'testnet2', // required: selects registry/trustbase/aggregator
  *   mnemonic: 'your twelve words...', // optional - will load if wallet exists
  *   autoGenerate: true, // generate new mnemonic if needed
  * });
@@ -27,9 +28,9 @@
  *
  * // Option 2: Manual create/load
  * if (await Sphere.exists(storage)) {
- *   const sphere = await Sphere.load({ storage, transport, oracle });
+ *   const sphere = await Sphere.load({ storage, transport, oracle, network: 'testnet2' });
  * } else {
- *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle });
+ *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle, network: 'testnet2' });
  * }
  *
  * // Use the wallet
@@ -721,14 +722,16 @@ export class Sphere {
     network?: NetworkType,
   ): GroupChatModuleConfig | undefined {
     if (!config) return undefined;
+    // Fail loud: relays differ per network — never silently default to mainnet.
+    if (!network) {
+      throw new SphereError('network is required to resolve group chat relays.', 'INVALID_CONFIG');
+    }
     if (config === true) {
-      const netConfig = network ? NETWORKS[network] : NETWORKS.mainnet;
-      return { relays: [...netConfig.groupRelays] };
+      return { relays: [...NETWORKS[network].groupRelays] };
     }
     // If relays not specified, fill from network defaults
     if (!config.relays || config.relays.length === 0) {
-      const netConfig = network ? NETWORKS[network] : NETWORKS.mainnet;
-      return { ...config, relays: [...netConfig.groupRelays] };
+      return { ...config, relays: [...NETWORKS[network].groupRelays] };
     }
     return config;
   }
@@ -785,17 +788,15 @@ export class Sphere {
    * This method ensures the main bundle's TokenRegistry is properly configured.
    */
   private static configureTokenRegistry(storage: StorageProvider, network?: NetworkType): void {
+    // Fail loud: a dropped/missing network would silently load the wrong-network
+    // registry (testnet vs mainnet). Every Sphere entry point must forward options.network.
     if (!network) {
-      // Don't fail hard (many callers/tests omit network), but make it LOUD: a dropped
-      // network silently loads testnet (V1) — wrong registry on any non-testnet network
-      // (esp. mainnet). Every Sphere entry point should forward options.network.
-      logger.warn(
-        'Sphere',
-        'configureTokenRegistry: no network provided — defaulting to testnet. Pass options.network to avoid loading the wrong-network registry.',
+      throw new SphereError(
+        'network is required to configure the TokenRegistry. Every Sphere entry point must forward options.network.',
+        'INVALID_CONFIG',
       );
     }
-    const netConfig = network ? NETWORKS[network] : NETWORKS.testnet;
-    TokenRegistry.configure({ remoteUrl: netConfig.tokenRegistryUrl, storage });
+    TokenRegistry.configure({ remoteUrl: NETWORKS[network].tokenRegistryUrl, storage });
   }
 
   /**

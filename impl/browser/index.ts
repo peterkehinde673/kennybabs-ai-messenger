@@ -28,6 +28,7 @@ export type {
 // =============================================================================
 
 import { logger as sdkLogger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
@@ -362,7 +363,11 @@ function resolveTokenSyncConfig(
  * ```
  */
 export function createBrowserProviders(config?: BrowserProvidersConfig): BrowserProviders {
-  const network = config?.network ?? 'mainnet';
+  // Fail loud: a missing network would silently load the wrong-network providers.
+  if (!config?.network) {
+    throw new SphereError('createBrowserProviders: config.network is required.', 'INVALID_CONFIG');
+  }
+  const network = config.network;
 
   // Configure global logger: top-level debug enables all, per-provider overrides are additive.
   // Only override global debug flag when explicitly provided — don't reset a previously-configured value.
