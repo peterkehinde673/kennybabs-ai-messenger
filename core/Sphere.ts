@@ -275,6 +275,10 @@ export interface SphereImportOptions {
   derivationMode?: DerivationMode;
   /** Optional nametag to register for this wallet (e.g., 'alice' for @alice). Token is auto-minted. */
   nametag?: string;
+  /** Network this wallet runs on — drives TokenRegistry config. Without it, import
+   *  falls back to NETWORKS.testnet and a non-testnet wallet loads the wrong registry
+   *  (symbols resolve via baked values but icons/metadata don't) until a reload. */
+  network?: NetworkType;
   /** Storage provider instance */
   storage: StorageProvider;
   /** Optional token storage provider */
@@ -636,6 +640,7 @@ export class Sphere {
     if (walletExists) {
       // Load existing wallet
       const sphere = await Sphere.load({
+        network: options.network, // forward network so load's configureTokenRegistry uses it (not the testnet default)
         storage: options.storage,
         transport: options.transport,
         oracle: options.oracle,
@@ -676,6 +681,7 @@ export class Sphere {
 
     const sphere = await Sphere.create({
       mnemonic,
+      network: options.network, // forward network so create's configureTokenRegistry uses it (not the testnet default)
       storage: options.storage,
       transport: options.transport,
       oracle: options.oracle,
@@ -779,6 +785,15 @@ export class Sphere {
    * This method ensures the main bundle's TokenRegistry is properly configured.
    */
   private static configureTokenRegistry(storage: StorageProvider, network?: NetworkType): void {
+    if (!network) {
+      // Don't fail hard (many callers/tests omit network), but make it LOUD: a dropped
+      // network silently loads testnet (V1) — wrong registry on any non-testnet network
+      // (esp. mainnet). Every Sphere entry point should forward options.network.
+      logger.warn(
+        'Sphere',
+        'configureTokenRegistry: no network provided — defaulting to testnet. Pass options.network to avoid loading the wrong-network registry.',
+      );
+    }
     const netConfig = network ? NETWORKS[network] : NETWORKS.testnet;
     TokenRegistry.configure({ remoteUrl: netConfig.tokenRegistryUrl, storage });
   }
@@ -1005,7 +1020,13 @@ export class Sphere {
       logger.debug('Sphere', 'Storage reconnected');
     }
 
-    const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat);
+    // Configure TokenRegistry for THIS network in the main bundle context.
+    // import() previously omitted this (unlike init/create/load), leaving the
+    // registry on a stale/default network — so imported wallets resolved tokens
+    // against the wrong-network registry (no icons) until a reload.
+    Sphere.configureTokenRegistry(options.storage, options.network);
+
+    const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
     const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
     const swapConfig = Sphere.resolveSwapConfig(options.swap);
