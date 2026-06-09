@@ -20,6 +20,7 @@ import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenSto
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
 import { vi } from 'vitest';
+import { TEST_NETWORK } from '../test-network';
 
 // =============================================================================
 // Test directories
@@ -139,6 +140,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -165,6 +167,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -186,6 +189,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -232,6 +236,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -276,6 +281,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -296,6 +302,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -329,6 +336,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -359,6 +367,7 @@ describe('Tracked addresses integration', () => {
         storage: storage2,
         transport: transport2,
         oracle: oracle2,
+        network: TEST_NETWORK,
         tokenStorage: tokenStorage2,
       });
 
@@ -411,6 +420,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -449,6 +459,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -492,6 +503,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -529,6 +541,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -553,6 +566,7 @@ describe('Tracked addresses integration', () => {
         storage: storage2,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: TEST_NETWORK,
         tokenStorage: tokenStorage2,
         autoGenerate: true,
       });
@@ -580,6 +594,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -620,6 +635,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -651,6 +667,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -688,6 +705,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
