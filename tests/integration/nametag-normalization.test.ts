@@ -131,6 +131,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage,
       autoGenerate: true,
     });
@@ -151,6 +152,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage,
       autoGenerate: true,
       nametag: 'BOB',
@@ -169,6 +171,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage,
       autoGenerate: true,
     });
@@ -188,6 +191,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage,
       autoGenerate: true,
     });
@@ -205,6 +209,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage,
       autoGenerate: true,
     });
@@ -222,6 +227,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage,
       autoGenerate: true,
     });
@@ -241,6 +247,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage,
       autoGenerate: true,
     });

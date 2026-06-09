@@ -155,6 +155,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -182,6 +183,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -207,6 +209,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -234,6 +237,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -257,6 +261,7 @@ describe('Provider disable/enable integration', () => {
       storage: new FileStorageProvider({ dataDir: DATA_DIR }),
       transport: transport2,
       oracle: oracle2,
+      network: 'testnet2',
       tokenStorage: freshReal,
       mnemonic: mnemonic!,
     });
@@ -281,6 +286,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -312,6 +318,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: 'testnet2',
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });

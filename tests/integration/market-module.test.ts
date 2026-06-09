@@ -119,6 +119,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
         autoGenerate: true,
       });
@@ -135,6 +136,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         autoGenerate: true,
       });
 
@@ -150,6 +152,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: false,
         autoGenerate: true,
       });
@@ -165,6 +168,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: { apiUrl: 'https://custom-market.api' },
         autoGenerate: true,
       });
@@ -191,6 +195,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: { timeout: 5000 },
         autoGenerate: true,
       });
@@ -206,6 +211,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: {
           apiUrl: 'https://market.custom',
           timeout: 10000,
@@ -231,6 +237,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         autoGenerate: true,
       });
       await initial.destroy();
@@ -241,6 +248,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
       });
 
@@ -256,6 +264,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         autoGenerate: true,
       });
       await initial.destroy();
@@ -266,6 +275,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
       });
 
       expect(sphere.market).toBeNull();
@@ -280,6 +290,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         autoGenerate: true,
       });
       await initial.destroy();
@@ -290,6 +301,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: { apiUrl: 'https://market.load.test' },
       });
 
@@ -314,6 +326,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
       });
 
@@ -332,6 +345,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: { apiUrl: 'https://custom-import.api', timeout: 20000 },
       });
 
@@ -352,6 +366,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         autoGenerate: true,
       });
 
@@ -370,6 +385,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         autoGenerate: true,
       });
 
@@ -394,6 +410,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
         autoGenerate: true,
       });
@@ -417,6 +434,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
         autoGenerate: true,
       });
@@ -450,6 +468,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
         autoGenerate: true,
       });
@@ -504,6 +523,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
         autoGenerate: true,
       });
@@ -527,6 +547,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
         autoGenerate: true,
       });
@@ -544,6 +565,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
         autoGenerate: true,
       });
@@ -555,6 +577,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
       });
 
@@ -684,6 +707,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: { apiUrl: 'https://test.market' },
         autoGenerate: true,
       });
@@ -772,6 +796,7 @@ describe('MarketModule integration with Sphere', () => {
           tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
           transport: createMockTransport(),
           oracle: createMockOracle(),
+          network: 'testnet2',
           market: true,
           autoGenerate: true,
         });
@@ -819,6 +844,7 @@ describe('MarketModule integration with Sphere', () => {
           tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
           transport: createMockTransport(),
           oracle: createMockOracle(),
+          network: 'testnet2',
           market: true,
           autoGenerate: true,
         });
@@ -876,6 +902,7 @@ describe('MarketModule integration with Sphere', () => {
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         market: true,
         autoGenerate: true,
       });

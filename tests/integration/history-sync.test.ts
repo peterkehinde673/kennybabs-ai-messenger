@@ -187,6 +187,7 @@ describe('History sync integration (multi-device)', () => {
       storage: storageA,
       transport: createMockTransport(),
       oracle: createMockOracle(),
+      network: 'testnet2',
       tokenStorage: tokenStorageA,
       autoGenerate: true,
     });
@@ -235,6 +236,7 @@ describe('History sync integration (multi-device)', () => {
       storage: storageB,
       transport: createMockTransport(),
       oracle: createMockOracle(),
+      network: 'testnet2',
       tokenStorage: tokenStorageB,
       mnemonic: generatedMnemonic!,
     });
@@ -275,6 +277,7 @@ describe('History sync integration (multi-device)', () => {
       storage: storageA,
       transport: createMockTransport(),
       oracle: createMockOracle(),
+      network: 'testnet2',
       tokenStorage: tokenStorageA,
       autoGenerate: true,
     });
@@ -312,6 +315,7 @@ describe('History sync integration (multi-device)', () => {
       storage: storageB,
       transport: createMockTransport(),
       oracle: createMockOracle(),
+      network: 'testnet2',
       tokenStorage: tokenStorageB,
       mnemonic: generatedMnemonic!,
     });

@@ -119,6 +119,7 @@ async function createAndDestroy(options: {
     tokenStorage,
     transport: createMockTransport(),
     oracle: createMockOracle(),
+    network: 'testnet2',
     mnemonic: TEST_MNEMONIC,
     password: options.password,
   });
@@ -160,6 +161,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
       });
 
       expect(sphere.getMnemonic()).toBe(TEST_MNEMONIC);
@@ -189,6 +191,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         password: TEST_PASSWORD,
       });
 
@@ -208,6 +211,7 @@ describe('Wallet password encryption', () => {
           tokenStorage,
           transport: createMockTransport(),
           oracle: createMockOracle(),
+        network: 'testnet2',
           password: 'wrong-password',
         })
       ).rejects.toThrow('Failed to decrypt mnemonic');
@@ -226,6 +230,7 @@ describe('Wallet password encryption', () => {
           tokenStorage,
           transport: createMockTransport(),
           oracle: createMockOracle(),
+        network: 'testnet2',
         })
       ).rejects.toThrow('Failed to decrypt mnemonic');
     });
@@ -249,6 +254,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         // No password — should fall back to DEFAULT_ENCRYPTION_KEY
       });
 
@@ -272,6 +278,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
       });
 
       expect(sphere.getMnemonic()).toBe(TEST_MNEMONIC);
@@ -299,6 +306,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
       });
 
       expect(sphere.getMnemonic()).toBe(TEST_MNEMONIC);
@@ -318,6 +326,7 @@ describe('Wallet password encryption', () => {
         ...providers,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         mnemonic: TEST_MNEMONIC,
       });
 
@@ -349,6 +358,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         password: TEST_PASSWORD,
       });
 
@@ -371,6 +381,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
       });
 
       expect(sphere.getMnemonic()).toBe(TEST_MNEMONIC);
@@ -391,6 +402,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         password: TEST_PASSWORD,
       });
 
@@ -423,6 +435,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: 'testnet2',
         password: TEST_PASSWORD,
       });
 
