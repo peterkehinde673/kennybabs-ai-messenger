@@ -952,13 +952,15 @@ describe('StorageProvider Cache', () => {
 
     await registry.refreshFromRemote();
 
-    // Should have called storage.set for cache and timestamp
+    // Should have called storage.set for cache and timestamp.
+    // Cache keys are namespaced by remoteUrl (per-network isolation).
+    const u = 'https://example.com/registry.json';
     expect(storage.set).toHaveBeenCalledWith(
-      STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE,
+      `${STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE}:${u}`,
       expect.any(String),
     );
     expect(storage.set).toHaveBeenCalledWith(
-      STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS,
+      `${STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS}:${u}`,
       expect.any(String),
     );
   });
