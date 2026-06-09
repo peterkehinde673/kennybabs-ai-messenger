@@ -100,6 +100,7 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
       transport,
       oracle,
       tokenStorage,
+      network: 'testnet2',
       autoGenerate: true,
     });
 
@@ -133,6 +134,7 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
       transport,
       oracle,
       tokenStorage,
+      network: 'testnet2',
       autoGenerate: true,
     });
 

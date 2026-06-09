@@ -25,6 +25,7 @@ export type {
 // =============================================================================
 
 import { logger as sdkLogger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import { createFileStorageProvider, createFileTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
@@ -200,7 +201,11 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     }
   }
 
-  const network = config?.network ?? 'mainnet';
+  // Fail loud: a missing network would silently load the wrong-network providers.
+  if (!config?.network) {
+    throw new SphereError('createNodeProviders: config.network is required.', 'INVALID_CONFIG');
+  }
+  const network = config.network;
 
   // Configure global logger: top-level debug enables all, per-provider overrides are additive
   const globalDebug = config?.debug ?? false;
