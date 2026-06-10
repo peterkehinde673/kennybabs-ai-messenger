@@ -108,21 +108,21 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 1. The two networks point at DIFFERENT registry URLs
+  // 1. Since the v1 cutover, 'testnet' is an ALIAS of testnet2: both point at
+  //    the testnet2 registry (the v1 testnet registry is retired).
   // ---------------------------------------------------------------------------
-  it('testnet2 and testnet use DIFFERENT tokenRegistryUrl (constants.ts)', () => {
-    expect(NETWORKS.testnet2.tokenRegistryUrl).not.toBe(NETWORKS.testnet.tokenRegistryUrl);
-    // sanity: each URL names its own network file
-    expect(NETWORKS.testnet.tokenRegistryUrl).toContain('unicity-ids.testnet.json');
+  it('testnet is an alias of testnet2 — same tokenRegistryUrl, naming testnet2 (constants.ts)', () => {
+    expect(NETWORKS.testnet.tokenRegistryUrl).toBe(NETWORKS.testnet2.tokenRegistryUrl);
     expect(NETWORKS.testnet2.tokenRegistryUrl).toContain('unicity-ids.testnet2.json');
   });
 
   // ---------------------------------------------------------------------------
-  // 2. configureTokenRegistry mapping: network -> NETWORKS[network].url,
-  //    and UNDEFINED network falls back to NETWORKS.testnet (the bug).
-  //    Replicated exactly from core/Sphere.ts:786.
+  // 2. configureTokenRegistry mapping: network -> NETWORKS[network].url.
+  //    The historical "undefined falls back to NETWORKS.testnet" bug is now
+  //    benign: testnet aliases testnet2, so the fallback loads the testnet2
+  //    registry. Replicated exactly from core/Sphere.ts.
   // ---------------------------------------------------------------------------
-  it('maps network -> NETWORKS[network].tokenRegistryUrl, undefined falls back to testnet (the bug)', () => {
+  it('maps network -> NETWORKS[network].tokenRegistryUrl; undefined fallback now lands on the testnet2 registry', () => {
     // EXACT logic from Sphere.configureTokenRegistry:
     //   const netConfig = network ? NETWORKS[network] : NETWORKS.testnet;
     const resolveUrl = (network?: keyof typeof NETWORKS): string => {
@@ -132,12 +132,11 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
 
     // Correct mappings
     expect(resolveUrl('testnet2')).toBe(NETWORKS.testnet2.tokenRegistryUrl);
-    expect(resolveUrl('testnet')).toBe(NETWORKS.testnet.tokenRegistryUrl);
+    expect(resolveUrl('testnet')).toBe(NETWORKS.testnet2.tokenRegistryUrl);
     expect(resolveUrl('mainnet')).toBe(NETWORKS.mainnet.tokenRegistryUrl);
 
-    // THE BUG: undefined network resolves to the testnet registry, NOT testnet2.
-    expect(resolveUrl(undefined)).toBe(NETWORKS.testnet.tokenRegistryUrl);
-    expect(resolveUrl(undefined)).not.toBe(NETWORKS.testnet2.tokenRegistryUrl);
+    // The undefined fallback resolves to the (aliased) testnet2 registry.
+    expect(resolveUrl(undefined)).toBe(NETWORKS.testnet2.tokenRegistryUrl);
   });
 
   // ---------------------------------------------------------------------------
@@ -177,11 +176,13 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 5. OPTIONAL network cross-check: fetch BOTH real registry JSONs and prove
-  //    they define DIFFERENT coinIds for the same symbol. Skips (does not
-  //    fail) if the network is unavailable, so the suite stays deterministic.
+  // 5. OPTIONAL network cross-check: fetch the LEGACY v1 registry (still used
+  //    by dev/mainnet) and the testnet2 registry, and prove they define
+  //    DIFFERENT coinIds for the same symbol — the premise behind the
+  //    wrong-registry → missing-icon mechanism. Skips (does not fail) if the
+  //    network is unavailable, so the suite stays deterministic.
   // ---------------------------------------------------------------------------
-  it('[network] real testnet vs testnet2 JSON define different coinIds for the same symbol', async () => {
+  it('[network] legacy (dev) vs testnet2 registry JSON define different coinIds for the same symbol', async () => {
     const fetchJson = async (url: string): Promise<TokenDefinition[] | null> => {
       try {
         const controller = new AbortController();
@@ -195,12 +196,12 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
       }
     };
 
-    const [testnet, testnet2] = await Promise.all([
-      fetchJson(NETWORKS.testnet.tokenRegistryUrl),
+    const [legacy, testnet2] = await Promise.all([
+      fetchJson(NETWORKS.dev.tokenRegistryUrl), // dev still points at the v1 testnet registry
       fetchJson(NETWORKS.testnet2.tokenRegistryUrl),
     ]);
 
-    if (!testnet || !testnet2) {
+    if (!legacy || !testnet2) {
       console.warn('[network] registry fetch unavailable — skipping real-JSON cross-check');
       return; // graceful skip, keeps the deterministic core green
     }
@@ -210,15 +211,15 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
 
     // Find at least one symbol present in BOTH with a DIFFERENT id.
     const symbols = new Set<string>();
-    for (const d of [...testnet, ...testnet2]) if (d.symbol) symbols.add(d.symbol.toUpperCase());
+    for (const d of [...legacy, ...testnet2]) if (d.symbol) symbols.add(d.symbol.toUpperCase());
 
     let foundDivergentSymbol = false;
     for (const sym of symbols) {
-      const a = idForSymbol(testnet, sym);
+      const a = idForSymbol(legacy, sym);
       const b = idForSymbol(testnet2, sym);
       if (a && b && a !== b) {
         foundDivergentSymbol = true;
-        console.info(`[network] symbol ${sym}: testnet=${a} testnet2=${b} (different)`);
+        console.info(`[network] symbol ${sym}: legacy=${a} testnet2=${b} (different)`);
         break;
       }
     }

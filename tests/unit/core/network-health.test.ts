@@ -110,8 +110,8 @@ describe('checkNetworkHealth', () => {
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       const calledUrl = fetchSpy.mock.calls[0][0] as string;
-      // Testnet aggregator is goggregator-test.unicity.network
-      expect(calledUrl).toContain('goggregator-test');
+      // v1 cutover: 'testnet' is an alias of testnet2 (v2 gateway)
+      expect(calledUrl).toContain('gateway.testnet2');
     });
 
     it('should use mainnet URLs when specified', async () => {

@@ -95,7 +95,10 @@ describe('Sphere.init network → TokenRegistry delegation (regression guard)', 
     const registryFetches = fetched.filter((u) => u.includes('unicity-ids'));
     expect(registryFetches.length).toBeGreaterThan(0);
     expect(registryFetches).toContain(NETWORKS.testnet2.tokenRegistryUrl);
-    expect(registryFetches).not.toContain(NETWORKS.testnet.tokenRegistryUrl);
+    // The legacy v1 registry (still pointed at by dev/mainnet) must never be fetched.
+    // (Since the v1 cutover NETWORKS.testnet aliases testnet2, so the legacy URL
+    // lives on NETWORKS.dev.)
+    expect(registryFetches).not.toContain(NETWORKS.dev.tokenRegistryUrl);
   });
 
   it('Test B: existing wallet (load path) fetches testnet2 registry, not testnet', async () => {
@@ -119,6 +122,9 @@ describe('Sphere.init network → TokenRegistry delegation (regression guard)', 
     const registryFetches = fetched.filter((u) => u.includes('unicity-ids'));
     expect(registryFetches.length).toBeGreaterThan(0);
     expect(registryFetches).toContain(NETWORKS.testnet2.tokenRegistryUrl);
-    expect(registryFetches).not.toContain(NETWORKS.testnet.tokenRegistryUrl);
+    // The legacy v1 registry (still pointed at by dev/mainnet) must never be fetched.
+    // (Since the v1 cutover NETWORKS.testnet aliases testnet2, so the legacy URL
+    // lives on NETWORKS.dev.)
+    expect(registryFetches).not.toContain(NETWORKS.dev.tokenRegistryUrl);
   });
 });
