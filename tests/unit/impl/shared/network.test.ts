@@ -19,8 +19,8 @@ describe('resolveNetworkConfig', () => {
     expect(r.networkId).toBe(4);
   });
 
-  it('resolves networkId 3 for testnet', () => {
-    expect(resolveNetworkConfig('testnet').networkId).toBe(3);
+  it('resolves networkId 4 for testnet (alias of testnet2 since the v1 cutover)', () => {
+    expect(resolveNetworkConfig('testnet').networkId).toBe(4);
   });
 });
 

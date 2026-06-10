@@ -3,7 +3,7 @@
  * Common embedded trustbase data and base loader
  */
 
-import { TRUSTBASE_TESTNET, TRUSTBASE_TESTNET2, TRUSTBASE_MAINNET, TRUSTBASE_DEV } from '../../assets/trustbase';
+import { TRUSTBASE_TESTNET2, TRUSTBASE_MAINNET, TRUSTBASE_DEV } from '../../assets/trustbase';
 import type { NetworkType } from '../../constants';
 import { SphereError } from '../../core/errors';
 
@@ -18,8 +18,10 @@ export function getEmbeddedTrustBase(network: NetworkType): unknown | null {
   switch (network) {
     case 'mainnet':
       return TRUSTBASE_MAINNET;
+    // v1 cutover: 'testnet' is now an alias of testnet2 (NETWORKS.testnet points
+    // at the testnet2 gateway), so it MUST resolve the testnet2 trust base —
+    // a mismatched trust base would make the engine reject every proof.
     case 'testnet':
-      return TRUSTBASE_TESTNET;
     case 'testnet2':
       return TRUSTBASE_TESTNET2;
     case 'dev':

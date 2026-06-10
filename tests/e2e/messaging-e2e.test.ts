@@ -16,10 +16,18 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { Sphere } from '../../core/Sphere';
 import { createNodeProviders } from '../../impl/nodejs';
-import { rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DirectMessage } from '../../types';
-import { rand, makeTempDirs, ensureTrustbase, DEFAULT_API_KEY } from './helpers';
+
+// Local helpers (the shared v1-era e2e helpers.ts died with the v1 cutover;
+// messaging needs no faucet/gateway — only temp dirs and random names).
+const rand = (n = 6): string => Math.random().toString(36).slice(2, 2 + n);
+function makeTempDirs(label: string): { dataDir: string; tokensDir: string } {
+  const base = mkdtempSync(join(tmpdir(), `sphere-e2e-${label}-`));
+  return { dataDir: join(base, 'data'), tokensDir: join(base, 'tokens') };
+}
 
 // =============================================================================
 // Helpers
@@ -67,16 +75,11 @@ async function createSphere(
   opts?: { groupChat?: boolean },
 ) {
   const dirs = makeTempDirs(label);
-  await ensureTrustbase(dirs.dataDir);
 
   const providers = createNodeProviders({
     network: 'testnet',
     dataDir: dirs.dataDir,
     tokensDir: dirs.tokensDir,
-    oracle: {
-      trustBasePath: join(dirs.dataDir, 'trustbase.json'),
-      apiKey: DEFAULT_API_KEY,
-    },
     ...(opts?.groupChat ? { groupChat: true } : {}),
   });
 
