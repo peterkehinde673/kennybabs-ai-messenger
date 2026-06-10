@@ -397,6 +397,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     ? createBrowserIpfsStorageProvider({
         gateways: ipfsConfig.gateways,
         debug: config?.tokenSync?.ipfs?.useDht, // reuse debug-like flag
+        network,
       })
     : undefined;
 

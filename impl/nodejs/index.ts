@@ -233,7 +233,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   // Create IPFS storage provider if enabled
   const ipfsSync = config?.tokenSync?.ipfs;
   const ipfsTokenStorage = ipfsSync?.enabled
-    ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
+    ? createNodeIpfsStorageProvider({ ...ipfsSync.config, network }, storage)
     : undefined;
 
   // Resolve group chat config
