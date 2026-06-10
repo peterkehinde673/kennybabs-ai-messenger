@@ -95,6 +95,29 @@ function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: str
 /** Maximum number of history entries to include in IPFS-synced TXF data */
 const MAX_SYNCED_HISTORY_ENTRIES = 5000;
 
+/**
+ * Overall timeout for a single engine transfer/split during send(). Overrides
+ * the SDK's 10s default inclusion-proof abort — a slow aggregator must get a
+ * fair window, because once the certification is submitted the source state is
+ * spent on-chain and an early abort strands the finished token.
+ */
+const SEND_ENGINE_OP_TIMEOUT_MS = 60_000;
+
+/**
+ * A FINISHED v2 token blob awaiting transport delivery. Journaled the moment
+ * the transfer/split output is certified on-chain (the source is already
+ * spent) and removed after successful delivery, so a transport failure or a
+ * crash never loses the recipient's token. Replayed by load().
+ */
+interface PendingV2Delivery {
+  transferId: string;
+  recipientPubkey: string;
+  /** Hex of the finished token blob (the V2_TRANSFER payload). */
+  tokenBlob: string;
+  memo?: string;
+  createdAt: number;
+}
+
 // =============================================================================
 // Receive Options & Result
 // =============================================================================
@@ -895,7 +918,26 @@ export class PaymentsModule {
       // receiver) can never confirm — their finalization path was v1-only. Move
       // them to the terminal 'invalid' state instead of leaving phantom
       // 'submitted' balance forever. sdkData is kept intact for audit.
+      // They lived in the legacy PENDING_V5_TOKENS KV key (TXF never persisted
+      // them), so this is a one-time KV migration; the in-map sweep below covers
+      // any stragglers that did land in token storage.
       let terminalized = 0;
+      try {
+        const legacyPendingV5 = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+        if (legacyPendingV5) {
+          const v5Tokens = JSON.parse(legacyPendingV5) as Token[];
+          for (const t of v5Tokens) {
+            if (this.tokens.has(t.id)) continue;
+            t.status = 'invalid';
+            t.updatedAt = Date.now();
+            this.tokens.set(t.id, t);
+            terminalized++;
+          }
+          await this.deps!.storage.remove(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+        }
+      } catch (err) {
+        logger.warn('Payments', 'load(): failed to migrate legacy PENDING_V5_TOKENS:', err);
+      }
       for (const [, t] of this.tokens) {
         if (t.status !== 'submitted') continue;
         const isPendingV5 = t.id.startsWith('v5split_')
@@ -911,6 +953,34 @@ export class PaymentsModule {
       if (terminalized > 0) {
         logger.warn('Payments', `load(): terminalized ${terminalized} orphaned pending-V5 token(s) (v1 finalization removed)`);
         await this.save();
+      }
+
+      // Crash recovery: tokens persisted mid-send stay 'transferring' forever —
+      // nothing else writes that status, and v2 storage round-trips it verbatim.
+      // Reconcile against the network: spent on-chain → terminal 'spent';
+      // unspent → back to 'confirmed' (spendable again). Engine/network
+      // unavailable → leave for the next load. In-flight sends in THIS session
+      // are protected by their reservation, so flipping is safe.
+      const recoveryEngine = this.deps?.tokenEngine;
+      if (recoveryEngine) {
+        let reconciled = 0;
+        for (const [, t] of this.tokens) {
+          if (t.status !== 'transferring' || !t.sdkData || !looksLikeTokenBlob(t.sdkData)) continue;
+          try {
+            const st = await recoveryEngine.decodeToken(decodeTokenBlob(hexToBytes(t.sdkData)));
+            const spent = await recoveryEngine.isSpent(st);
+            t.status = spent ? 'spent' : 'confirmed';
+            t.updatedAt = Date.now();
+            if (!spent) await this.cacheEngineParsedToken(t);
+            reconciled++;
+          } catch {
+            // Aggregator unreachable — keep 'transferring', retry next load.
+          }
+        }
+        if (reconciled > 0) {
+          logger.warn('Payments', `load(): reconciled ${reconciled} token(s) stuck in 'transferring' from an interrupted send`);
+          await this.save();
+        }
       }
 
       // Load transaction history from dedicated history store (with migration from legacy KV)
@@ -930,6 +1000,11 @@ export class PaymentsModule {
 
     this.loadedPromise = doLoad();
     await this.loadedPromise;
+
+    // Replay finished-but-undelivered v2 blobs from a previous session
+    // (fire-and-forget; failures are kept journaled for the next load).
+    void this.replayPendingV2Deliveries().catch((err) =>
+      logger.warn('Payments', 'Pending v2 delivery replay failed:', err));
   }
 
   /**
@@ -1001,6 +1076,11 @@ export class PaymentsModule {
       tokens: [],
       tokenTransfers: [],
     };
+
+    // W23-R2 (v2): ids of source tokens whose spend was CERTIFIED on-chain during
+    // this send. The failure handler must never restore these as 'confirmed' —
+    // their state is consumed; the finished output blob is journaled separately.
+    const committedOnChainTokenIds = new Set<string>();
 
     try {
       // Resolve recipient
@@ -1122,9 +1202,8 @@ export class PaymentsModule {
         // parseInvoiceMemoForOnChain already produced the encoded bytes (or null).
         const memoData = onChainMessage ?? undefined;
 
-        // Hand a finished token to the recipient as a V2_TRANSFER (blob) payload.
-        const handToRecipient = async (finished: SphereToken): Promise<void> => {
-          const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
+        // Deliver a journaled finished-token blob as a V2_TRANSFER payload.
+        const deliverBlob = async (tokenBlob: string): Promise<void> => {
           await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
             type: 'V2_TRANSFER',
             version: '2.0',
@@ -1135,12 +1214,28 @@ export class PaymentsModule {
 
         // Whole-token direct transfers.
         for (const tw of splitPlan.tokensToTransferDirectly) {
-          const finished = await engine.transfer({
-            token: tw.sdkToken as SphereToken,
-            recipientPubkey: recipientChainPubkey,
-            data: memoData,
+          const finished = await engine.transfer(
+            {
+              token: tw.sdkToken as SphereToken,
+              recipientPubkey: recipientChainPubkey,
+              data: memoData,
+            },
+            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS) },
+          );
+          // The source state is spent on-chain from here on.
+          committedOnChainTokenIds.add(tw.uiToken.id);
+          // Journal the finished blob BEFORE delivery: a transport failure or a
+          // crash must not lose the recipient's token (replayed on next load()).
+          const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
+          await this.savePendingV2Delivery({
+            transferId: result.id,
+            recipientPubkey,
+            tokenBlob,
+            memo: request.memo,
+            createdAt: Date.now(),
           });
-          await handToRecipient(finished);
+          await deliverBlob(tokenBlob);
+          await this.removePendingV2Delivery(tokenBlob);
           result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
           await this.removeToken(tw.uiToken.id, result.id);
         }
@@ -1150,16 +1245,33 @@ export class PaymentsModule {
         // it) — no placeholder / background-proof step.
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
           const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
-          const { outputs } = await engine.split({
-            token: splitPlan.tokenToSplit.sdkToken as SphereToken,
-            outputs: [
-              { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: splitPlan.splitAmount!, data: memoData },
-              { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
-            ],
+          const { outputs } = await engine.split(
+            {
+              token: splitPlan.tokenToSplit.sdkToken as SphereToken,
+              outputs: [
+                { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: splitPlan.splitAmount!, data: memoData },
+                { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
+              ],
+            },
+            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS) },
+          );
+          // The split source is burnt on-chain from here on. Persist BOTH outputs
+          // (journal the recipient's blob, store our change token) BEFORE the
+          // delivery attempt — nothing after the on-chain split may depend on
+          // the transport succeeding.
+          committedOnChainTokenIds.add(splitPlan.tokenToSplit.uiToken.id);
+          const recipientBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0])));
+          await this.savePendingV2Delivery({
+            transferId: result.id,
+            recipientPubkey,
+            tokenBlob: recipientBlob,
+            memo: request.memo,
+            createdAt: Date.now(),
           });
-          await handToRecipient(outputs[0]);
-
           await this.storeEngineToken(engine, outputs[1]); // change token, confirmed
+
+          await deliverBlob(recipientBlob);
+          await this.removePendingV2Delivery(recipientBlob);
 
           result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
@@ -1213,19 +1325,53 @@ export class PaymentsModule {
       result.status = 'failed';
       result.error = error instanceof Error ? error.message : String(error);
 
-      // Restore tokens and re-add to spend queue cache.
-      // W23-R2/R3 fix: Skip tokens that were already removeToken()'d (archived +
-      // tombstoned) during a partially-successful transfer loop — restoring those
-      // would create phantom tokens.
+      // Restore tokens. Three classes (W23-R2/R3, v2 edition):
+      //  - already removeToken()'d during a partially-successful loop → skip
+      //    (restoring would create phantom tokens);
+      //  - certified on-chain during THIS send (tracked, or — for ops that threw
+      //    mid-flight, e.g. an inclusion-proof timeout AFTER certification — the
+      //    network says spent) → terminal 'spent', NEVER back to 'confirmed'
+      //    (a spent state in the spend pool just fails every future send);
+      //  - genuinely untouched → restore 'confirmed' + re-cache for the queue.
+      const restoreEngine = this.deps?.tokenEngine;
       for (const token of result.tokens) {
         if (!this.tokens.has(token.id)) {
           logger.warn('Payments', `Skipping restoration of already-removed token ${token.id}`);
           continue;
         }
-        token.status = 'confirmed';
-        this.tokens.set(token.id, token);
-        await this.cacheEngineParsedToken(token);
+        let spentOnChain = committedOnChainTokenIds.has(token.id);
+        if (!spentOnChain && restoreEngine && token.sdkData && looksLikeTokenBlob(token.sdkData)) {
+          try {
+            const st = await restoreEngine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
+            spentOnChain = await restoreEngine.isSpent(st);
+          } catch {
+            // Network/decode failure — restore optimistically; validate() or the
+            // next send attempt reconciles a stale state.
+          }
+        }
+        if (spentOnChain) {
+          token.status = 'spent';
+          this.tokens.set(token.id, token);
+          logger.warn('Payments', `Token ${token.id} was spent on-chain during the failed send — marked 'spent' (output blob journaled for delivery replay)`);
+        } else {
+          token.status = 'confirmed';
+          this.tokens.set(token.id, token);
+          await this.cacheEngineParsedToken(token);
+        }
       }
+
+      // Persist the restore — without this a crash right after a handled failure
+      // reloads the tokens as stuck-'transferring'.
+      try {
+        await this.save();
+      } catch (saveErr) {
+        logger.error('Payments', 'Failed to persist send-failure restore:', saveErr);
+      }
+      // The pre-send outbox snapshot can recover nothing (finished blobs are
+      // journaled in PENDING_V2_DELIVERIES) — prune it on failure too.
+      try {
+        await this.removeFromOutbox(result.id);
+      } catch { /* best-effort */ }
 
       // Notify queue AFTER cache is rebuilt so queued entries see restored tokens
       this.spendQueue.notifyChange(request.coinId);
@@ -2764,13 +2910,20 @@ export class PaymentsModule {
   }
 
   /**
-   * Persist a realized v2 engine token as a confirmed wallet Token and return it.
-   * Single source of truth for "engine SphereToken -> stored UI Token": serialize
-   * with the wallet blob codec, derive coin/amount via parseTokenInfo, apply
-   * registry overrides, key it v2_<genesis-stable tokenId>, and addToken. Reused
-   * by self-mint, the send change-token path, and the v2 receive path.
+   * Persist a realized v2 engine token as a confirmed wallet Token. Single
+   * source of truth for "engine SphereToken -> stored UI Token": serialize with
+   * the wallet blob codec, derive coin/amount via parseTokenInfo, apply registry
+   * overrides, key it v2_<genesis-stable tokenId>, and addToken. Reused by
+   * self-mint, the send change-token path, and the v2 receive path.
+   *
+   * `added` is addToken's verdict — false when storage REJECTED the token
+   * (tombstoned re-delivery of a since-spent state, or an exact duplicate).
+   * Callers emitting receipt events must gate on it.
    */
-  private async storeEngineToken(engine: ITokenEngine, token: SphereToken): Promise<Token> {
+  private async storeEngineToken(
+    engine: ITokenEngine,
+    token: SphereToken,
+  ): Promise<{ uiToken: Token; added: boolean }> {
     // Re-encode from the decoded blob; byte-identical to the wire blob (canonical CBOR).
     const sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(token)));
     const info = await parseTokenInfo(sdkData, engine);
@@ -2787,8 +2940,8 @@ export class PaymentsModule {
       updatedAt: Date.now(),
       sdkData,
     };
-    await this.addToken(uiToken);
-    return uiToken;
+    const added = await this.addToken(uiToken);
+    return { uiToken, added };
   }
 
   /**
@@ -2834,7 +2987,7 @@ export class PaymentsModule {
         recipientPubkey: engine.getIdentity().chainPubkey,
         value: { assets: [{ coinId: coinIdHex, amount }] },
       });
-      const uiToken = await this.storeEngineToken(engine, minted);
+      const { uiToken } = await this.storeEngineToken(engine, minted);
       return { success: true, token: uiToken, tokenId: engine.tokenId(minted) };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -3289,7 +3442,14 @@ export class PaymentsModule {
       return;
     }
 
-    const uiToken = await this.storeEngineToken(engine, token);
+    const { uiToken, added } = await this.storeEngineToken(engine, token);
+    if (!added) {
+      // Storage rejected it: a tombstoned re-delivery of a since-spent state, or
+      // a duplicate race. Emitting transfer:incoming / writing RECEIVED history
+      // here would announce a phantom payment for value the wallet does not hold.
+      logger.warn('Payments', `V2 transfer ${id.slice(0, 16)}... rejected by storage (tombstoned/duplicate) — no event emitted`);
+      return;
+    }
     const senderInfo = await this.resolveSenderInfo(senderPubkey);
 
     this.deps!.emitEvent('transfer:incoming', {
@@ -3430,6 +3590,57 @@ export class PaymentsModule {
   private async loadOutbox(): Promise<Array<{ transfer: TransferResult; recipient: string; createdAt: number }>> {
     const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.OUTBOX);
     return data ? JSON.parse(data) : [];
+  }
+
+  // ===========================================================================
+  // Private: Pending v2 deliveries (finished-but-undelivered token blobs)
+  // ===========================================================================
+
+  private async loadPendingV2Deliveries(): Promise<PendingV2Delivery[]> {
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES);
+    return data ? (JSON.parse(data) as PendingV2Delivery[]) : [];
+  }
+
+  private async savePendingV2Delivery(entry: PendingV2Delivery): Promise<void> {
+    const all = await this.loadPendingV2Deliveries();
+    if (!all.some((e) => e.tokenBlob === entry.tokenBlob)) {
+      all.push(entry);
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
+    }
+  }
+
+  private async removePendingV2Delivery(tokenBlob: string): Promise<void> {
+    const all = await this.loadPendingV2Deliveries();
+    const filtered = all.filter((e) => e.tokenBlob !== tokenBlob);
+    if (filtered.length !== all.length) {
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
+    }
+  }
+
+  /**
+   * Replay journaled finished-but-undelivered v2 blobs (kicked fire-and-forget
+   * from load()). The recipient dedups re-deliveries by the genesis-stable
+   * token id, so replaying an already-delivered blob is harmless. Entries that
+   * still fail to send are kept for the next load.
+   */
+  private async replayPendingV2Deliveries(): Promise<void> {
+    const entries = await this.loadPendingV2Deliveries();
+    if (entries.length === 0) return;
+    logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
+    for (const e of entries) {
+      try {
+        await this.deps!.transport.sendTokenTransfer(e.recipientPubkey, {
+          type: 'V2_TRANSFER',
+          version: '2.0',
+          tokenBlob: e.tokenBlob,
+          memo: e.memo,
+        } as unknown as import('../../transport').TokenTransferPayload);
+        await this.removePendingV2Delivery(e.tokenBlob);
+        logger.debug('Payments', `Replayed undelivered v2 transfer ${e.transferId.slice(0, 8)}...`);
+      } catch (err) {
+        logger.warn('Payments', `Replay of undelivered v2 transfer ${e.transferId.slice(0, 8)}... failed (kept for next load):`, err);
+      }
+    }
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {

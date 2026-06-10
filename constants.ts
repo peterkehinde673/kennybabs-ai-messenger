@@ -81,6 +81,13 @@ export const STORAGE_KEYS_ADDRESS = {
   TRANSACTION_HISTORY: 'transaction_history',
   /** Pending V5 finalization tokens (unconfirmed instant split tokens) */
   PENDING_V5_TOKENS: 'pending_v5_tokens',
+  /**
+   * FINISHED v2 token blobs awaiting transport delivery. Written the moment a
+   * transfer/split output is certified on-chain (the source is already spent),
+   * removed after successful delivery — survives transport failures + crashes
+   * so the recipient's token is never lost with the process.
+   */
+  PENDING_V2_DELIVERIES: 'pending_v2_deliveries',
   /** Group chat: joined groups for this address */
   GROUP_CHAT_GROUPS: 'group_chat_groups',
   /** Group chat: messages for this address */
