@@ -32,7 +32,6 @@ import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModul
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import type { ITokenEngine, SphereToken } from '../../token-engine';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
-import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
