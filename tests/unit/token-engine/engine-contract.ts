@@ -123,6 +123,17 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       expect(e.tokenId(again)).toBe(e.tokenId(t));
     });
 
+    it('isOwnedBy matches the current state owner and follows transfers', async () => {
+      const e = makeEngine();
+      const mine = e.getIdentity().chainPubkey;
+      const src = await mintSelf(e, 5n);
+      expect(e.isOwnedBy(src, mine)).toBe(true);
+      expect(e.isOwnedBy(src, PK_B)).toBe(false);
+      const recv = await e.transfer({ token: src, recipientPubkey: PK_B });
+      expect(e.isOwnedBy(recv, PK_B)).toBe(true);
+      expect(e.isOwnedBy(recv, mine)).toBe(false);
+    });
+
     it('carries an opaque on-chain memo on a whole-token transfer (readMemo)', async () => {
       const e = makeEngine();
       const src = await mintSelf(e, 1n);
