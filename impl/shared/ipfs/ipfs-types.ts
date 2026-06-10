@@ -99,6 +99,11 @@ export interface GatewayHealthResult {
 
 /** IPFS storage provider configuration */
 export interface IpfsStorageConfig {
+  /**
+   * Network — derives a per-network IPNS identity (HKDF info `${IPNS_HKDF_INFO}:${network}`)
+   * so the same wallet key maps to a DISTINCT IPNS record per network (v1↔v2 isolation).
+   */
+  network?: import('../../../constants').NetworkType;
   /** Gateway URLs for HTTP API (defaults to Unicity dedicated nodes) */
   gateways?: string[];
   /** Content fetch timeout in ms (default: 15000) */

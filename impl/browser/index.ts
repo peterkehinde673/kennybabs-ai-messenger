@@ -388,7 +388,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
 
-  const storage = createIndexedDBStorageProvider(config?.storage);
+  const storage = createIndexedDBStorageProvider({ ...config?.storage, network });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
@@ -397,6 +397,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     ? createBrowserIpfsStorageProvider({
         gateways: ipfsConfig.gateways,
         debug: config?.tokenSync?.ipfs?.useDht, // reuse debug-like flag
+        network,
       })
     : undefined;
 
@@ -431,7 +432,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       debug: oracleConfig.debug,
       network,
     }),
-    tokenStorage: createIndexedDBTokenStorageProvider(),
+    tokenStorage: createIndexedDBTokenStorageProvider({ network }),
     l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,

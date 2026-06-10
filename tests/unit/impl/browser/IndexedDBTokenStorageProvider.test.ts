@@ -31,7 +31,10 @@ function createProvider(prefix?: string): IndexedDBTokenStorageProvider {
 function createIdentity(directAddress: string): FullIdentity {
   return {
     privateKey: '0'.repeat(64),
-    chainPubkey: '02' + 'a'.repeat(64),
+    // directAddress is derived from chainPubkey 1:1 in reality, so distinct addresses
+    // MUST have distinct pubkeys. The token DB is now keyed by chainPubkey, so vary it
+    // per address — otherwise this fixture would (unrealistically) collide two addresses.
+    chainPubkey: '02' + Buffer.from(directAddress).toString('hex').padEnd(64, '0').slice(0, 64),
     l1Address: 'alpha1testaddr',
     directAddress,
     nametag: 'testuser',

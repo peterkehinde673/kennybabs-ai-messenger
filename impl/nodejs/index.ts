@@ -226,13 +226,14 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const storage = createFileStorageProvider({
     dataDir: config?.dataDir ?? './sphere-data',
     ...(config?.walletFileName ? { fileName: config.walletFileName } : {}),
+    network,
   });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
   const ipfsSync = config?.tokenSync?.ipfs;
   const ipfsTokenStorage = ipfsSync?.enabled
-    ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
+    ? createNodeIpfsStorageProvider({ ...ipfsSync.config, network }, storage)
     : undefined;
 
   // Resolve group chat config
@@ -251,6 +252,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     market,
     tokenStorage: createFileTokenStorageProvider({
       tokensDir: config?.tokensDir ?? './sphere-tokens',
+      network,
     }),
     transport: createNostrTransportProvider({
       relays: transportConfig.relays,
