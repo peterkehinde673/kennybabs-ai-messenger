@@ -5070,7 +5070,30 @@ export class PaymentsModule {
     const valid: Token[] = [];
     const invalid: Token[] = [];
 
+    const engine = this.deps?.tokenEngine;
     for (const token of this.tokens.values()) {
+      // v2 blob tokens are verified via the engine (local proof check + on-chain
+      // spent-status); the oracle's validateToken only understands v1 TXF.
+      if (engine && token.sdkData && looksLikeTokenBlob(token.sdkData)) {
+        try {
+          const sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
+          const verdict = await engine.verify(sphereToken);
+          const spent = verdict.ok ? await engine.isSpent(sphereToken) : false;
+          if (verdict.ok && !spent) {
+            valid.push(token);
+          } else {
+            token.status = 'invalid';
+            this.parsedTokenCache.delete(token.id);
+            invalid.push(token);
+          }
+        } catch (err) {
+          // Transient failure (decode/network) — do NOT invalidate funds on an
+          // outage; skip this token for this run.
+          logger.warn('Payments', `validate: engine check failed for ${token.id}, skipping:`, err);
+        }
+        continue;
+      }
+
       const result = await this.deps!.oracle.validateToken(token.sdkData);
 
       if (result.valid && !result.spent) {
@@ -5496,6 +5519,19 @@ export class PaymentsModule {
       token = await engine.decodeToken(decodeTokenBlob(hexToBytes(payload.tokenBlob)));
     } catch (err) {
       logger.error('Payments', 'V2 transfer: failed to decode token blob:', err);
+      return;
+    }
+
+    // Security: the sender hands us a FINISHED token — verify it cryptographically
+    // and confirm its final state is actually locked to this wallet before it
+    // enters the balance. Both checks are local (trust base + predicate bytes).
+    const verdict = await engine.verify(token);
+    if (!verdict.ok) {
+      logger.warn('Payments', `V2 transfer rejected: verification failed (${verdict.reason ?? 'unknown'})`);
+      return;
+    }
+    if (!engine.isOwnedBy(token, engine.getIdentity().chainPubkey)) {
+      logger.warn('Payments', 'V2 transfer rejected: token not addressed to this wallet');
       return;
     }
 

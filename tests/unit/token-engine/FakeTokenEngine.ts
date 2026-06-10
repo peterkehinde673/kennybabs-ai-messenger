@@ -183,6 +183,12 @@ export class FakeTokenEngine implements ITokenEngine {
     return Promise.resolve(this.spent.has(this.idOf(token)));
   }
 
+  public isOwnedBy(token: SphereToken, pubkey: Uint8Array): boolean {
+    const owner = decodeFakeState(token.blob.token).owner;
+    if (owner.length !== pubkey.length) return false;
+    return owner.every((b, i) => b === pubkey[i]);
+  }
+
   public encodeToken(token: SphereToken): TokenBlob {
     return token.blob;
   }

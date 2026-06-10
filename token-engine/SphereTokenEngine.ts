@@ -300,6 +300,12 @@ export class SphereTokenEngine implements ITokenEngine {
     return result.status === VerificationStatus.OK ? { ok: true } : { ok: false, reason: String(result.status) };
   }
 
+  public isOwnedBy(token: SphereToken, pubkey: Uint8Array): boolean {
+    const owner = token.sdkToken.latestTransaction.recipient;
+    const claimed = EncodedPredicate.fromPredicate(SignaturePredicate.create(pubkey));
+    return EncodedPredicate.equals(owner, claimed);
+  }
+
   public async isSpent(token: SphereToken, _options?: EngineOpOptions): Promise<boolean> {
     // The token's current state id = what a future transfer would spend. Derive it via a
     // probe transfer (never submitted) — StateId depends only on the source's lock script
@@ -337,9 +343,7 @@ export class SphereTokenEngine implements ITokenEngine {
 
   /** Fail fast if this engine's key does not own the token's current state. */
   private assertOwned(token: SphereToken): void {
-    const owner = token.sdkToken.latestTransaction.recipient;
-    const mine = EncodedPredicate.fromPredicate(SignaturePredicate.create(this.deps.signingService.publicKey));
-    if (!EncodedPredicate.equals(owner, mine)) {
+    if (!this.isOwnedBy(token, this.deps.signingService.publicKey)) {
       throw new SphereError('Cannot transfer a token not owned by this engine identity', 'VALIDATION_ERROR');
     }
   }

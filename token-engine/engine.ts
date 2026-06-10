@@ -93,6 +93,12 @@ export interface ITokenEngine {
   verify(token: SphereToken, options?: EngineOpOptions): Promise<EngineVerifyResult>;
   /** Whether the token's current state has already been spent on the network. */
   isSpent(token: SphereToken, options?: EngineOpOptions): Promise<boolean>;
+  /**
+   * Whether the token's CURRENT state is locked to `SignaturePredicate(pubkey)`.
+   * Local + synchronous (predicate byte-compare, no network). The receive path
+   * uses it to reject tokens that are not actually addressed to this wallet.
+   */
+  isOwnedBy(token: SphereToken, pubkey: Uint8Array): boolean;
 
   // ── serialization ──────────────────────────────────────────────────────────
   /** Serialize a token for storage/transport. Synchronous. */
