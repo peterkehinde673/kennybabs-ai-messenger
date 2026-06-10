@@ -9,18 +9,18 @@
 
 import { numberToBytesBE } from '@noble/curves/utils.js';
 
-import { InputRecord } from 'state-transition-sdk-v2/lib/api/bft/InputRecord.js';
-import { ShardId } from 'state-transition-sdk-v2/lib/api/bft/ShardId.js';
-import { ShardTreeCertificate } from 'state-transition-sdk-v2/lib/api/bft/ShardTreeCertificate.js';
-import { UnicityCertificate } from 'state-transition-sdk-v2/lib/api/bft/UnicityCertificate.js';
-import { UnicitySeal } from 'state-transition-sdk-v2/lib/api/bft/UnicitySeal.js';
-import { UnicityTreeCertificate } from 'state-transition-sdk-v2/lib/api/bft/UnicityTreeCertificate.js';
-import { NetworkId } from 'state-transition-sdk-v2/lib/api/NetworkId.js';
-import { DataHash } from 'state-transition-sdk-v2/lib/crypto/hash/DataHash.js';
-import { DataHasher } from 'state-transition-sdk-v2/lib/crypto/hash/DataHasher.js';
-import { HashAlgorithm } from 'state-transition-sdk-v2/lib/crypto/hash/HashAlgorithm.js';
-import { SigningService } from 'state-transition-sdk-v2/lib/crypto/secp256k1/SigningService.js';
-import { CborSerializer } from 'state-transition-sdk-v2/lib/serialization/cbor/CborSerializer.js';
+import { InputRecord } from '@unicitylabs/state-transition-sdk/lib/api/bft/InputRecord.js';
+import { ShardId } from '@unicitylabs/state-transition-sdk/lib/api/bft/ShardId.js';
+import { ShardTreeCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/ShardTreeCertificate.js';
+import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
+import { UnicitySeal } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicitySeal.js';
+import { UnicityTreeCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityTreeCertificate.js';
+import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
+import { DataHash } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHash.js';
+import { DataHasher } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHasher.js';
+import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/HashAlgorithm.js';
+import { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
+import { CborSerializer } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 
 export async function createUnicityCertificate(
   rootHash: DataHash,

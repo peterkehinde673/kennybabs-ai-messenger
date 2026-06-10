@@ -8,25 +8,25 @@
  * aggregator. Keep in sync with upstream.
  */
 
-import { RootTrustBase } from 'state-transition-sdk-v2/lib/api/bft/RootTrustBase.js';
-import { CertificationData } from 'state-transition-sdk-v2/lib/api/CertificationData.js';
+import { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/api/bft/RootTrustBase.js';
+import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
 import {
   CertificationResponse,
   CertificationStatus,
-} from 'state-transition-sdk-v2/lib/api/CertificationResponse.js';
-import { IAggregatorClient } from 'state-transition-sdk-v2/lib/api/IAggregatorClient.js';
-import { InclusionCertificate } from 'state-transition-sdk-v2/lib/api/InclusionCertificate.js';
-import { InclusionProof } from 'state-transition-sdk-v2/lib/api/InclusionProof.js';
-import { InclusionProofResponse } from 'state-transition-sdk-v2/lib/api/InclusionProofResponse.js';
-import { StateId } from 'state-transition-sdk-v2/lib/api/StateId.js';
-import { DataHasher } from 'state-transition-sdk-v2/lib/crypto/hash/DataHasher.js';
-import { DataHasherFactory } from 'state-transition-sdk-v2/lib/crypto/hash/DataHasherFactory.js';
-import { HashAlgorithm } from 'state-transition-sdk-v2/lib/crypto/hash/HashAlgorithm.js';
-import { SigningService } from 'state-transition-sdk-v2/lib/crypto/secp256k1/SigningService.js';
-import { PredicateVerifierService } from 'state-transition-sdk-v2/lib/predicate/verification/PredicateVerifierService.js';
-import { SparseMerkleTree } from 'state-transition-sdk-v2/lib/smt/radix/SparseMerkleTree.js';
-import { BitString } from 'state-transition-sdk-v2/lib/util/BitString.js';
-import { VerificationStatus } from 'state-transition-sdk-v2/lib/verification/VerificationStatus.js';
+} from '@unicitylabs/state-transition-sdk/lib/api/CertificationResponse.js';
+import { IAggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/IAggregatorClient.js';
+import { InclusionCertificate } from '@unicitylabs/state-transition-sdk/lib/api/InclusionCertificate.js';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
+import { InclusionProofResponse } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProofResponse.js';
+import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
+import { DataHasher } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHasher.js';
+import { DataHasherFactory } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHasherFactory.js';
+import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/HashAlgorithm.js';
+import { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
+import { PredicateVerifierService } from '@unicitylabs/state-transition-sdk/lib/predicate/verification/PredicateVerifierService.js';
+import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radix/SparseMerkleTree.js';
+import { BitString } from '@unicitylabs/state-transition-sdk/lib/util/BitString.js';
+import { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationStatus.js';
 
 import { createRootTrustBase } from './RootTrustBaseFixture';
 import { createUnicityCertificate } from './UnicityCertificateFixture';

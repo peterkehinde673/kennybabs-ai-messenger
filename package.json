@@ -122,13 +122,12 @@
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
     "@unicitylabs/nostr-js-sdk": "^0.5.0",
-    "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
+    "@unicitylabs/state-transition-sdk": "2.0.0-rc.6027e82",
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
     "canonicalize": "^3.0.0",
     "crypto-js": "^4.2.0",
-    "elliptic": "^6.6.1",
-    "state-transition-sdk-v2": "npm:@unicitylabs/state-transition-sdk@^2.0.0-rc.6027e82"
+    "elliptic": "^6.6.1"
   },
   "optionalDependencies": {
     "@libp2p/crypto": "^5.1.13",
