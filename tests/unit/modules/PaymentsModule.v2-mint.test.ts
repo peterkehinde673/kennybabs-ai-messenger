@@ -192,14 +192,14 @@ describe('mintFungibleToken — v2 engine self-mint (top-up)', () => {
   });
 });
 
-describe('mintFungibleToken — v1 fallback when no engine', () => {
-  it('takes the v1 path and surfaces the v1 unavailability error', async () => {
+describe('mintFungibleToken — no engine', () => {
+  it('fails loudly when the token engine is unavailable (v1 fallback removed)', async () => {
     const { module } = setup({ engine: null, withStClient: false });
     const res = await module.mintFungibleToken(UCT, 100n);
 
     expect(res.success).toBe(false);
     if (res.success) return;
-    expect(res.error).toContain('State transition client not available');
+    expect(res.error).toContain('Token engine unavailable');
     expect(module.getTokens()).toHaveLength(0);
   });
 });
