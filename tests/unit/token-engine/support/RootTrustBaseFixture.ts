@@ -6,9 +6,9 @@
  * orchestrates installed SDK classes. Keep in sync with upstream.
  */
 
-import { RootTrustBase } from 'state-transition-sdk-v2/lib/api/bft/RootTrustBase.js';
-import { NetworkId } from 'state-transition-sdk-v2/lib/api/NetworkId.js';
-import { HexConverter } from 'state-transition-sdk-v2/lib/util/HexConverter.js';
+import { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/api/bft/RootTrustBase.js';
+import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
+import { HexConverter } from '@unicitylabs/state-transition-sdk/lib/util/HexConverter.js';
 
 export function createRootTrustBase(publicKey: Uint8Array): RootTrustBase {
   return RootTrustBase.fromJSON({

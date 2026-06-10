@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BREAKING — v1 state-transition-sdk removed (v2 engine cutover)
+
+The legacy `@unicitylabs/state-transition-sdk@1.6.1-rc` engine is gone. The
+canonical package name now resolves to the v2 SDK (pinned `2.0.0-rc.6027e82`),
+consumed exclusively through the `token-engine/` port. Consequences:
+
+- **The token engine is mandatory for money movement.** `send()`,
+  `mintFungibleToken()`, `accounting.createInvoice()/importInvoice()` fail
+  loudly (`AGGREGATOR_ERROR` / `INVOICE_ORACLE_REQUIRED`) when the oracle does
+  not supply a v2 trust base + gateway URL. Recipients must have a published
+  chain pubkey (`INVALID_RECIPIENT` otherwise).
+- **Removed public API:** `payments.sendInstant()`, `payments.resolveUnconfirmed()`,
+  instant-split/payment-session wire types (`types/instant-split`,
+  `types/payment-session`), transport `sendInstantSplitBundle`/`onInstantSplitReceived`,
+  oracle `submitCommitment`/`getProof`/`waitForProof`/`isSpent`/`getTokenState`/
+  `getCurrentRound`/`mint`/`getStateTransitionClient`/`getAggregatorClient`/
+  `waitForProofSdk` (+ their commitment/proof/mint types).
+  `ReceiveOptions` finalization options are deprecated no-ops (v2 tokens arrive
+  finished — there is no finalization phase).
+- **Wire compatibility:** the only supported transfer payload is `V2_TRANSFER`
+  (a finished v2 token blob). Incoming v1 payloads (V5/V6 instant-split,
+  NOSTR-FIRST, `{sourceToken,transferTx}`, plain token JSON) are dropped with an
+  explicit error log — peers must run a >=0.8 wallet to send to this wallet.
+- **Incoming v2 transfers are now verified** (`engine.verify` + ownership check
+  against this wallet's chain pubkey) before entering the balance; `validate()`
+  checks v2 tokens via the engine (`verify` + `isSpent`).
+- **Stored v1 TXF tokens** stay visible (parsed as plain JSON for display) but
+  are unspendable — there is no migration path through the removed v1 engine.
+  Orphaned pending-V5 tokens are terminalized to `invalid` on load (data kept).
+  Legacy v1 TXF invoices are rejected on import with an explicit error.
+- **`NETWORKS.testnet` now points at testnet2** (the v2 gateway network,
+  networkId 4, own token registry); `testnet2` stays as an alias. `mainnet`/`dev`
+  still point at v1-era aggregators — wallet operations there fail loudly until
+  those gateways are cut over to the v2 protocol.
+- **`AccountingModuleDependencies.trustBase` removed** (the engine owns trust);
+  `accounting.importInvoice` accepts the v2 invoice blob (hex string).
+
 ### Added
 - **`cacheMessages` option for CommunicationsModule** — `communications: { cacheMessages: false }` in `SphereInitOptions` disables DM caching in memory and storage. Messages still flow through `onDirectMessage()` handlers and `message:dm` events, but are never stored. Useful for anonymous/ephemeral agents (e.g. LLM bots) that only need streaming DM reception. `sendDM()` still works but doesn't cache the sent message. Deduplication is skipped when caching is disabled.
 - **Message signing** — `signMessage()`, `verifySignedMessage()`, `hashSignMessage()` crypto functions for secp256k1 ECDSA with recoverable signatures (Bitcoin-like double-SHA256 with `Sphere Signed Message:\n` prefix). `Sphere.signMessage(message)` instance method encapsulates private key access. `SIGNING_ERROR` added to `SphereErrorCode`. `SphereInstance` interface in ConnectHost extended with `signMessage`. 22 unit tests covering signing, verification, round-trips, tampering detection, and edge cases.

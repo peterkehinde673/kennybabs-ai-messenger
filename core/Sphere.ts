@@ -2488,20 +2488,10 @@ export class Sphere {
     if (this._accounting) {
       const accountingTokenStorage = tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
-        // Resolve trustBase from oracle for invoice proof verification
-        let trustBase: unknown = null;
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
-        } catch {
-          logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
-        }
-
         this._accounting.initialize({
           payments,
           tokenStorage: accountingTokenStorage,
           oracle: this._oracle,
-          trustBase,
           identity,
           getActiveAddresses: () => this._getActiveAddressesInternal(),
           emitEvent,
@@ -4310,20 +4300,10 @@ export class Sphere {
     if (this._accounting) {
       const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
-        // Resolve trustBase from oracle for invoice proof verification
-        let trustBase: unknown = null;
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
-        } catch {
-          logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
-        }
-
         this._accounting.initialize({
           payments: this._payments,
           tokenStorage: accountingTokenStorage,
           oracle: this._oracle,
-          trustBase,
           identity: this._identity!,
           getActiveAddresses: () => this._getActiveAddressesInternal(),
           emitEvent,

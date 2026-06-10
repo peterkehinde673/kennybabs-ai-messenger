@@ -17,7 +17,9 @@ import { SphereError } from '../../core/errors';
  * the wrong chain. mainnet/dev have no pinned id yet (mainnet is not onboarded).
  */
 const EXPECTED_NETWORK_ID: Partial<Record<NetworkType, number>> = {
-  testnet: 3,
+  // v1 cutover: 'testnet' is an alias of testnet2 (the v2 gateway network),
+  // so both expect the testnet2 trust base (networkId 4).
+  testnet: 4,
   testnet2: 4,
 };
 

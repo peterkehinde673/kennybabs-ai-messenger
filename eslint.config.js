@@ -19,19 +19,19 @@ export default tseslint.config(
       '@typescript-eslint/no-non-null-assertion': 'off',
     },
   },
-  // ── token-engine boundary (state-transition v2 migration) ──────────────────
-  // The v2 token SDK is an isolated dependency. Only token-engine/sdk.ts (the
-  // anti-corruption barrel) may import it; everything else imports from ./sdk
-  // re-exports. This keeps the SDK swap (npm alias -> canonical at cut-over) a
-  // one-file change and prevents v2 types leaking across the codebase.
+  // ── token-engine boundary ───────────────────────────────────────────────────
+  // The state-transition SDK is an isolated dependency. Only token-engine/sdk.ts
+  // (the anti-corruption barrel) may import it; everything else imports from
+  // ./sdk re-exports. This prevents SDK types leaking across the codebase and
+  // guards against ad-hoc deep imports creeping back in after the v1 removal.
   {
     rules: {
       'no-restricted-imports': ['error', {
         patterns: [
           {
-            group: ['state-transition-sdk-v2', 'state-transition-sdk-v2/*'],
+            group: ['@unicitylabs/state-transition-sdk', '@unicitylabs/state-transition-sdk/*'],
             message:
-              'Import the v2 state-transition SDK only via token-engine/sdk.ts. ' +
+              'Import the state-transition SDK only via token-engine/sdk.ts. ' +
               'Other modules must import from token-engine (the ITokenEngine port), not the SDK directly.',
           },
         ],

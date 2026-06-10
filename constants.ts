@@ -81,6 +81,13 @@ export const STORAGE_KEYS_ADDRESS = {
   TRANSACTION_HISTORY: 'transaction_history',
   /** Pending V5 finalization tokens (unconfirmed instant split tokens) */
   PENDING_V5_TOKENS: 'pending_v5_tokens',
+  /**
+   * FINISHED v2 token blobs awaiting transport delivery. Written the moment a
+   * transfer/split output is certified on-chain (the source is already spent),
+   * removed after successful delivery — survives transport failures + crashes
+   * so the recipient's token is never lost with the process.
+   */
+  PENDING_V2_DELIVERIES: 'pending_v2_deliveries',
   /** Group chat: joined groups for this address */
   GROUP_CHAT_GROUPS: 'group_chat_groups',
   /** Group chat: messages for this address */
@@ -403,14 +410,19 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
+  // v1 cutover: 'testnet' now POINTS AT TESTNET2 (the v2 gateway network). The
+  // old goggregator testnet spoke the removed v1 protocol — a v2 engine cannot
+  // run against it. 'testnet2' stays as an alias of the same configuration.
   testnet: {
-    name: 'Testnet',
-    aggregatorUrl: TEST_AGGREGATOR_URL,
-    nostrRelays: TEST_NOSTR_RELAYS,
+    name: 'Testnet2',
+    // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
+    aggregatorUrl: 'https://gateway.testnet2.unicity.network',
+    nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs/electrum)
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
-    tokenRegistryUrl: TOKEN_REGISTRY_URL,
+    tokenRegistryUrl:
+      'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
   },
   testnet2: {
     name: 'Testnet2',
@@ -423,6 +435,9 @@ export const NETWORKS = {
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
   },
+  // NOTE: mainnet/dev still point at v1-era aggregators. The v2 engine cannot
+  // operate against them until their gateways are cut over to the v2 protocol —
+  // wallet operations on these networks fail loudly (AGGREGATOR_ERROR) until then.
   dev: {
     name: 'Development',
     aggregatorUrl: DEV_AGGREGATOR_URL,

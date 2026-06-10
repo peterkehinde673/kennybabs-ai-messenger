@@ -30,10 +30,10 @@ describe('getNetworkConfig', () => {
     expect(config.aggregatorUrl).toBe(NETWORKS.mainnet.aggregatorUrl);
   });
 
-  it('should return testnet config when specified', () => {
+  it('should return testnet config when specified (alias of testnet2 since the v1 cutover)', () => {
     const config = getNetworkConfig('testnet');
-    expect(config.name).toBe('Testnet');
-    expect(config.aggregatorUrl).toBe(NETWORKS.testnet.aggregatorUrl);
+    expect(config.name).toBe('Testnet2');
+    expect(config.aggregatorUrl).toBe(NETWORKS.testnet2.aggregatorUrl);
   });
 
   it('should return dev config when specified', () => {

@@ -31,10 +31,11 @@ const V1_TESTNET_REGISTRY_FILE = 'unicity-ids.testnet.json';
 
 /**
  * Known expected trust-base networkId per network. mainnet's real id is unknown
- * until it exists; dev currently aliases testnet, so neither is pinned here.
+ * until it exists; dev currently aliases the old testnet, so neither is pinned
+ * here. Since the v1 cutover 'testnet' is an alias of testnet2 (networkId 4).
  */
 const EXPECTED_NETWORK_ID: Partial<Record<NetworkType, number>> = {
-  testnet: 3,
+  testnet: 4,
   testnet2: 4,
 };
 
@@ -78,9 +79,9 @@ describe.each(Object.keys(NETWORKS) as NetworkType[])('network "%s" config', (ne
   test('registry')(
     'registry URL names this network (no cross-network reuse of v1 testnet registry)',
     () => {
-      if (net !== 'testnet') {
-        expect(config.tokenRegistryUrl).not.toContain(V1_TESTNET_REGISTRY_FILE);
-      }
+      // v1 cutover: 'testnet' is an alias of testnet2 and must use the testnet2
+      // registry — NO network may point at the v1 testnet registry anymore.
+      expect(config.tokenRegistryUrl).not.toContain(V1_TESTNET_REGISTRY_FILE);
     },
   );
 

@@ -16,8 +16,6 @@ import { SphereError } from '../../core/errors';
 import type { Token } from '../../types';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import type { TokenReservationLedger } from './TokenReservationLedger';
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 import type { ITokenEngine } from '../../token-engine';
 import { decodeTokenBlob } from '../../token-engine/token-blob';
 import { hexToBytes } from '../../core/crypto';
@@ -46,7 +44,7 @@ export const QUEUE_MAX_SIZE = 100;
 /** A pre-parsed token with its SDK object and bigint amount already computed. */
 export interface ParsedTokenEntry {
   token: Token;
-  /** Opaque per-token handle: a v1 SdkToken (legacy path) or a v2 SphereToken (engine path). Pass-through only. */
+  /** Opaque per-token handle: a v2 SphereToken (engine path). Pass-through only. */
   sdkToken: unknown;
   amount: bigint;
 }
@@ -81,10 +79,9 @@ const TAG = 'SpendQueue';
 
 export class SpendPlanner {
   /**
-   * Token engine (path B). When injected, value reads go through the v2 engine
-   * (sdkData = engine blob); otherwise the legacy v1 SdkToken path is used. The
-   * engine is wired after construction via {@link setEngine} (it is bound to the
-   * payments deps, which arrive after the planner is built).
+   * Token engine (v2) — the only value-read path. The engine is wired after
+   * construction via {@link setEngine} (it is bound to the payments deps, which
+   * arrive after the planner is built).
    */
   private engine?: ITokenEngine;
 
@@ -102,11 +99,17 @@ export class SpendPlanner {
    * Called BEFORE the synchronous critical section.
    *
    * Filters to confirmed tokens matching the coinId, decodes each token's
-   * sdkData and extracts the bigint amount — via the v2 engine when injected,
-   * else the legacy v1 SdkToken path.
+   * sdkData (v2 engine blob) and extracts the bigint amount via the engine.
+   * Without an engine the pool is empty — sends fail with insufficient
+   * balance downstream; legacy v1 TXF tokens never enter the pool.
    */
   async buildParsedPool(tokens: Token[], coinId: string): Promise<ParsedTokenPool> {
     const pool: ParsedTokenPool = new Map();
+
+    if (!this.engine) {
+      logger.warn(TAG, 'buildParsedPool: no token engine — spendable pool is empty (v2 oracle config required)');
+      return pool;
+    }
 
     for (const t of tokens) {
       if (t.coinId !== coinId) continue;
@@ -114,9 +117,7 @@ export class SpendPlanner {
       if (!t.sdkData) continue;
 
       try {
-        const { sdkToken, amount } = this.engine
-          ? await this.parseViaEngine(t.sdkData, coinId)
-          : await this.parseViaSdk(t.sdkData, coinId);
+        const { sdkToken, amount } = await this.parseViaEngine(t.sdkData, coinId);
 
         if (amount <= 0n) {
           logger.warn(TAG, `Token ${t.id} has 0 balance for coinId ${coinId}`);
@@ -136,12 +137,6 @@ export class SpendPlanner {
   private async parseViaEngine(sdkData: string, coinId: string): Promise<{ sdkToken: unknown; amount: bigint }> {
     const token = await this.engine!.decodeToken(decodeTokenBlob(hexToBytes(sdkData)));
     return { sdkToken: token, amount: this.engine!.balanceOf(token, coinId) };
-  }
-
-  /** Legacy v1 path: sdkData is TXF JSON. */
-  private async parseViaSdk(sdkData: string, coinId: string): Promise<{ sdkToken: unknown; amount: bigint }> {
-    const sdkToken = await SdkToken.fromJSON(JSON.parse(sdkData));
-    return { sdkToken, amount: this.getTokenBalance(sdkToken, coinId) };
   }
 
   /**
@@ -332,17 +327,6 @@ export class SpendPlanner {
     }
 
     return entries;
-  }
-
-  /** Get balance of a specific coin from an SDK token. */
-  private getTokenBalance(sdkToken: SdkToken<any>, coinIdHex: string): bigint {
-    try {
-      if (!sdkToken.coins) return 0n;
-      const coinId = CoinId.fromJSON(coinIdHex);
-      return sdkToken.coins.get(coinId) ?? 0n;
-    } catch {
-      return 0n;
-    }
   }
 
   /** Create a direct transfer plan (no split needed). */

@@ -631,21 +631,15 @@ export interface AccountingModuleDependencies {
   payments: PaymentsModule;
   /** Token storage for invoice tokens (same provider as currency/nametag tokens) */
   tokenStorage: TokenStorageProvider;
-  /** Oracle for minting invoice tokens (also provides stateTransitionClient via getStateTransitionClient()) */
+  /** Oracle (network/trust-base config source for the token engine) */
   oracle: OracleProvider;
-  /**
-   * Trust base for aggregator proof verification.
-   * Required by waitInclusionProof() and Token.mint() during invoice minting.
-   * Follows the same pattern as NametagMinterConfig.trustBase.
-   * Obtained via the oracle/aggregator configuration at init time.
-   */
-  trustBase: unknown;
   /** Current wallet identity */
   identity: FullIdentity;
   /**
-   * Token engine (v2). Optional during migration (path B): when provided,
-   * invoice tokens are minted via engine.mintDataToken (a data token); otherwise
-   * the legacy v1 hand-rolled mint is used. Wired by Sphere once A4-int lands.
+   * Token engine (v2). Required for invoice create/import — invoices are minted
+   * as v2 data tokens (engine.mintDataToken) and verified via engine.verify.
+   * Optional in the type so read-only accounting (status/history queries over
+   * already-stored invoices) keeps working without an engine.
    */
   tokenEngine?: ITokenEngine;
   /**
