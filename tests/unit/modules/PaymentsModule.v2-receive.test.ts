@@ -22,7 +22,7 @@ import type { V2TransferPayload } from '../../../types/v2-transfer';
 const FAKE_PRIVATE_KEY = 'a'.repeat(64);
 const FAKE_PUBKEY = '02' + 'b'.repeat(64);
 const SENDER_TRANSPORT_PUBKEY = 'cc'.repeat(32);
-const RECIPIENT = new Uint8Array([0x02, ...new Array<number>(32).fill(7)]); // 33 bytes
+const FOREIGN_PUBKEY = new Uint8Array([0x02, ...new Array<number>(32).fill(7)]); // 33 bytes, NOT this wallet
 const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
 const BOB_CHAIN_PUBKEY = '02' + 'ee'.repeat(32); // recipient's 33-byte chain pubkey (hex)
 
@@ -123,8 +123,9 @@ function setup(engine = new FakeTokenEngine()) {
 
 async function v2Payload(
   engine: FakeTokenEngine, coinId: string, amount: bigint, memo?: string,
+  recipientPubkey: Uint8Array = engine.getIdentity().chainPubkey,
 ): Promise<V2TransferPayload> {
-  const st = await engine.mint({ recipientPubkey: RECIPIENT, value: { assets: [{ coinId, amount }] } });
+  const st = await engine.mint({ recipientPubkey, value: { assets: [{ coinId, amount }] } });
   return { type: 'V2_TRANSFER', version: '2.0', tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(st))), memo };
 }
 
@@ -175,6 +176,28 @@ describe('handleV2Transfer — v2 receiver (B1)', () => {
 
     expect(module.getTokens()).toHaveLength(1);
   });
+
+  it('rejects a token that fails engine verification (not stored, no event)', async () => {
+    class RejectingEngine extends FakeTokenEngine {
+      public override verify() {
+        return Promise.resolve({ ok: false, reason: 'NOT_AUTHENTICATED' });
+      }
+    }
+    const { module, engine, emitEvent } = setup(new RejectingEngine());
+    await deliver(module, await v2Payload(engine as FakeTokenEngine, UCT, 100n));
+
+    expect(module.getTokens()).toHaveLength(0);
+    expect(emitEvent.mock.calls.find((c: any[]) => c[0] === 'transfer:incoming')).toBeUndefined();
+    expect(module.getHistory().filter((h) => h.type === 'RECEIVED')).toHaveLength(0);
+  });
+
+  it('rejects a token whose final state is owned by a FOREIGN pubkey (not stored)', async () => {
+    const { module, engine, emitEvent } = setup();
+    await deliver(module, await v2Payload(engine, UCT, 100n, undefined, FOREIGN_PUBKEY));
+
+    expect(module.getTokens()).toHaveLength(0);
+    expect(emitEvent.mock.calls.find((c: any[]) => c[0] === 'transfer:incoming')).toBeUndefined();
+  });
 });
 
 describe('send — v2 engine path, whole-token (B1)', () => {
@@ -208,9 +231,10 @@ describe('send — v2 engine path, whole-token (B1)', () => {
     await deliver(module, await v2Payload(engine, UCT, 100n));
     await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
 
-    // Feed the emitted V2_TRANSFER into a fresh recipient wallet (same engine fixture).
+    // Feed the emitted V2_TRANSFER into a fresh recipient wallet (bob's identity,
+    // matching the transferred token's new owner predicate).
     const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
-    const recipient = setup(engine);
+    const recipient = setup(new FakeTokenEngine({ chainPubkey: hexToBytes(BOB_CHAIN_PUBKEY) }));
     await deliver(recipient.module, sentPayload);
 
     expect(recipient.module.getTokens()).toHaveLength(1);
@@ -231,10 +255,10 @@ describe('send — v2 engine path, whole-token (B1)', () => {
     expect(tokens[0].amount).toBe('700');
     expect(tokens[0].status).toBe('confirmed');
 
-    // Recipient's V2_TRANSFER decodes to a 300 token.
+    // Recipient's V2_TRANSFER decodes to a 300 token (bob's wallet owns it).
     const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
     expect(sentPayload.type).toBe('V2_TRANSFER');
-    const recipient = setup(engine);
+    const recipient = setup(new FakeTokenEngine({ chainPubkey: hexToBytes(BOB_CHAIN_PUBKEY) }));
     await deliver(recipient.module, sentPayload);
     expect(recipient.module.getTokens()[0].amount).toBe('300');
   });

@@ -5499,6 +5499,19 @@ export class PaymentsModule {
       return;
     }
 
+    // Security: the sender hands us a FINISHED token — verify it cryptographically
+    // and confirm its final state is actually locked to this wallet before it
+    // enters the balance. Both checks are local (trust base + predicate bytes).
+    const verdict = await engine.verify(token);
+    if (!verdict.ok) {
+      logger.warn('Payments', `V2 transfer rejected: verification failed (${verdict.reason ?? 'unknown'})`);
+      return;
+    }
+    if (!engine.isOwnedBy(token, engine.getIdentity().chainPubkey)) {
+      logger.warn('Payments', 'V2 transfer rejected: token not addressed to this wallet');
+      return;
+    }
+
     // Dedup by genesis-stable id (a re-delivered identical token is ignored).
     const id = `v2_${engine.tokenId(token)}`;
     if (this.tokens.has(id)) {
