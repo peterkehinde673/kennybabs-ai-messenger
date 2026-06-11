@@ -42,8 +42,10 @@ import type {
   TokenBlob,
   TransferParams,
 } from '../../../token-engine';
+import { sha256 } from '@noble/hashes/sha2.js';
+
 import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
-import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
+import { TOKEN_BLOB_VERSION, decodeTokenBlob } from '../../../token-engine/token-blob';
 
 const DEFAULT_PUBKEY = new Uint8Array([0x02, ...new Array<number>(32).fill(0)]); // 33 bytes
 
@@ -193,6 +195,17 @@ export class FakeTokenEngine implements ITokenEngine {
     return token.blob;
   }
 
+  /**
+   * @inheritDoc — fake-world derivation: sha256 over the inner token bytes.
+   * Internally CONSISTENT across the fake engine + fake server + helpers; the
+   * REAL derivation (SDK state-hash imprint) is pinned by the real-engine test
+   * in delivery-keys.test.ts and, end-to-end, by the cross-repo harness.
+   */
+  public deliveryKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> {
+    const blob = decodeTokenBlob(blobBytes);
+    return Promise.resolve({ tokenId: blob.tokenId, stateHash: bytesToHexLocal(sha256(blob.token)) });
+  }
+
   public decodeToken(blob: TokenBlob): Promise<SphereToken> {
     return Promise.resolve({ sdkToken: handleFor(blob.token), blob, value: valueOf(decodeFakeState(blob.token)) });
   }
@@ -231,6 +244,25 @@ export class FakeTokenEngine implements ITokenEngine {
       throw new Error('FakeTokenEngine: token already spent');
     }
     this.spent.add(id);
+  }
+}
+
+/**
+ * Decode a fake inner-token state's value — the injectable `decodeAssets`
+ * port for FakeWalletApi (the §8.2 step-6 stand-in), so wallet-api
+ * integration tests can run PaymentsModule + FakeTokenEngine against the
+ * fake backend's deposit/apply validation pipeline.
+ */
+export function decodeFakeTokenAssets(
+  tokenBytes: Uint8Array
+): { coinId: string; amount: bigint }[] | null {
+  try {
+    const state = decodeFakeState(tokenBytes);
+    if (!state.genesisData || !isSpherePaymentData(state.genesisData)) return null;
+    const value = SpherePaymentData.fromCBOR(state.genesisData).toValue();
+    return value.assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
+  } catch {
+    return null;
   }
 }
 
@@ -294,4 +326,8 @@ function assertConserved(source: SphereValue, outputs: SplitParams['outputs']): 
       throw new Error(`FakeTokenEngine: split is not value-conserving for coin ${coin}`);
     }
   }
+}
+
+function bytesToHexLocal(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
