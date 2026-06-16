@@ -160,6 +160,18 @@ export class WalletApiClient {
   private jwt: string | null = null;
   /** Serializes concurrent re-auth attempts. */
   private authInFlight: Promise<void> | null = null;
+  /**
+   * #583: monotonic auth-session counter. Bumped by every {@link setIdentity}
+   * and {@link logout}. A sign-in/refresh attempt captures it at its START and
+   * bails before any shared-state mutation (`this.jwt`, the refresh token) if it
+   * no longer matches — i.e. the identity moved on while the attempt was async,
+   * so its result is stale and would contaminate the new owner. See
+   * {@link isStale}.
+   */
+  private authGeneration = 0;
+
+  /** The construction config, retained so {@link clone} can mint a sibling. */
+  private readonly config: WalletApiClientConfig;
 
   constructor(config: WalletApiClientConfig) {
     const url = assertSecureBaseUrl(config.baseUrl);
@@ -178,12 +190,39 @@ export class WalletApiClient {
       config.fetchFn ?? ((u, init) => (globalThis as unknown as { fetch: FetchLike }).fetch(u, init));
     this.wsFactory = config.webSocketFactory ?? defaultWebSocketFactory;
     this.now = config.now ?? (() => Date.now());
+    this.config = config;
+  }
+
+  /**
+   * #583: mint a FRESH, identity-less sibling client from the SAME construction
+   * config (baseUrl, network, deviceId, storage, fetch/ws factories, clock).
+   * Per-address client isolation builds one client per HD address from this, so
+   * each address's providers authenticate as their OWN owner with their OWN JWT
+   * — an orphaned previous-address poll pump can never drive a client that has
+   * been re-authed to a DIFFERENT owner. The shared `storage` is intentional:
+   * its keys are namespaced per (network, chainPubkey, deviceId), so per-owner
+   * refresh tokens / cursors stay separate (no cross-owner collision). The clone
+   * starts with no identity and no JWT — the caller binds it via setIdentity.
+   */
+  clone(): WalletApiClient {
+    return new WalletApiClient(this.config);
   }
 
   /** Bind the wallet identity this client authenticates as. Resets the session. */
   setIdentity(identity: WalletApiIdentity): void {
     this.identity = identity;
     this.jwt = null;
+    // #583: invalidate any in-flight sign-in for the PREVIOUS identity. Nulling
+    // `authInFlight` only drops our reference — the orphaned challenge→sign /
+    // refresh chain keeps running and could STILL resolve later, at which point
+    // it would (a) cache `this.jwt` for the wrong owner and (b) write/clear the
+    // refresh token under `refreshTokenKey()`, which is now derived from the NEW
+    // identity — cross-owner contamination. Bumping `authGeneration` makes those
+    // late mutations self-cancel: every attempt captured the generation at its
+    // start and `isStale()`-guards each shared-state write, so a stale chain
+    // discards its result instead of clobbering the new owner's session.
+    this.authGeneration += 1;
+    this.authInFlight = null;
   }
 
   // ── storage keys (scoped per network + pubkey + device) ────────────────────
@@ -202,6 +241,16 @@ export class WalletApiClient {
     return `${this.scopedKey('refresh')}:${this.deviceId}`;
   }
 
+  /**
+   * #583: true once the identity has moved on since `gen` was captured (a
+   * {@link setIdentity}/{@link logout} bumped {@link authGeneration}). A sign-in
+   * attempt checks this before every mutation of `this.jwt` or the refresh token
+   * and bails out when stale — its tokens belong to a now-discarded owner.
+   */
+  private isStale(gen: number): boolean {
+    return this.authGeneration !== gen;
+  }
+
   // ── auth (ARCHITECTURE §4) ──────────────────────────────────────────────────
 
   /**
@@ -210,15 +259,30 @@ export class WalletApiClient {
    */
   async signIn(): Promise<void> {
     if (this.authInFlight) return this.authInFlight;
-    this.authInFlight = this.signInInner().finally(() => {
-      this.authInFlight = null;
+    // #583: bind this attempt to the CURRENT auth generation. A later
+    // setIdentity()/logout() bumps the generation; the attempt then self-cancels
+    // before mutating shared state (see `signInInner`/`tryRefresh`/`challengeSignIn`).
+    const gen = this.authGeneration;
+    const inFlight = this.signInInner(gen).finally(() => {
+      // #583: only clear the slot if it still holds THIS promise. setIdentity()
+      // may null `authInFlight` (abandoning a stale sign-in) and a fresh signIn()
+      // may have stored a NEW promise; an unconditional clear here would clobber
+      // that newer in-flight sign-in and break the de-dup guarantee.
+      if (this.authInFlight === inFlight) this.authInFlight = null;
     });
-    return this.authInFlight;
+    this.authInFlight = inFlight;
+    return inFlight;
   }
 
-  private async signInInner(): Promise<void> {
-    if (await this.tryRefresh()) return;
-    await this.challengeSignIn();
+  private async signInInner(gen: number): Promise<void> {
+    if (await this.tryRefresh(gen)) return;
+    // #583: `tryRefresh` returns false for TWO reasons — a genuine refresh miss
+    // (no/expired token) OR the identity moved on mid-refresh (`isStale`). In the
+    // stale case we must NOT fall through to a challenge→verify cycle: it would
+    // run under the NEW owner, hit the network, possibly throw, and be discarded
+    // by `challengeSignIn`'s own end-guard anyway. Bail cleanly instead.
+    if (this.isStale(gen)) return;
+    await this.challengeSignIn(gen);
   }
 
   /**
@@ -226,24 +290,34 @@ export class WalletApiClient {
    * 4xx (expired, revoked, rotation-reuse revocation) clears the stored token
    * and reports `false` — the caller falls back to a challenge cycle.
    */
-  private async tryRefresh(): Promise<boolean> {
-    const stored = await this.storage.get(this.refreshTokenKey());
+  private async tryRefresh(gen: number): Promise<boolean> {
+    // #583: capture the refresh-token key NOW. The whole attempt operates on
+    // THIS owner's key; a mid-flight identity switch repoints `refreshTokenKey()`
+    // at the new owner, so we must never read or write under the new key here.
+    const key = this.refreshTokenKey();
+    const stored = await this.storage.get(key);
     if (!stored) return false;
     const res = await this.rawFetch('POST', '/v1/auth/refresh', { refreshToken: stored });
+    // The identity may have moved on while the request was in flight — discard
+    // the result rather than caching the previous owner's JWT / refresh token.
+    if (this.isStale(gen)) return false;
     if (res.status === 200) {
       const tokens = parseAuthTokens(await this.readJson(res, 'auth/refresh'));
       this.jwt = tokens.jwt;
-      await this.storage.set(this.refreshTokenKey(), tokens.refreshToken);
+      await this.storage.set(key, tokens.refreshToken);
       return true;
     }
     // Stale/revoked/reused token — discard it; a fresh challenge cycle follows.
-    await this.storage.remove(this.refreshTokenKey());
+    await this.storage.remove(key);
     return false;
   }
 
   /** The challenge→verify cycle (§4 steps 1–3) with template verification (S1). */
-  private async challengeSignIn(): Promise<void> {
+  private async challengeSignIn(gen: number): Promise<void> {
     const identity = this.requireIdentity();
+    // #583: pin the refresh-token key to THIS owner up front (it is derived from
+    // the identity); a mid-flight switch must not write under the new owner's key.
+    const key = this.refreshTokenKey();
     const challengeRes = await this.rawFetch('POST', '/v1/auth/challenge', {
       pubkey: identity.chainPubkey,
     });
@@ -266,12 +340,20 @@ export class WalletApiClient {
     });
     if (verifyRes.status !== 200) throw await this.toError(verifyRes, 'auth/verify');
     const tokens = parseAuthTokens(await this.readJson(verifyRes, 'auth/verify'));
+    // The identity may have switched while challenge→verify was in flight —
+    // discard this owner's freshly-minted session instead of caching the JWT /
+    // persisting the refresh token under the new owner's storage key.
+    if (this.isStale(gen)) return;
     this.jwt = tokens.jwt;
-    await this.storage.set(this.refreshTokenKey(), tokens.refreshToken);
+    await this.storage.set(key, tokens.refreshToken);
   }
 
   /** Revoke the session server-side and drop all local credentials. */
   async logout(): Promise<void> {
+    // #583: invalidate any in-flight sign-in so it cannot re-cache a JWT or
+    // re-persist the refresh token after we have just dropped them.
+    this.authGeneration += 1;
+    this.authInFlight = null;
     if (this.jwt) {
       try {
         await this.rawFetch('POST', '/v1/auth/logout', {}, this.jwt);

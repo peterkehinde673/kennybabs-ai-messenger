@@ -133,6 +133,35 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     this.hadSuccessfulLoad = false;
   }
 
+  /**
+   * #583 per-address client isolation: mint an INDEPENDENT provider for a
+   * different HD address. Each address's storage provider drives its OWN
+   * identity-bound client — an orphaned previous-address poll pump can never
+   * serve inventory from a client re-authed to a different owner (the
+   * address-switch bleed class collapses).
+   *
+   * `sharedClient` (Sphere threads it): the address's ALREADY-built client — the
+   * one backing its delivery provider + walletApi session. Reusing it makes ALL
+   * of an address's wallet-api artifacts share ONE client and ONE refresh-token
+   * rotation lineage. Two sibling clients of the SAME owner+deviceId over the
+   * shared stateStore would otherwise rotate the SAME refresh token and trip the
+   * server's rotation-reuse revocation (§4). A bare clone is the fallback when
+   * no shared client is threaded. The client starts identity-less here;
+   * `setIdentity` binds it before it serves inventory. The shared `stateStore`
+   * is fine — keys are namespaced per (network, chainPubkey), so per-owner
+   * cursors / known-spend sets stay separate.
+   */
+  createForAddress(sharedClient?: unknown): WalletApiTokenStorageProvider {
+    // The generic TokenStorageProvider contract types the context as `unknown`;
+    // for this provider it is the address's WalletApiClient (or absent → clone).
+    const client = sharedClient instanceof WalletApiClient ? sharedClient : this.client.clone();
+    return new WalletApiTokenStorageProvider({
+      client,
+      stateStore: this.stateStore,
+      verifyToken: this.verifyToken,
+    });
+  }
+
   async initialize(): Promise<boolean> {
     this.status = 'connected';
     return true;

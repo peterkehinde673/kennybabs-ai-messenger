@@ -304,9 +304,26 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
    * Create a new independent instance of this provider for a different address.
    * Used by per-address module architecture — each address gets its own
    * TokenStorageProvider instance to avoid cross-address data contamination.
-   * If not implemented, the provider cannot be used in multi-address mode.
+   *
+   * Omitting `createForAddress` is safe ONLY for **stateless or identity-keyed**
+   * providers — ones that re-scope correctly when `Sphere.buildAddressTokenProviders`
+   * falls back to reusing the single instance and re-binding it via `setIdentity`
+   * (e.g. a local provider that namespaces every read/write by the active
+   * identity). A provider that holds **per-address mutable state** (cursors,
+   * caches, an embedded `WalletApiClient`, etc.) and does NOT implement
+   * `createForAddress` is UNSAFE in multi-address mode: the fallback hands every
+   * address the same instance and a stale-address poll/sync can bleed into the
+   * newly bound address. Such providers MUST implement `createForAddress`.
+   *
+   * `sharedClient` (#583): an optional, provider-specific per-address context —
+   * for wallet-api-backed providers it is the address's already-built
+   * `WalletApiClient`, so all of an address's wallet-api artifacts share ONE
+   * client + one refresh-token lineage (separate sibling clients of the same
+   * owner+deviceId would trip the server's rotation-reuse revocation). Typed as
+   * `unknown` to keep this generic storage contract decoupled from the
+   * wallet-api layer; providers that don't need it ignore the argument.
    */
-  createForAddress?(): TokenStorageProvider<TData>;
+  createForAddress?(sharedClient?: unknown): TokenStorageProvider<TData>;
 
   /**
    * Subscribe to storage events
