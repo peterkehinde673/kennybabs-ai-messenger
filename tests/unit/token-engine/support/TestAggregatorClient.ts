@@ -60,30 +60,35 @@ export class TestAggregatorClient implements IAggregatorClient {
 
   /**
    * @inheritDoc
+   *
+   * Fidelity note: the proof is REBUILT from the live SMT on every request —
+   * fresh sibling path + a fresh UnicityCertificate over the CURRENT root.
+   * This matches the real aggregator (aggregator-go rebuilds per request;
+   * confirmed by owner analysis on st-sdk#126, closed as invalid): only the
+   * stored CertificationData is stable across refetches. Consequence for
+   * resume flows: a proof refetched after later submissions differs
+   * byte-wise from the original — match on certificationData /
+   * transactionHash, never on proof bytes (sdk-changes E.2, sphere-sdk#501).
    */
   public async getInclusionProof(stateId: StateId): Promise<InclusionProofResponse> {
     const path = BitString.fromBytesReversedLSB(stateId.data).toBigInt();
     const root = await this.smt.calculateRoot();
 
-    if (!this.requests.has(path)) {
-      return Promise.resolve(
-        new InclusionProofResponse(
-          1n,
-          new InclusionProof(null, null, await createUnicityCertificate(root.hash, this.signingService)),
-        ),
+    const certificationData = this.requests.get(path);
+    if (certificationData === undefined) {
+      return new InclusionProofResponse(
+        1n,
+        new InclusionProof(null, null, await createUnicityCertificate(root.hash, this.signingService)),
       );
     }
-
-    const certificationData = this.requests.get(path);
-
-    return Promise.resolve(
-      new InclusionProofResponse(
-        1n,
-        new InclusionProof(
-          certificationData ?? null,
-          InclusionCertificate.create(root, stateId.data),
-          await createUnicityCertificate(root.hash, this.signingService),
-        ),
+    // Recomputed from the CURRENT tree per request — like the real aggregator
+    // (fresh siblings + latest UC); only certificationData is stable (#126).
+    return new InclusionProofResponse(
+      1n,
+      new InclusionProof(
+        certificationData,
+        InclusionCertificate.create(root, stateId.data),
+        await createUnicityCertificate(root.hash, this.signingService),
       ),
     );
   }
@@ -107,8 +112,7 @@ export class TestAggregatorClient implements IAggregatorClient {
 
     const path = BitString.fromBytesReversedLSB(stateId.data).toBigInt();
     if (!this.requests.has(path)) {
-      const leafValue = certificationData.transactionHash;
-      await this.smt.addLeaf(stateId.data, leafValue.data);
+      await this.smt.addLeaf(stateId.data, certificationData.transactionHash.data);
       this.requests.set(path, certificationData);
     }
 

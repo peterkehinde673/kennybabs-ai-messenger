@@ -41,8 +41,23 @@ export { deriveDirectAddress } from './identity';
 // The concrete adapter factory (A4) — the public way to obtain an ITokenEngine.
 export { createSphereTokenEngine } from './factory';
 
+// Typed conflict surface of the recoverable engine (Part E.2): the source state
+// was consumed by a DIFFERENT transaction — a lost race, not a resume. Callers
+// abort the intent and re-plan under a new transferId.
+export { TransferConflictError } from './errors';
+
 // Self-issued Unicity ID (nametag) token mint — the v2 analog of the v1
 // nametag mint, stored at registration but unused at runtime (D5 + user
 // decision 2026-06-10; see unicity-id.ts header).
 export { createUnicityIdMinter } from './unicity-id';
 export type { IUnicityIdMinter, UnicityIdMintResult } from './unicity-id';
+
+// The SpherePaymentData codec (CBOR tag 39050) — the value envelope inside
+// Sphere tokens. Exported via the `./token-engine` subpath so server-side
+// consumers (wallet-api deposit validation) can decode token values without
+// pulling the browser/IPFS/Nostr dependency closure of the root entry.
+export {
+  SpherePaymentData,
+  decodeSpherePaymentData,
+  sphereAssetToSdk,
+} from './SpherePaymentData';

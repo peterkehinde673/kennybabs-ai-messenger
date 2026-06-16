@@ -56,6 +56,7 @@ export type {
   SphereInitOptions,
   SphereInitResult,
   SphereImportOptions,
+  SphereWalletApiSession,
   InitProgressStep,
   InitProgress,
   InitProgressCallback,
@@ -155,7 +156,71 @@ export type {
   TxfOutboxEntry,
   TxfSentEntry,
   TxfInvalidEntry,
+  // Lazy inventory port (sdk-changes S2)
+  InventoryAsset,
+  InventoryItem,
+  InventoryView,
+  ApplyDeltaAdded,
+  ApplyDeltaOptions,
+  RecoverRemovedResult,
+  WholeBlobStore,
 } from './storage';
+
+// Default lazy-port adapter for whole-blob providers (sdk-changes S2)
+export { WholeBlobInventoryAdapter } from './storage';
+
+// =============================================================================
+// Wallet-api client (sdk-changes S1) & field encryption (S6)
+// =============================================================================
+
+export {
+  WalletApiClient,
+  WalletApiError,
+  ChallengeTemplateError,
+  AUTH_CHALLENGE_PREFIX,
+  verifyChallengeTemplate,
+} from './wallet-api';
+export type {
+  WalletApiErrorCode,
+  WalletApiClientConfig,
+  WalletApiIdentity,
+  KeyValueStore,
+  InventoryPage,
+  CoinBalance,
+  BlobUrlEntry,
+  UploadUrlRequest,
+  UploadUrlEntry,
+  ApplyDeltaRequest,
+  IntentRecord,
+  WakeEvent,
+  WakeCallback,
+  WakeSocketHandle,
+} from './wallet-api';
+
+export {
+  deriveFieldEncryptionKey,
+  encryptField,
+  decryptField,
+  assertFieldEnvelopeShape,
+  FIELD_ENCRYPTION_HKDF_INFO,
+  FIELD_ENVELOPE_PREFIX,
+  FIELD_ENVELOPE_NONCE_BYTES,
+  FIELD_ENVELOPE_MAX_BYTES,
+} from './core';
+
+// Delivery port (sdk-changes S7) — the swappable seam for handing finished
+// token blobs to recipients (covenant §3.1-6); wallet-api's mailbox provider
+// (impl/shared/wallet-api) is the reference implementation.
+export { computeDeliveryId, composeDeliveryKeys } from './transport';
+export type {
+  DeliveryProvider,
+  DeliveryReceipt,
+  DeliverOptions,
+  IncomingDelivery,
+  DeliveryDisposition,
+  DeliveryCustody,
+  DeliveryBlobKeys,
+} from './transport';
 
 export type {
   // Transport
@@ -198,6 +263,7 @@ export {
 export type {
   PaymentsModuleConfig,
   PaymentsModuleDependencies,
+  PaymentsWalletApiPort,
   ReceiveOptions,
   ReceiveResult,
   TransactionHistoryEntry,

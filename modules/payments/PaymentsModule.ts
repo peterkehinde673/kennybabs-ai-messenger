@@ -30,7 +30,8 @@ import type {
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
-import type { ITokenEngine, SphereToken } from '../../token-engine';
+import type { ITokenEngine, SphereToken, TokenBlob } from '../../token-engine';
+import { TransferConflictError } from '../../token-engine';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -44,6 +45,14 @@ import type {
   IncomingPaymentRequest as TransportPaymentRequest,
   IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
+import type { DeliveryProvider, IncomingDelivery, WakeStream } from '../../transport/delivery-provider';
+import { TransportDeliveryAdapter } from './TransportDeliveryAdapter';
+import { deriveFieldEncryptionKey, encryptField, decryptField } from '../../core/field-encryption';
+import {
+  deriveDeliveryEncryptionKey,
+  encryptDeliveryBundle,
+  decryptDeliveryBundle,
+} from '../../core/delivery-envelope';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import type {
@@ -67,7 +76,8 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
-import { decodeTokenBlob, encodeTokenBlob } from '../../token-engine/token-blob';
+import { sleep } from '../../core/utils';
+import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // =============================================================================
@@ -96,12 +106,51 @@ function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: str
 const MAX_SYNCED_HISTORY_ENTRIES = 5000;
 
 /**
+ * Cap on the number of newest-first keyset pages pulled when rebuilding history
+ * from the server on reload (the wallet-api composition). At the §16 page limit
+ * this bounds a single hydration well past any realistic wallet's recent
+ * history while staying finite if the server ever mis-reports `more`.
+ */
+const MAX_HISTORY_HYDRATION_PAGES = 100;
+
+/**
+ * Cap on the number of gap-free `?since=` pages pulled when rebuilding the
+ * incoming payment-request view from the server on reload (the wallet-api
+ * composition — the #556 reload fix). At the §16 page limit this bounds a
+ * single hydration past any realistic payer's request history while staying
+ * finite if the server ever mis-reports `more`. Mirrors
+ * {@link MAX_HISTORY_HYDRATION_PAGES}.
+ */
+const MAX_PR_HYDRATION_PAGES = 100;
+
+/**
  * Overall timeout for a single engine transfer/split during send(). Overrides
  * the SDK's 10s default inclusion-proof abort — a slow aggregator must get a
  * fair window, because once the certification is submitted the source state is
  * spent on-chain and an early abort strands the finished token.
  */
 const SEND_ENGINE_OP_TIMEOUT_MS = 60_000;
+
+/**
+ * Incoming-delivery poll interval (sdk-changes S3). The pull is the
+ * correctness path; the optional wake hook only shortens latency (§9 — a
+ * dropped wake can never cause divergence).
+ */
+const DELIVERY_POLL_INTERVAL_MS = 30_000;
+
+/**
+ * Bounded replay budget for journaled finished-but-undelivered v2 blobs (#517
+ * item 1). Each load()'s replay pass makes at most {@link DELIVERY_REPLAY_RETRIES}
+ * + 1 attempts per entry with exponential backoff; the cumulative failed-attempt
+ * count is journaled across loads. Once it reaches
+ * {@link MAX_DELIVERY_REPLAY_ATTEMPTS} (inclusive) the entry is surfaced as poison
+ * (`delivery:undeliverable`) and left journaled but no longer auto-retried —
+ * the deposit is idempotent, so a later app version may still land it.
+ */
+const DELIVERY_REPLAY_RETRIES = 2;
+const MAX_DELIVERY_REPLAY_ATTEMPTS = 6;
+const DELIVERY_REPLAY_BASE_DELAY_MS = 1_000;
+const DELIVERY_REPLAY_MAX_DELAY_MS = 8_000;
 
 /**
  * A FINISHED v2 token blob awaiting transport delivery. Journaled the moment
@@ -116,6 +165,29 @@ interface PendingV2Delivery {
   tokenBlob: string;
   memo?: string;
   createdAt: number;
+  /**
+   * Cumulative failed replay attempts across load()s. Surfaced as poison and
+   * marked `undeliverable` once it reaches {@link MAX_DELIVERY_REPLAY_ATTEMPTS}
+   * so journaled blobs never sit undelivered invisibly (#517).
+   */
+  attempts?: number;
+  /** Set once the entry is surfaced as poison; it stays journaled but is no longer auto-retried. */
+  undeliverable?: boolean;
+}
+
+/** Running per-coin totals folded by {@link PaymentsModule.aggregateTokens}. */
+interface AssetAccumulator {
+  coinId: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  iconUrl?: string;
+  confirmedAmount: bigint;
+  unconfirmedAmount: bigint;
+  transferringAmount: bigint;
+  confirmedTokenCount: number;
+  unconfirmedTokenCount: number;
+  transferringTokenCount: number;
 }
 
 // =============================================================================
@@ -300,6 +372,11 @@ export async function parseTokenInfo(tokenData: unknown, engine?: ITokenEngine):
 // Cache parsed sdkData fields to avoid repeated JSON.parse in hot loops.
 // Key = sdkData string reference, value = { tokenId, stateHash }.
 // Cleared on address switch via clearSdkDataCache().
+// LOCAL-namespace keys ONLY (journal/tombstone dedup): this stateHash is a
+// plain sha256 over the token bytes — it is NOT the protocol state hash the
+// backend uses (that is token-engine deriveDeliveryKeys / the SDK imprint).
+// Both writers and readers of these keys use THIS function; never mix the two
+// derivations in one comparison.
 const sdkDataCache = new Map<string, { tokenId: string | null; stateHash: string }>();
 const SDK_DATA_CACHE_MAX = 2000;
 
@@ -593,6 +670,164 @@ export interface ProofPollingJob {
 }
 
 // =============================================================================
+// wallet-api port (sdk-changes E.3/S2/S4 — the slice PaymentsModule consumes)
+// =============================================================================
+
+/** §16 payment-request wire record (structural mirror of `wallet-api/types.ts`). */
+export interface WalletApiPaymentRequest {
+  id: string;
+  /** Per-payer gap-free, commit-ordered seq (§9/§10) — the incoming cursor unit. */
+  seq: bigint;
+  fromPubkey: string;
+  toPubkey: string;
+  assets: { coinId: string; amount: bigint }[];
+  /** S6 `enc1.` envelope, verbatim — decrypts only under the requester's wallet key. */
+  memo?: string;
+  status: 'open' | 'paid' | 'declined' | 'expired';
+  transferId: string | null;
+  createdAt: number;
+  expiresAt?: number;
+}
+
+/** §16 list query — the two role views carry DIFFERENT cursor families (never mixed). */
+export type WalletApiListPaymentRequestsParams =
+  | { role: 'incoming'; status?: 'open' | 'paid' | 'declined' | 'expired'; since?: bigint }
+  | { role: 'outgoing'; status?: 'open' | 'paid' | 'declined' | 'expired'; before?: string };
+
+/** §16 list page, discriminated by the requested role. */
+export type WalletApiPaymentRequestsPage =
+  | {
+      role: 'incoming';
+      requests: WalletApiPaymentRequest[];
+      more: boolean;
+      /** The gap-free `?since=` seq cursor (§9/§16). */
+      cursor: bigint;
+      syncEpoch: bigint;
+    }
+  | {
+      role: 'outgoing';
+      requests: WalletApiPaymentRequest[];
+      more: boolean;
+      /** Opaque keyset for the next (older) page; null when drained (§16). */
+      cursor: string | null;
+      syncEpoch: bigint;
+    };
+
+/**
+ * One §16 history wire record (§10 — the server never writes history rows).
+ * `memo` / `counterpartyNametag` are S6 `enc1.` envelopes, verbatim (§8.3) —
+ * encrypted on POST, returned encrypted on GET, decrypted by the owner only.
+ */
+export interface WalletApiHistoryRecord {
+  dedupKey: string;
+  id: string;
+  type: string;
+  ts: string;
+  assets: { coinId: string; amount: string }[];
+  transferId?: string;
+  tokenId?: string;
+  counterpartyPubkey?: string;
+  memo?: string;
+  counterpartyNametag?: string;
+}
+
+/**
+ * The narrow, STRUCTURAL slice of the wallet-api client this module needs:
+ * the E.3 intent lifecycle, blob uploads for spend outputs, and the §10
+ * client-written history log. `WalletApiClient` satisfies it as-is; the
+ * module never imports the client (covenant §3.1-6 — no provider-specific
+ * logic outside implementations; the spec itself makes these endpoints the
+ * module's responsibility: sdk-changes E.3 + S2 consumer update).
+ */
+export interface PaymentsWalletApiPort {
+  /** E.3: persist the client-encrypted intent; MUST be awaited before the engine. */
+  putIntent(transferId: string, payloadEnvelope: string): Promise<void>;
+  /** E.3 uniform close — every finished send ends with this (idempotent). */
+  completeIntent(transferId: string): Promise<void>;
+  /** E.2 lost-race cleanup (soft, recoverable). */
+  abortIntent(transferId: string): Promise<void>;
+  /** E.3 resume: list open intents at sign-in (any device). */
+  listIntents(status: 'open' | 'aborted'): Promise<
+    { transferId: string; payload: string; status: 'open' | 'completed' | 'aborted'; createdAt: number }[]
+  >;
+  /** §5.2 checksum-bound presigned PUTs for spend outputs. */
+  getUploadUrls(
+    blobs: { sha256: string; size: number }[]
+  ): Promise<{ sha256: string; key: string; putUrl: string }[]>;
+  /** Upload to a presigned PUT (a 412 = already present = success — §5.2). */
+  uploadBlob(putUrl: string, bytes: Uint8Array): Promise<void>;
+  /** §10: client-asserted history records (§16 wire shape), deduped by dedupKey server-side. */
+  postHistoryRecords(records: WalletApiHistoryRecord[]): Promise<void>;
+  /**
+   * §10/§16: read the client-written history log back — newest-first keyset
+   * pages (`{records, more, cursor, syncEpoch}`). The READ side of the §10 log:
+   * a reloaded thin wallet rebuilds its history from here (the in-memory cache
+   * is process-lifetime; the durable log lives on the server). `memo` /
+   * `counterpartyNametag` come back as the verbatim S6 `enc1.` envelopes — the
+   * owner decrypts them with its own field key on display (§8.3).
+   */
+  listHistory(options?: { before?: string; limit?: number }): Promise<{
+    records: WalletApiHistoryRecord[];
+    more: boolean;
+    cursor: string | null;
+    syncEpoch: bigint;
+  }>;
+
+  // ── payment requests (sdk-changes S4 — §10/§16) — OPTIONAL capability ───────
+  // When the composed port carries all three endpoints (the S4 wallet-api
+  // presets do — `WalletApiClient` provides them), payment requests ride
+  // wallet-api and the Nostr payment-request channel is NOT installed.
+  // Compositions without them keep the transport path (port selection,
+  // covenant §3.1-6). Pre-S4 mocks/ports stay structurally conformant.
+
+  /** Network name — scopes the persisted payment-request cursor (mirrors the mailbox cursor). */
+  readonly network?: string;
+  /** `POST /v1/payment-requests` (§16) — `memo` MUST already be an S6 envelope (§8.3). */
+  createPaymentRequest?(input: {
+    toPubkey: string;
+    assets: { coinId: string; amount: bigint }[];
+    memo?: string;
+    expiresAt?: number;
+  }): Promise<WalletApiPaymentRequest>;
+  /** `GET /v1/payment-requests?role=` (§16) — role-bound cursor families. */
+  listPaymentRequests?<R extends 'incoming' | 'outgoing'>(
+    params: Extract<WalletApiListPaymentRequestsParams, { role: R }>
+  ): Promise<Extract<WalletApiPaymentRequestsPage, { role: R }>>;
+  /** `POST /v1/payment-requests/{id}/respond` (§16) — paid links the fulfilling transferId. */
+  respondPaymentRequest?(
+    id: string,
+    response: { action: 'paid'; transferId: string } | { action: 'declined' }
+  ): Promise<WalletApiPaymentRequest>;
+}
+
+/**
+ * The S4 capability slice once detected (see
+ * {@link PaymentsModule.paymentRequestsApi}) — the optional members above,
+ * required.
+ */
+type PaymentRequestsApi = Pick<PaymentsWalletApiPort, 'network'> &
+  Required<
+    Pick<PaymentsWalletApiPort, 'createPaymentRequest' | 'listPaymentRequests' | 'respondPaymentRequest'>
+  >;
+
+/** The decrypted E.3 intent payload (`{ sources, recipient, amounts }` concretized). */
+interface IntentPayloadV1 {
+  v: 1;
+  /** Recipient chain pubkey (33-byte compressed, hex). */
+  recipient: string;
+  coinId: string;
+  /** Requested amount (decimal string). */
+  amount: string;
+  memo?: string;
+  invoiceRefundAddress?: string;
+  invoiceContact?: { address: string; url?: string };
+  /** Genesis token ids transferred whole, in execution order. */
+  direct: string[];
+  /** The at-most-one split (ARCHITECTURE §7). */
+  split?: { tokenId: string; splitAmount: string; remainderAmount: string };
+}
+
+// =============================================================================
 // Dependencies Interface
 // =============================================================================
 
@@ -620,6 +855,76 @@ export interface PaymentsModuleDependencies {
   price?: PriceProvider;
   /** Set of disabled provider IDs — disabled providers are skipped during sync/save */
   disabledProviderIds?: ReadonlySet<string>;
+  /**
+   * Delivery port (sdk-changes S7). When provided, ASSET transfers ride it
+   * exclusively — outgoing via `deliver()`, incoming via `incoming()` (poll +
+   * wake) — and the transport's token-transfer subscription is NOT installed
+   * (S4: assets leave Nostr; DMs/group-chat/nametags stay). When absent, a
+   * {@link TransportDeliveryAdapter} preserves the legacy relay path through
+   * the same seam.
+   */
+  delivery?: DeliveryProvider;
+  /**
+   * wallet-api slice for the E.3 intent lifecycle, output uploads and §10
+   * history (see {@link PaymentsWalletApiPort}). Present in wallet-api
+   * compositions (full preset AND own-storage preset); absent in fully-local
+   * ones.
+   */
+  walletApi?: PaymentsWalletApiPort;
+  /** Current address's canonical display nametag (bare, no '@'), from the Sphere-level Nostr-backed store. Preferred over the local minted-token nametags[] for outgoing memos. */
+  getCurrentNametag?: () => string | undefined;
+}
+
+/** The provider {@link PaymentsModule.getActiveTokenStorageProvider} will pick:
+ * first non-disabled entry, mirroring getTokenStorageProviders' precedence. */
+function firstEnabledTokenStorage(
+  deps: PaymentsModuleDependencies
+): TokenStorageProvider<TxfStorageDataBase> | null {
+  const providers =
+    deps.tokenStorageProviders && deps.tokenStorageProviders.size > 0
+      ? [...deps.tokenStorageProviders.entries()]
+      : deps.tokenStorage
+        ? [[deps.tokenStorage.id, deps.tokenStorage] as const]
+        : [];
+  for (const [id, provider] of providers) {
+    if (!deps.disabledProviderIds?.has(id)) return provider;
+  }
+  return null;
+}
+
+/**
+ * Fail-closed composition invariant (#515 F1, sdk-changes S7): wallet-api
+ * CUSTODY artifacts — delivery custody `'inventory'` (acks write the server
+ * inventory) or an active token-storage provider that declares
+ * `requiresWalletApi` (the S2 thin provider) — are only legal WITH the
+ * wallet-api client. The E.3 intent barrier and §7 server apply are
+ * guard-by-presence on `deps.walletApi`, so an accidentally-degraded
+ * composition (e.g. a stale bundle dropping the client) would silently run
+ * local-custody semantics while the user believes wallet-api custody is
+ * active. Legal compositions (the composition.ts presets):
+ *  - fully local: no wallet-api artifacts, no client;
+ *  - FULL preset: thin storage + custody 'inventory' + client;
+ *  - OWN-STORAGE preset: own storage + custody 'external' + client.
+ * Own storage + custody 'external' WITHOUT a client stays legal (no custody
+ * artifact — delivery fails loudly at call time, nothing is silently lost).
+ */
+function assertLegalCustodyComposition(deps: PaymentsModuleDependencies): void {
+  if (deps.walletApi) return;
+  if (deps.delivery?.custody === 'inventory') {
+    throw new SphereError(
+      "Illegal composition (#515): delivery custody is 'inventory' (wallet-api server custody) but no `walletApi` client was provided — refusing to initialize. " +
+        "Pass the preset's `walletApi` to Sphere.init, or compose the own-storage preset (custody 'external').",
+      'INVALID_CONFIG'
+    );
+  }
+  const storage = firstEnabledTokenStorage(deps);
+  if (storage?.requiresWalletApi) {
+    throw new SphereError(
+      `Illegal composition (#515): the active token-storage provider '${storage.id}' keeps custody in the wallet-api backend but no \`walletApi\` client was provided — refusing to initialize. ` +
+        "Pass the preset's `walletApi` to Sphere.init, or compose a local storage provider.",
+      'INVALID_CONFIG'
+    );
+  }
 }
 
 // =============================================================================
@@ -665,6 +970,39 @@ export class PaymentsModule {
   private unsubscribePaymentRequests: (() => void) | null = null;
   private unsubscribePaymentRequestResponses: (() => void) | null = null;
 
+  // Delivery port (sdk-changes S3/S7)
+  /** The single delivery seam — an injected provider or the transport adapter. */
+  private delivery: DeliveryProvider | null = null;
+  /** Set only when a provider was INJECTED — gates the incoming pump (S3). */
+  private injectedDelivery: DeliveryProvider | null = null;
+  private deliveryWakeUnsub: (() => void) | null = null;
+  private deliveryPollTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Low-frequency inventory poll (§9): the correctness backstop that converges
+   * the owned-token set even when an `inventory` wake is missed. Mirrors the
+   * delivery/PR pumps' interval; the wake is just a nudge that pulls sooner.
+   */
+  private inventoryPollTimer: ReturnType<typeof setInterval> | null = null;
+  /** Coalesces concurrent incoming-pump runs. */
+  private pumpInFlight: Promise<number> | null = null;
+  /** S6 field-encryption key (intent payloads, history memos) — per identity. */
+  private fieldEncryptionKey: Uint8Array | null = null;
+
+  // wallet-api payment requests (sdk-changes S4 — §10/§16)
+  private prPollTimer: ReturnType<typeof setInterval> | null = null;
+  /** Coalesces concurrent payment-request pump runs. */
+  private prPumpInFlight: Promise<void> | null = null;
+  /**
+   * Set after the once-per-session full incoming hydration (#556): the surfaced
+   * incoming list is in-memory only, so on a fresh engine the CURRENT state of
+   * ALL incoming requests — open AND resolved (paid/declined/expired) — must be
+   * rebuilt from a `role=incoming&since=0` pull, not just the still-open ones.
+   * A status-filtered bootstrap (the pre-#556 `status=open` scan) dropped
+   * requests resolved in a PRIOR session, so the payer reopened and the
+   * 'Paid Successfully' request was gone (twin of #521/#549).
+   */
+  private prBootstrapped = false;
+
   // Guard: ensure load() completes before processing incoming bundles
   private loadedPromise: Promise<void> | null = null;
   private loaded = false;
@@ -686,6 +1024,28 @@ export class PaymentsModule {
   private spendQueue: SpendQueue;
   /** Cache of parsed SdkToken data for synchronous queue re-evaluation */
   private readonly parsedTokenCache: Map<string, ParsedTokenEntry> = new Map();
+  /**
+   * Base delay (ms) for the journaled-delivery replay backoff (#517 item 1).
+   * A field, not a const, so tests can drive the bounded retry loop without
+   * waiting real time — never mutated in production.
+   */
+  private replayBackoffBaseMs = DELIVERY_REPLAY_BASE_DELAY_MS;
+  /**
+   * #517: serializes {@link replayPendingV2Deliveries}. `load()` kicks replay
+   * off fire-and-forget and `receive()` calls `load()`, so two passes can
+   * overlap — duplicating delivery attempts and clobbering each other's
+   * `attempts` increments (both read the same stale value, both write N+1,
+   * delaying poison surfacing). Only one pass runs per module instance at a time.
+   */
+  private replayInFlight = false;
+  /**
+   * #517: serializes every read-modify-write of the PENDING_V2_DELIVERIES journal.
+   * save/remove/update each load → mutate → store the WHOLE blob, so a replay
+   * (fire-and-forget from load()) overlapping a send()'s journal write could
+   * clobber a newly-saved undelivered entry and lose it — defeating the crash-
+   * safety guarantee. A promise-chain mutex makes each whole RMW atomic.
+   */
+  private journalMutation: Promise<unknown> = Promise.resolve();
 
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
@@ -765,6 +1125,9 @@ export class PaymentsModule {
    * Initialize module with dependencies
    */
   initialize(deps: PaymentsModuleDependencies): void {
+    // #515 F1: refuse illegal custody compositions BEFORE any state is touched.
+    assertLegalCustodyComposition(deps);
+
     // Clean up previous subscriptions before re-initializing
     this.unsubscribeTransfers?.();
     this.unsubscribeTransfers = null;
@@ -772,6 +1135,8 @@ export class PaymentsModule {
     this.unsubscribePaymentRequests = null;
     this.unsubscribePaymentRequestResponses?.();
     this.unsubscribePaymentRequestResponses = null;
+    this.teardownDeliveryPump();
+    this.teardownPaymentRequestPump();
 
     // Stop background subscriptions from the previous address context so they
     // don't call save() in the new address's storage context.
@@ -808,8 +1173,26 @@ export class PaymentsModule {
 
     this.deps = deps;
     this.priceProvider = deps.price ?? null;
+    this.fieldEncryptionKey = null; // re-derived lazily per identity (S6)
     // Path B: wire the engine into the planner (value reads use it when present).
     this.spendPlanner.setEngine(deps.tokenEngine);
+
+    // Delivery seam (sdk-changes S3/S7): the injected port, or the transport
+    // adapter preserving the legacy relay leg through the same seam.
+    this.injectedDelivery = deps.delivery ?? null;
+    const lazyDeliveryKeys = async (blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> => {
+      const engine = this.deps?.tokenEngine;
+      if (!engine) throw new SphereError('Token engine required for delivery-key derivation (S7)', 'AGGREGATOR_ERROR');
+      return engine.deliveryKeys(blobBytes);
+    };
+    this.delivery = deps.delivery ?? new TransportDeliveryAdapter(deps.transport, lazyDeliveryKeys);
+    // S7: the module owns the engine — late-bind the backend-true derivation
+    // into whatever delivery provider was composed.
+    this.delivery.bindDeliveryKeys?.(lazyDeliveryKeys);
+    this.delivery.setIdentity?.({
+      privateKey: deps.identity.privateKey,
+      chainPubkey: deps.identity.chainPubkey,
+    });
 
     // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
     if (this.l1) {
@@ -821,23 +1204,70 @@ export class PaymentsModule {
       });
     }
 
-    // Subscribe to incoming transfers
-    this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) =>
-      this.handleIncomingTransfer(transfer)
-    );
-
-    // Subscribe to incoming payment requests (if supported)
-    if (deps.transport.onPaymentRequest) {
-      this.unsubscribePaymentRequests = deps.transport.onPaymentRequest((request) => {
-        this.handleIncomingPaymentRequest(request);
-      });
+    // Incoming assets (sdk-changes S3/S4): with an injected delivery port the
+    // mailbox pull (poll + wake) is the ONLY asset channel — the Nostr
+    // token-transfer subscription is not installed. Without one, the relay
+    // push subscription stays exactly as before.
+    if (this.injectedDelivery) {
+      // One wake socket multiplexes all three owner streams (§9): route each
+      // nudge to its own (debounced/coalesced) pull. The wake is best-effort —
+      // every stream below also has a poll backstop that is the correctness
+      // path. (Before this, only `mailbox` was consumed, so a second session
+      // saw no realtime inventory/payment-request convergence.)
+      this.deliveryWakeUnsub =
+        this.injectedDelivery.onWake?.(
+          (stream) => this.handleWake(stream),
+          // §9: surface TRUE wake-socket liveness, decoupled from sign-in state,
+          // so the frontend can show a "live/reconnecting" indicator.
+          (status) => this.deps?.emitEvent('realtime:status', { status })
+        ) ?? null;
+      // Poll is the correctness path; the wake is just a nudge (§9).
+      this.deliveryPollTimer = setInterval(() => {
+        void this.pumpIncomingDeliveries().catch((err) =>
+          logger.warn('Payments', 'Incoming delivery pump (poll) failed:', err)
+        );
+      }, DELIVERY_POLL_INTERVAL_MS);
+      // Inventory poll backstop (§9): converges the owned-token set even if an
+      // `inventory` wake is missed, mirroring the delivery/PR pumps' interval.
+      this.inventoryPollTimer = setInterval(() => {
+        void this.resyncInventory().catch((err) =>
+          logger.warn('Payments', 'Inventory resync (poll) failed:', err)
+        );
+      }, DELIVERY_POLL_INTERVAL_MS);
+    } else {
+      // Subscribe to incoming transfers
+      this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) =>
+        this.handleIncomingTransfer(transfer)
+      );
     }
 
-    // Subscribe to payment request responses (if supported)
-    if (deps.transport.onPaymentRequestResponse) {
-      this.unsubscribePaymentRequestResponses = deps.transport.onPaymentRequestResponse((response) => {
-        this.handlePaymentRequestResponse(response);
-      });
+    // Payment requests (sdk-changes S4): when the composed wallet-api port
+    // carries the §16 payment-request endpoints they ride wallet-api — the
+    // incoming `?since=<seq>` stream is polled (gap-free — §9; the poll is the
+    // correctness path) and the Nostr payment-request channel is NOT
+    // installed. Without the capability the transport subscriptions stay
+    // exactly as before (port selection, covenant §3.1-6).
+    this.prBootstrapped = false;
+    if (this.paymentRequestsApi()) {
+      this.prPollTimer = setInterval(() => {
+        void this.pumpPaymentRequests().catch((err) =>
+          logger.warn('Payments', 'Payment-request pump (poll) failed:', err)
+        );
+      }, DELIVERY_POLL_INTERVAL_MS);
+    } else {
+      // Subscribe to incoming payment requests (if supported)
+      if (deps.transport.onPaymentRequest) {
+        this.unsubscribePaymentRequests = deps.transport.onPaymentRequest((request) => {
+          this.handleIncomingPaymentRequest(request);
+        });
+      }
+
+      // Subscribe to payment request responses (if supported)
+      if (deps.transport.onPaymentRequestResponse) {
+        this.unsubscribePaymentRequestResponses = deps.transport.onPaymentRequestResponse((response) => {
+          this.handlePaymentRequestResponse(response);
+        });
+      }
     }
 
     // Subscribe to storage provider events (push-based sync)
@@ -864,6 +1294,7 @@ export class PaymentsModule {
       // Load metadata from TokenStorageProviders (archived, tombstones, forked)
       // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
       const providers = this.getTokenStorageProviders();
+      let loadedProvider: TokenStorageProvider<TxfStorageDataBase> | null = null;
       for (const [id, provider] of providers) {
         try {
           const result = await provider.load();
@@ -886,10 +1317,27 @@ export class PaymentsModule {
               await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
             }
             logger.debug('Payments', `Loaded metadata from provider ${id}`);
+            loadedProvider = provider;
             break; // Use first successful provider
           }
         } catch (err) {
           logger.error('Payments', `Failed to load from provider ${id}:`, err);
+        }
+      }
+
+      // S2: merge the provider's inventory VIEW as lazy records — value
+      // metadata only, ZERO blob downloads. A thin provider (wallet-api)
+      // contributes the wallet's whole balance this way (coin-selection plans
+      // from it; getToken() materializes only the selected sources); for
+      // whole-blob providers the view equals the loaded set and nothing is
+      // added. Guarded structurally: pre-S2 custom providers (and test mocks)
+      // built before the port extension may lack `listInventory` — they keep
+      // working through the whole-blob path, just without a lazy view.
+      if (loadedProvider && typeof loadedProvider.listInventory === 'function') {
+        try {
+          await this.mergeLazyInventory(loadedProvider);
+        } catch (err) {
+          logger.warn('Payments', 'load(): inventory view merge failed:', err);
         }
       }
 
@@ -1005,6 +1453,20 @@ export class PaymentsModule {
     // (fire-and-forget; failures are kept journaled for the next load).
     void this.replayPendingV2Deliveries().catch((err) =>
       logger.warn('Payments', 'Pending v2 delivery replay failed:', err));
+
+    // S3: drain the delivery port's incoming feed once at load (poll + wake
+    // keep it drained afterwards).
+    if (this.injectedDelivery) {
+      void this.pumpIncomingDeliveries().catch((err) =>
+        logger.warn('Payments', 'Incoming delivery pump (load) failed:', err));
+    }
+
+    // S4: drain the payment-request `?since=` stream once at load (the poll
+    // keeps it drained afterwards).
+    if (this.paymentRequestsApi()) {
+      void this.pumpPaymentRequests().catch((err) =>
+        logger.warn('Payments', 'Payment-request pump (load) failed:', err));
+    }
   }
 
   /**
@@ -1020,6 +1482,8 @@ export class PaymentsModule {
     this.unsubscribePaymentRequests = null;
     this.unsubscribePaymentRequestResponses?.();
     this.unsubscribePaymentRequestResponses = null;
+    this.teardownDeliveryPump();
+    this.teardownPaymentRequestPump();
     this.paymentRequestHandlers.clear();
     this.paymentRequestResponseHandlers.clear();
 
@@ -1167,13 +1631,15 @@ export class PaymentsModule {
       }
       result.tokens = tokensToSend;
 
-      // Mark as transferring and persist — UI shows "Pending" badge immediately
+      // Mark as transferring and persist — UI shows "Pending" badge immediately.
+      // critical (#515 F2): nothing is spent yet — an unwritable active custody
+      // provider must abort the send HERE, before the intent/engine run.
       for (const token of tokensToSend) {
         token.status = 'transferring';
         this.tokens.set(token.id, token);
         this.parsedTokenCache.delete(token.id);
       }
-      await this.save();
+      await this.save({ critical: true });
 
       // Save to outbox for recovery
       await this.saveToOutbox(result, recipientPubkey);
@@ -1196,31 +1662,73 @@ export class PaymentsModule {
         // a FINISHED token — no commitment / inclusion-proof / finalization.
         // =================================================================
         const engine = this.deps.tokenEngine;
-        const recipientChainPubkey = hexToBytes(peerInfo.chainPubkey);
+        const walletApi = this.deps.walletApi;
+        const delivery = this.delivery!;
+        // §7/§5.3: with wallet-api INVENTORY custody the spend is recorded
+        // server-side via ONE applyDelta carrying this send's transferId —
+        // the evidence link to the mailbox deposit. With 'external' custody
+        // (the own-storage composition) the sender never calls apply
+        // (ARCHITECTURE §6: storage-opt-out senders); local bookkeeping is
+        // the record and the intent closes via completeIntent alone.
+        const serverApply = !!walletApi && delivery.custody === 'inventory';
+        const recipientChainPubkeyHex = peerInfo.chainPubkey;
+        const recipientChainPubkey = hexToBytes(recipientChainPubkeyHex);
         // On-chain memo: the structured invoice ref ({inv:{id,dir}}) for invoice
         // payments, else null — plain memos stay transport-only (privacy).
         // parseInvoiceMemoForOnChain already produced the encoded bytes (or null).
         const memoData = onChainMessage ?? undefined;
 
-        // Deliver a journaled finished-token blob as a V2_TRANSFER payload.
+        // S2: blobs are fetched on demand — lazy inventory records selected by
+        // coin-selection are materialized (getToken + engine decode) only now.
+        await this.materializeSelectedSources(splitPlan);
+
+        // E.3: persist the (client-encrypted — S6) intent and AWAIT the server
+        // ack BEFORE any engine submit — the intent is the only resume seed
+        // for a possibly-already-certified transfer; local-only persistence is
+        // forbidden for the live path.
+        if (walletApi) {
+          await walletApi.putIntent(
+            result.id,
+            encryptField(
+              this.getFieldEncryptionKey(),
+              JSON.stringify(this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
+            )
+          );
+        }
+
+        // Deliver a journaled finished-token blob via the delivery port (S3:
+        // the port replaced the direct relay leg; recipients are addressed by
+        // CHAIN pubkey — the canonical identity).
         const deliverBlob = async (tokenBlob: string): Promise<void> => {
-          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-            type: 'V2_TRANSFER',
-            version: '2.0',
-            tokenBlob,
+          // Carry the sender's own CANONICAL nametag so the recipient renders
+          // "@name" instead of "Someone" — bundled with the memo in ONE
+          // recipient-addressed envelope (S6).
+          const nm = this.currentNametagName();
+          await delivery.deliver(recipientChainPubkeyHex, hexToBytes(tokenBlob), {
+            transferId: result.id,
             memo: request.memo,
-          } as unknown as import('../../transport').TokenTransferPayload);
+            ...(nm !== undefined ? { senderNametag: nm } : {}),
+          });
         };
 
-        // Whole-token direct transfers.
-        for (const tw of splitPlan.tokensToTransferDirectly) {
+        // Sources consumed by this send — the §7 step 6 apply (server path)
+        // and the deferred local removals are driven from this list.
+        const consumedSources: { uiTokenId: string; genesisId: string }[] = [];
+
+        // Whole-token direct transfers. ONE realization seed per SEND
+        // (ARCHITECTURE §7/§8.1): the intent transferId seeds every engine op,
+        // so any device holding the wallet seed can rebuild the identical
+        // transactions and resume (Part E).
+        for (const [opIndex, tw] of splitPlan.tokensToTransferDirectly.entries()) {
           const finished = await engine.transfer(
             {
               token: tw.sdkToken as SphereToken,
               recipientPubkey: recipientChainPubkey,
               data: memoData,
             },
-            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS) },
+            // opIndex = position in the persisted intent's `direct` order — the
+            // stable (transferId, opIndex) pairing resume replays (§8.1).
+            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex },
           );
           // The source state is spent on-chain from here on.
           committedOnChainTokenIds.add(tw.uiToken.id);
@@ -1229,7 +1737,7 @@ export class PaymentsModule {
           const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
           await this.savePendingV2Delivery({
             transferId: result.id,
-            recipientPubkey,
+            recipientPubkey: recipientChainPubkeyHex,
             tokenBlob,
             memo: request.memo,
             createdAt: Date.now(),
@@ -1237,12 +1745,20 @@ export class PaymentsModule {
           await deliverBlob(tokenBlob);
           await this.removePendingV2Delivery(tokenBlob);
           result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
-          await this.removeToken(tw.uiToken.id, result.id);
+          consumedSources.push({
+            uiTokenId: tw.uiToken.id,
+            genesisId: extractTokenIdFromSdkData(tw.uiToken.sdkData) ?? tw.uiToken.id.replace(/^v2_/, ''),
+          });
+          // Server path: the removal is recorded by the single applyDelta
+          // below (its evidence is the deposit just made); locally the source
+          // is removed right away on the non-server path (unchanged behavior).
+          if (!serverApply) await this.removeToken(tw.uiToken.id, result.id);
         }
 
         // Value-conserving split: recipient gets splitAmount, this wallet keeps
         // the remainder. The change token is real + immediate (the engine mints
         // it) — no placeholder / background-proof step.
+        let changeOutput: SphereToken | null = null;
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
           const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
           const { outputs } = await engine.split(
@@ -1253,28 +1769,76 @@ export class PaymentsModule {
                 { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
               ],
             },
-            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS) },
+            // Same per-send seed; the split's opIndex follows the direct ops
+            // (stable across resume — it is derived from the intent's order).
+            {
+              signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS),
+              transferId: result.id,
+              opIndex: splitPlan.tokensToTransferDirectly.length,
+            },
           );
-          // The split source is burnt on-chain from here on. Persist BOTH outputs
-          // (journal the recipient's blob, store our change token) BEFORE the
-          // delivery attempt — nothing after the on-chain split may depend on
-          // the transport succeeding.
+          // The split source is burnt on-chain from here on. Journal the
+          // recipient's blob BEFORE the delivery attempt.
           committedOnChainTokenIds.add(splitPlan.tokenToSplit.uiToken.id);
           const recipientBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0])));
           await this.savePendingV2Delivery({
             transferId: result.id,
-            recipientPubkey,
+            recipientPubkey: recipientChainPubkeyHex,
             tokenBlob: recipientBlob,
             memo: request.memo,
             createdAt: Date.now(),
           });
-          await this.storeEngineToken(engine, outputs[1]); // change token, confirmed
+          changeOutput = outputs[1];
+          if (!serverApply) {
+            // Non-server path: persist the change BEFORE the delivery attempt —
+            // nothing after the on-chain split may depend on the transport
+            // succeeding. On the server path the awaited intent (E.3) is the
+            // recovery seed (a deterministic re-run rebuilds BOTH outputs), and
+            // local storage follows the server apply below so the provider's
+            // write-behind cannot race a second add of the same state.
+            // critical (#515 F2): an unpersisted change token is value loss on
+            // reload — fail the send (the open intent resumes it) rather than
+            // report success.
+            await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
+          }
 
           await deliverBlob(recipientBlob);
           await this.removePendingV2Delivery(recipientBlob);
 
           result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
+          consumedSources.push({
+            uiTokenId: splitPlan.tokenToSplit.uiToken.id,
+            genesisId:
+              extractTokenIdFromSdkData(splitPlan.tokenToSplit.uiToken.sdkData) ??
+              splitPlan.tokenToSplit.uiToken.id.replace(/^v2_/, ''),
+          });
+          if (!serverApply) await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
+        }
+
+        if (serverApply) {
+          // §7 steps 4+6: upload the change output, then record the whole
+          // spend in ONE idempotent apply carrying the send's transferId. The
+          // backend evidence-checks the removals against the mailbox deposit
+          // of the same transferId (§5.3) and completes the intent in the
+          // same transaction (§16).
+          const added: { tokenId: string; key: string }[] = [];
+          if (changeOutput) {
+            const changeBytes = encodeTokenBlob(engine.encodeToken(changeOutput));
+            added.push({ tokenId: engine.tokenId(changeOutput), key: await this.uploadOutputBlob(changeBytes) });
+          }
+          const storage = this.getActiveTokenStorageProvider();
+          if (!storage) {
+            throw new SphereError('No token storage provider available for applyDelta', 'STORAGE_ERROR');
+          }
+          await storage.applyDelta(
+            result.id,
+            consumedSources.map((s) => s.genesisId),
+            added
+          );
+          // Local bookkeeping AFTER the server apply (see the ordering note
+          // above): store the change, then drop the consumed sources.
+          if (changeOutput) await this.storeEngineToken(engine, changeOutput);
+          for (const s of consumedSources) await this.removeToken(s.uiTokenId, result.id);
         }
       }
 
@@ -1285,6 +1849,19 @@ export class PaymentsModule {
       await this.removeFromOutbox(result.id);
 
       result.status = 'completed';
+
+      // E.3 uniform close: every finished send ends with completeIntent
+      // (idempotent). With wallet-api inventory custody the apply above has
+      // already completed it server-side (no-op); with own storage this call
+      // is the ONLY close — without it every historical send would re-resume
+      // at each sign-in forever.
+      if (this.deps.walletApi) {
+        try {
+          await this.deps.walletApi.completeIntent(result.id);
+        } catch (err) {
+          logger.warn('Payments', 'completeIntent failed (the next sign-in resume converges it):', err);
+        }
+      }
 
       // Build token breakdown using a Map for O(1) lookup
       const tokenMap = new Map(result.tokens.map(t => [t.id, t]));
@@ -1323,7 +1900,47 @@ export class PaymentsModule {
       this.reservationLedger.cancel(result.id);
 
       result.status = 'failed';
-      result.error = error instanceof Error ? error.message : String(error);
+      // A TransferConflictError is a LOST RACE (Part E.2): another transaction —
+      // typically this owner's other device — already consumed a source token.
+      // Fail this send cleanly with a distinct message; the restore loop below
+      // marks the conflicted source 'spent' via the on-chain isSpent check.
+      // (Re-planning the uncovered remainder automatically is Part S.)
+      result.error = error instanceof TransferConflictError
+        ? `Send conflicted: a source token was already spent by a concurrent transfer — re-plan and retry (${error.message})`
+        : error instanceof Error ? error.message : String(error);
+
+      // #517 item 2: a TransferConflictError here is the predictable stale-view
+      // race — coin-selection planned from a lazy-inventory view that missed
+      // another device's spend. It is handled (abort + reconcile below) but was
+      // otherwise SILENT; surface it as a distinct, recoverable signal so a UI
+      // can prompt "refresh and retry" instead of just showing a generic failure.
+      if (error instanceof TransferConflictError) {
+        this.deps!.emitEvent('inventory:conflict', {
+          transferId: result.id,
+          coinId: request.coinId,
+          error: error.message,
+        });
+      }
+
+      // Intent disposition on failure (E.2/E.3):
+      //  - a TransferConflictError aborts (the prescribed recovery — the
+      //    caller re-plans under a NEW transferId; soft abort keeps the row);
+      //    any already-certified legs stay journaled for delivery replay and
+      //    converge via the recipient's claim handoff (§6);
+      //  - a failure with NOTHING certified also aborts — an open intent would
+      //    silently re-execute the transfer at the next sign-in after the user
+      //    already saw it fail (and possibly retried it manually);
+      //  - a partially-certified non-conflict failure keeps the intent OPEN:
+      //    forward completion via resume is the only exit (§7).
+      if (this.deps?.walletApi) {
+        if (error instanceof TransferConflictError || committedOnChainTokenIds.size === 0) {
+          try {
+            await this.deps.walletApi.abortIntent(result.id);
+          } catch (abortErr) {
+            logger.warn('Payments', 'abortIntent failed (soft abort is best-effort):', abortErr);
+          }
+        }
+      }
 
       // Restore tokens. Three classes (W23-R2/R3, v2 edition):
       //  - already removeToken()'d during a partially-successful loop → skip
@@ -1424,6 +2041,154 @@ export class PaymentsModule {
   }
 
   // ===========================================================================
+  // Private: wallet-api send pipeline helpers (sdk-changes S2/S3, E.3)
+  // ===========================================================================
+
+  /** The active (first, non-disabled) token storage provider — the lazy port. */
+  private getActiveTokenStorageProvider(): TokenStorageProvider<TxfStorageDataBase> | null {
+    const first = this.getTokenStorageProviders().values().next();
+    return first.done ? null : first.value;
+  }
+
+  /** S6 field-encryption key for this identity (intent payloads, history memos). */
+  private getFieldEncryptionKey(): Uint8Array {
+    if (!this.fieldEncryptionKey) {
+      this.fieldEncryptionKey = deriveFieldEncryptionKey(this.deps!.identity.privateKey);
+    }
+    return this.fieldEncryptionKey;
+  }
+
+  /**
+   * S2: materialize the SELECTED lazy sources — fetch each blob on demand via
+   * the storage port's `getToken()` and decode it through the engine. Only
+   * tokens the plan actually consumes are downloaded; coin-selection itself
+   * ran on the inventory view alone.
+   */
+  private async materializeSelectedSources(splitPlan: SplitPlan): Promise<void> {
+    const selected: TokenWithAmount[] = [...splitPlan.tokensToTransferDirectly];
+    if (splitPlan.tokenToSplit) selected.push(splitPlan.tokenToSplit);
+    const pending = selected.filter((tw) => !tw.sdkToken);
+    if (pending.length === 0) return;
+
+    const engine = this.deps!.tokenEngine;
+    const provider = this.getActiveTokenStorageProvider();
+    if (!engine || !provider) {
+      throw new SphereError(
+        'Cannot materialize lazy sources — token engine or storage provider missing',
+        'STORAGE_ERROR'
+      );
+    }
+    for (const tw of pending) {
+      const genesisId = tw.uiToken.id.replace(/^v2_/, '');
+      const blob = await provider.getToken(genesisId);
+      tw.sdkToken = await engine.decodeToken(blob);
+      // Backfill sdkData so the downstream machinery (tombstones, restore
+      // isSpent checks, archive) sees a complete token record.
+      (tw.uiToken as { sdkData?: string }).sdkData = bytesToHex(encodeTokenBlob(blob));
+      const live = this.tokens.get(tw.uiToken.id);
+      if (live && live !== tw.uiToken) {
+        (live as { sdkData?: string }).sdkData = (tw.uiToken as { sdkData?: string }).sdkData;
+      }
+    }
+  }
+
+  /**
+   * The E.3 intent payload — `{ sources, recipient, amounts }` concretized to
+   * the realization plan, so a resume on ANY device rebuilds byte-identical
+   * transactions (same transferId + same inputs + same output order).
+   */
+  private buildIntentPayload(
+    request: TransferRequest,
+    recipientChainPubkey: string,
+    splitPlan: SplitPlan
+  ): IntentPayloadV1 {
+    const genesisIdOf = (tw: TokenWithAmount): string =>
+      extractTokenIdFromSdkData(tw.uiToken.sdkData) ?? tw.uiToken.id.replace(/^v2_/, '');
+    return {
+      v: 1,
+      recipient: recipientChainPubkey,
+      coinId: request.coinId,
+      amount: request.amount,
+      ...(request.memo !== undefined ? { memo: request.memo } : {}),
+      ...(request.invoiceRefundAddress !== undefined
+        ? { invoiceRefundAddress: request.invoiceRefundAddress }
+        : {}),
+      ...(request.invoiceContact !== undefined ? { invoiceContact: request.invoiceContact } : {}),
+      direct: splitPlan.tokensToTransferDirectly.map(genesisIdOf),
+      ...(splitPlan.requiresSplit && splitPlan.tokenToSplit
+        ? {
+            split: {
+              tokenId: genesisIdOf(splitPlan.tokenToSplit),
+              splitAmount: splitPlan.splitAmount!.toString(),
+              remainderAmount: splitPlan.remainderAmount!.toString(),
+            },
+          }
+        : {}),
+    };
+  }
+
+  /** §5.2: upload a spend output blob (content-addressed; 412 = present = success). */
+  private async uploadOutputBlob(bytes: Uint8Array): Promise<string> {
+    const walletApi = this.deps!.walletApi!;
+    // §5.2/§8.2: the wire carries RAW token bytes — callers hand the sphere
+    // envelope; unwrap at the wallet-api boundary.
+    const wire = unwrapTokenBlobBytes(bytes);
+    const sha = sha256(bytesToHex(wire), 'hex');
+    const urls = await walletApi.getUploadUrls([{ sha256: sha, size: wire.length }]);
+    const url = urls.find((u) => u.sha256 === sha);
+    if (!url) {
+      throw new SphereError(`upload-urls response missing sha256 ${sha}`, 'STORAGE_ERROR');
+    }
+    await walletApi.uploadBlob(url.putUrl, wire);
+    return url.key;
+  }
+
+  /**
+   * S2: project the storage provider's inventory view into the in-memory
+   * token map as LAZY records — value metadata only, zero blob downloads.
+   * Balances render from these; coin-selection plans from them; the blob is
+   * fetched only when a token is selected to be spent.
+   */
+  private async mergeLazyInventory(provider: TokenStorageProvider<TxfStorageDataBase>): Promise<void> {
+    const view = await provider.listInventory();
+    if (view.items.length === 0) return;
+
+    // Genesis ids already represented in memory (full or lazy records).
+    const known = new Set<string>();
+    for (const [, t] of this.tokens) {
+      const genesisId =
+        extractTokenIdFromSdkData(t.sdkData) ?? (t.id.startsWith('v2_') ? t.id.slice(3) : null);
+      if (genesisId) known.add(genesisId);
+    }
+
+    let merged = 0;
+    for (const item of view.items) {
+      if (item.status !== 'active' || !item.assets || item.assets.length === 0) continue;
+      if (known.has(item.tokenId)) continue;
+      // The UI token model is single-asset (mirrors storeEngineToken).
+      const asset = item.assets[0];
+      const token: Token = {
+        id: `v2_${item.tokenId}`,
+        coinId: asset.coinId,
+        symbol: this.getCoinSymbol(asset.coinId),
+        name: this.getCoinName(asset.coinId),
+        decimals: this.getCoinDecimals(asset.coinId),
+        iconUrl: this.getCoinIconUrl(asset.coinId),
+        amount: asset.amount.toString(),
+        status: 'confirmed',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        lazy: true,
+      };
+      this.tokens.set(token.id, token);
+      merged++;
+    }
+    if (merged > 0) {
+      logger.debug('Payments', `load(): merged ${merged} lazy inventory record(s) — no blobs downloaded (S2)`);
+    }
+  }
+
+  // ===========================================================================
   // Public API - Payment Requests
   // ===========================================================================
 
@@ -1438,6 +2203,13 @@ export class PaymentsModule {
     request: Omit<PaymentRequest, 'id' | 'createdAt'>
   ): Promise<PaymentRequestResult> {
     this.ensureInitialized();
+
+    // S4: with the wallet-api payment-request capability composed, the
+    // request rides the §16 endpoints — the Nostr channel is not used.
+    const prApi = this.paymentRequestsApi();
+    if (prApi) {
+      return this.sendWalletApiPaymentRequest(prApi, recipientPubkeyOrNametag, request);
+    }
 
     if (!this.deps!.transport.sendPaymentRequest) {
       return {
@@ -1498,6 +2270,87 @@ export class PaymentsModule {
   }
 
   /**
+   * S4: create the request via wallet-api (§16). The payer is addressed by
+   * CHAIN pubkey (the canonical identity); the memo is S6-encrypted client-
+   * side BEFORE it leaves the device (§8.3) — the operator stores ciphertext.
+   * Mirrors the transport path's no-throw contract: failures (including the
+   * §5.5 per-payer cap → 429) come back as `{ success: false, error }`.
+   */
+  private async sendWalletApiPaymentRequest(
+    api: PaymentRequestsApi,
+    recipientPubkeyOrNametag: string,
+    request: Omit<PaymentRequest, 'id' | 'createdAt'>
+  ): Promise<PaymentRequestResult> {
+    try {
+      const peerInfo = await this.deps!.transport.resolve?.(recipientPubkeyOrNametag) ?? null;
+      const toPubkey =
+        peerInfo?.chainPubkey ??
+        (/^0[23][0-9a-f]{64}$/i.test(recipientPubkeyOrNametag)
+          ? recipientPubkeyOrNametag.toLowerCase()
+          : null);
+      if (!toPubkey) {
+        return {
+          success: false,
+          error: `Recipient ${recipientPubkeyOrNametag} has no published identity (chain pubkey) — cannot receive payment requests.`,
+        };
+      }
+
+      // S6: the requester's nametag + message ride ONE recipient-addressed
+      // envelope keyed off ECDH(requesterPriv, PAYER chain pubkey) — symmetric,
+      // so the payer re-derives it from its own key + this request's fromPubkey
+      // (the PR twin of #546/#547). The self-scoped field key was wrong here:
+      // a memo encrypted with the requester's key could never be opened by the
+      // payer. Same `enc1.` XChaCha20-Poly1305 wire (operator-blind, backend-
+      // valid — no wire/backend change); attached whenever there is a nametag
+      // OR a message, so the payer renders "@requester" even with no message.
+      const memoEnvelope = encryptDeliveryBundle(
+        deriveDeliveryEncryptionKey(this.deps!.identity.privateKey, toPubkey),
+        { senderNametag: this.currentNametagName(), memo: request.message }
+      );
+
+      const wire = await api.createPaymentRequest({
+        toPubkey,
+        // Amounts are decimal strings end-to-end (§11) — BigInt round-trips them exactly.
+        assets: [{ coinId: request.coinId, amount: BigInt(request.amount) }],
+        ...(memoEnvelope !== undefined ? { memo: memoEnvelope } : {}),
+        ...(request.expiresAt !== undefined ? { expiresAt: request.expiresAt } : {}),
+      });
+
+      // Track the outgoing request under the SERVER id — the `?before=`
+      // backfill refresh (refreshOutgoingPaymentRequests) matches on it.
+      const outgoingRequest: OutgoingPaymentRequest = {
+        id: wire.id,
+        eventId: wire.id, // no relay event on this path — the server id stands in
+        recipientPubkey: toPubkey,
+        recipientNametag: recipientPubkeyOrNametag.startsWith('@')
+          ? recipientPubkeyOrNametag.slice(1)
+          : undefined,
+        amount: request.amount,
+        coinId: request.coinId,
+        message: request.message,
+        createdAt: wire.createdAt,
+        status: 'pending',
+      };
+      this.outgoingPaymentRequests.set(wire.id, outgoingRequest);
+
+      logger.debug('Payments', `Payment request created via wallet-api: ${wire.id}`);
+
+      return {
+        success: true,
+        requestId: wire.id,
+        eventId: wire.id,
+      };
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      logger.debug('Payments', `Failed to create wallet-api payment request: ${errorMsg}`);
+      return {
+        success: false,
+        error: errorMsg,
+      };
+    }
+  }
+
+  /**
    * Subscribe to incoming payment requests
    * @param handler - Handler function for incoming requests
    * @returns Unsubscribe function
@@ -1543,11 +2396,16 @@ export class PaymentsModule {
   /**
    * Reject a payment request and notify the requester.
    *
+   * On the wallet-api path (S4) the respond IS the state change — it is
+   * confirmed server-side (`action: 'declined'`, §16) before the local status
+   * flips, and a server rejection (403/409) propagates to the caller. The
+   * transport path is best-effort and never throws.
+   *
    * @param requestId - ID of the incoming payment request to reject.
    */
   async rejectPaymentRequest(requestId: string): Promise<void> {
-    this.updatePaymentRequestStatus(requestId, 'rejected');
     await this.sendPaymentRequestResponse(requestId, 'rejected');
+    this.updatePaymentRequestStatus(requestId, 'rejected');
   }
 
   /**
@@ -1606,9 +2464,15 @@ export class PaymentsModule {
         memo: memo || request.message,
       });
 
-      // Mark as paid and send response with transfer ID
+      // Mark as paid and send response with transfer ID. The transfer already
+      // succeeded — a failed status link (e.g. an expiry race on the
+      // wallet-api respond, §16) is logged, never reported as a failed payment.
       this.updatePaymentRequestStatus(requestId, 'paid');
-      await this.sendPaymentRequestResponse(requestId, 'paid', result.id);
+      try {
+        await this.sendPaymentRequestResponse(requestId, 'paid', result.id);
+      } catch (error) {
+        logger.warn('Payments', `Payment sent but the paid response failed for ${requestId}:`, error);
+      }
 
       return result;
     } catch (error) {
@@ -1627,7 +2491,8 @@ export class PaymentsModule {
       const eventType = `payment_request:${status}` as const;
       if (eventType === 'payment_request:accepted' ||
           eventType === 'payment_request:rejected' ||
-          eventType === 'payment_request:paid') {
+          eventType === 'payment_request:paid' ||
+          eventType === 'payment_request:expired') {
         this.deps?.emitEvent(eventType, request);
       }
     }
@@ -1774,22 +2639,8 @@ export class PaymentsModule {
   }
 
   private handlePaymentRequestResponse(transportResponse: TransportPaymentRequestResponse): void {
-    // Find the outgoing request by matching requestId
-    let outgoingRequest: OutgoingPaymentRequest | undefined;
-    let outgoingRequestId: string | undefined;
-
-    for (const [id, request] of this.outgoingPaymentRequests) {
-      // Match by eventId or requestId from the response
-      if (request.eventId === transportResponse.response.requestId ||
-          request.id === transportResponse.response.requestId) {
-        outgoingRequest = request;
-        outgoingRequestId = id;
-        break;
-      }
-    }
-
     // Convert transport response to PaymentRequestResponse
-    const response: PaymentRequestResponse = {
+    this.dispatchPaymentRequestResponse({
       id: transportResponse.id,
       responderPubkey: transportResponse.responderTransportPubkey,
       requestId: transportResponse.response.requestId,
@@ -1797,7 +2648,29 @@ export class PaymentsModule {
       message: transportResponse.response.message,
       transferId: transportResponse.response.transferId,
       timestamp: transportResponse.timestamp,
-    };
+    });
+  }
+
+  /**
+   * Fold a payment-request response into the outgoing surface and notify —
+   * shared by the transport subscription and the wallet-api outgoing refresh
+   * (S4): update the matched outgoing request, resolve any
+   * {@link waitForPaymentResponse} waiter, emit the event, run the handlers.
+   */
+  private dispatchPaymentRequestResponse(response: PaymentRequestResponse): void {
+    // Find the outgoing request by matching requestId
+    let outgoingRequest: OutgoingPaymentRequest | undefined;
+    let outgoingRequestId: string | undefined;
+
+    for (const [id, request] of this.outgoingPaymentRequests) {
+      // Match by eventId or requestId from the response
+      if (request.eventId === response.requestId ||
+          request.id === response.requestId) {
+        outgoingRequest = request;
+        outgoingRequestId = id;
+        break;
+      }
+    }
 
     // Update outgoing request if found
     if (outgoingRequest && outgoingRequestId) {
@@ -1841,6 +2714,25 @@ export class PaymentsModule {
     const request = this.paymentRequests.find((r) => r.id === requestId);
     if (!request) return;
 
+    // S4: respond via the §16 endpoint. 'accepted' is a LOCAL UI state — the
+    // backend models open → paid|declined|expired only, so nothing is sent
+    // until the actual decision. Unlike the best-effort transport leg below,
+    // server rejections (403 non-addressee / 409 non-open) propagate.
+    const prApi = this.paymentRequestsApi();
+    if (prApi) {
+      if (responseType === 'accepted') return;
+      if (responseType === 'paid') {
+        if (transferId === undefined) {
+          throw new SphereError('A paid response requires the fulfilling transferId (§16)', 'VALIDATION_ERROR');
+        }
+        await prApi.respondPaymentRequest(request.requestId, { action: 'paid', transferId });
+      } else {
+        await prApi.respondPaymentRequest(request.requestId, { action: 'declined' });
+      }
+      logger.debug('Payments', `Responded to payment request via wallet-api: ${responseType} for ${requestId}`);
+      return;
+    }
+
     if (!this.deps?.transport.sendPaymentRequestResponse) {
       logger.debug('Payments', 'Transport does not support sendPaymentRequestResponse');
       return;
@@ -1883,6 +2775,26 @@ export class PaymentsModule {
     callback?: (transfer: IncomingTransfer) => void,
   ): Promise<ReceiveResult> {
     this.ensureInitialized();
+
+    // S3: with an injected delivery port the one-shot fetch IS a pump of the
+    // port's incoming feed (mailbox pull) — Nostr is not used for assets.
+    if (this.injectedDelivery) {
+      const tokensBefore = new Set(this.tokens.keys());
+      await this.pumpIncomingDeliveriesFresh();
+      const received: IncomingTransfer[] = [];
+      for (const [tokenId, token] of this.tokens) {
+        if (tokensBefore.has(tokenId)) continue;
+        const transfer: IncomingTransfer = {
+          id: tokenId,
+          senderPubkey: '',
+          tokens: [token],
+          receivedAt: Date.now(),
+        };
+        received.push(transfer);
+        if (callback) callback(transfer);
+      }
+      return { transfers: received };
+    }
 
     if (!this.deps!.transport.fetchPendingEvents) {
       throw new SphereError('Transport provider does not support fetchPendingEvents', 'TRANSPORT_ERROR');
@@ -1974,8 +2886,11 @@ export class PaymentsModule {
    * Get token balances grouped by coin type.
    *
    * Returns an array of {@link Asset} objects, one per coin type held.
-   * Each entry includes confirmed and unconfirmed breakdowns. Tokens with
-   * status `'spent'`, `'invalid'`, or `'transferring'` are excluded.
+   * Each entry includes confirmed and unconfirmed breakdowns. `'spent'` and
+   * `'invalid'` tokens are excluded entirely. In-flight (`'transferring'`)
+   * tokens are NOT counted toward the spendable balance (`totalAmount`,
+   * `confirmedAmount`, `unconfirmedAmount`) — they are reported only in the
+   * `transferring*` fields (#517 item 3).
    *
    * This is synchronous — no price data is included. Use {@link getAssets}
    * for the async version with fiat pricing.
@@ -1989,7 +2904,10 @@ export class PaymentsModule {
 
   /**
    * Get aggregated assets (tokens grouped by coinId) with price data.
-   * Includes both confirmed and unconfirmed tokens with breakdown.
+   * Confirmed + unconfirmed tokens make up the spendable balance; in-flight
+   * (`'transferring'`) tokens are reported only in the `transferring*` fields
+   * and excluded from `totalAmount` (#517 item 3). Fiat value derives from
+   * `totalAmount`, so it likewise excludes in-flight value.
    */
   async getAssets(coinId?: string): Promise<Asset[]> {
     const rawAssets = this.aggregateTokens(coinId);
@@ -2051,82 +2969,79 @@ export class PaymentsModule {
   }
 
   /**
-   * Aggregate tokens by coinId with confirmed/unconfirmed breakdown.
+   * Aggregate tokens by coinId with confirmed/unconfirmed/transferring breakdown.
    * Excludes tokens with status 'spent' or 'invalid'.
-   * Tokens with status 'transferring' are counted as unconfirmed (visible in UI as "Sending").
+   *
+   * In-flight (`'transferring'`) tokens are LEAVING the wallet during an active
+   * send, so they are NOT counted as spendable: they are tracked in their own
+   * `transferring*` fields and excluded from `totalAmount`/`unconfirmedAmount`.
+   * Counting them as balance would show the user value they cannot spend (the
+   * #517 incident follow-up).
    */
   private aggregateTokens(coinId?: string): Asset[] {
-    const assetsMap = new Map<string, {
-      coinId: string;
-      symbol: string;
-      name: string;
-      decimals: number;
-      iconUrl?: string;
-      confirmedAmount: bigint;
-      unconfirmedAmount: bigint;
-      confirmedTokenCount: number;
-      unconfirmedTokenCount: number;
-      transferringTokenCount: number;
-    }>();
+    const assetsMap = new Map<string, AssetAccumulator>();
 
     for (const token of this.tokens.values()) {
-      // Skip spent and invalid tokens; transferring tokens remain visible
+      // Skip spent and invalid tokens; transferring tokens are tracked separately.
       if (token.status === 'spent' || token.status === 'invalid') continue;
       if (coinId && token.coinId !== coinId) continue;
-
-      const key = token.coinId;
-      const amount = BigInt(token.amount);
-      const isConfirmed = token.status === 'confirmed';
-      const isTransferring = token.status === 'transferring';
-      const existing = assetsMap.get(key);
-
-      if (existing) {
-        if (isConfirmed) {
-          existing.confirmedAmount += amount;
-          existing.confirmedTokenCount++;
-        } else {
-          existing.unconfirmedAmount += amount;
-          existing.unconfirmedTokenCount++;
-        }
-        if (isTransferring) existing.transferringTokenCount++;
-      } else {
-        assetsMap.set(key, {
-          coinId: token.coinId,
-          symbol: token.symbol,
-          name: token.name,
-          decimals: token.decimals,
-          iconUrl: token.iconUrl,
-          confirmedAmount: isConfirmed ? amount : 0n,
-          unconfirmedAmount: isConfirmed ? 0n : amount,
-          confirmedTokenCount: isConfirmed ? 1 : 0,
-          unconfirmedTokenCount: isConfirmed ? 0 : 1,
-          transferringTokenCount: isTransferring ? 1 : 0,
-        });
-      }
+      this.accumulateToken(assetsMap, token);
     }
 
-    return Array.from(assetsMap.values()).map((raw) => {
-      const totalAmount = (raw.confirmedAmount + raw.unconfirmedAmount).toString();
-      return {
-        coinId: raw.coinId,
-        symbol: raw.symbol,
-        name: raw.name,
-        decimals: raw.decimals,
-        iconUrl: raw.iconUrl,
-        totalAmount,
-        tokenCount: raw.confirmedTokenCount + raw.unconfirmedTokenCount,
-        confirmedAmount: raw.confirmedAmount.toString(),
-        unconfirmedAmount: raw.unconfirmedAmount.toString(),
-        confirmedTokenCount: raw.confirmedTokenCount,
-        unconfirmedTokenCount: raw.unconfirmedTokenCount,
-        transferringTokenCount: raw.transferringTokenCount,
-        priceUsd: null,
-        priceEur: null,
-        change24h: null,
-        fiatValueUsd: null,
-        fiatValueEur: null,
-      };
-    });
+    return Array.from(assetsMap.values()).map((raw) => ({
+      coinId: raw.coinId,
+      symbol: raw.symbol,
+      name: raw.name,
+      decimals: raw.decimals,
+      iconUrl: raw.iconUrl,
+      // Spendable + soon-spendable holdings ONLY — the in-flight token is omitted.
+      totalAmount: (raw.confirmedAmount + raw.unconfirmedAmount).toString(),
+      tokenCount: raw.confirmedTokenCount + raw.unconfirmedTokenCount,
+      confirmedAmount: raw.confirmedAmount.toString(),
+      unconfirmedAmount: raw.unconfirmedAmount.toString(),
+      confirmedTokenCount: raw.confirmedTokenCount,
+      unconfirmedTokenCount: raw.unconfirmedTokenCount,
+      transferringTokenCount: raw.transferringTokenCount,
+      transferringAmount: raw.transferringAmount.toString(),
+      priceUsd: null,
+      priceEur: null,
+      change24h: null,
+      fiatValueUsd: null,
+      fiatValueEur: null,
+    }));
+  }
+
+  /** Fold one token into its coin's running totals (see {@link aggregateTokens}). */
+  private accumulateToken(assetsMap: Map<string, AssetAccumulator>, token: Token): void {
+    const acc = assetsMap.get(token.coinId) ?? this.newAssetAccumulator(token);
+    assetsMap.set(token.coinId, acc);
+    const amount = BigInt(token.amount);
+    if (token.status === 'transferring') {
+      acc.transferringAmount += amount;
+      acc.transferringTokenCount++;
+    } else if (token.status === 'confirmed') {
+      acc.confirmedAmount += amount;
+      acc.confirmedTokenCount++;
+    } else {
+      acc.unconfirmedAmount += amount;
+      acc.unconfirmedTokenCount++;
+    }
+  }
+
+  private newAssetAccumulator(token: Token): AssetAccumulator {
+    return {
+      coinId: token.coinId,
+      symbol: token.symbol,
+      name: token.name,
+      decimals: token.decimals,
+      iconUrl: token.iconUrl,
+      confirmedAmount: 0n,
+      unconfirmedAmount: 0n,
+      transferringAmount: 0n,
+      confirmedTokenCount: 0,
+      unconfirmedTokenCount: 0,
+      transferringTokenCount: 0,
+    };
   }
 
   /**
@@ -2179,9 +3094,12 @@ export class PaymentsModule {
    *   the old state is archived and replaced with the incoming one.
    *
    * @param token - The token to add.
+   * @param opts - `criticalSave: true` on user-facing flows (mint/send): a
+   *   failed save of the ACTIVE custody provider then throws STORAGE_ERROR
+   *   (#515 F2) instead of emitting `storage:degraded`.
    * @returns `true` if the token was added, `false` if rejected as duplicate or tombstoned.
    */
-  async addToken(token: Token): Promise<boolean> {
+  async addToken(token: Token, opts: { criticalSave?: boolean } = {}): Promise<boolean> {
     this.ensureInitialized();
 
     logger.debug('Payments', `addToken called: id=${token.id.slice(0, 16)}... coinId=${token.coinId.slice(0, 16)}... status=${token.status}`);
@@ -2260,7 +3178,7 @@ export class PaymentsModule {
     // Archive the token (for recovery purposes)
     await this.archiveToken(token);
 
-    await this.save();
+    await this.save({ critical: opts.criticalSave });
     logger.debug('Payments', `addToken: saved id=${token.id.slice(0, 16)}...`);
 
     // Notify observers (e.g., AccountingModule) that a token was added
@@ -2711,15 +3629,68 @@ export class PaymentsModule {
       this._historyCache.push(historyEntry);
     }
 
+    // §10: the server-side history log is CLIENT-written (the server never
+    // writes rows), deduped by dedupKey. Memo + counterparty nametag are S6
+    // envelopes — the operator never sees plaintext (§8.3). Best-effort: a
+    // failed POST never fails the money path; the record stays local.
+    const walletApi = this.deps!.walletApi;
+    // §16 wire shape (strict server-side zod; caught drifting by the phase-2
+    // harness — the fake had accepted the module's internal shape):
+    //  - `id` (uuid) + `ts` (ISO-8601), never `timestamp`;
+    //  - `type` is the §16 enum — anything else stays local-only;
+    //  - `tokenId` is the genesis-stable lowercase hex (strip the `v2_` UI prefix);
+    //  - `counterpartyPubkey` only when it IS a 33-byte compressed pubkey.
+    const postableType = historyEntry.type === 'SENT' || historyEntry.type === 'RECEIVED' || historyEntry.type === 'MINT';
+    if (walletApi && postableType) {
+      try {
+        const fieldKey = this.getFieldEncryptionKey();
+        const counterpartyNametag = historyEntry.recipientNametag ?? historyEntry.senderNametag;
+        const wireTokenId = historyEntry.tokenId?.replace(/^v2_/, '');
+        const counterparty = historyEntry.recipientPubkey ?? historyEntry.senderPubkey;
+        await walletApi.postHistoryRecords([
+          {
+            dedupKey: historyEntry.dedupKey,
+            id: crypto.randomUUID(),
+            type: historyEntry.type,
+            ts: new Date(historyEntry.timestamp).toISOString(),
+            assets: [{ coinId: historyEntry.coinId, amount: historyEntry.amount }],
+            ...(historyEntry.transferId !== undefined ? { transferId: historyEntry.transferId } : {}),
+            ...(wireTokenId !== undefined && /^(?:[0-9a-f]{2}){1,64}$/.test(wireTokenId)
+              ? { tokenId: wireTokenId }
+              : {}),
+            ...(counterparty !== undefined && /^0[23][0-9a-f]{64}$/.test(counterparty)
+              ? { counterpartyPubkey: counterparty }
+              : {}),
+            ...(historyEntry.memo !== undefined ? { memo: encryptField(fieldKey, historyEntry.memo) } : {}),
+            ...(counterpartyNametag !== undefined
+              ? { counterpartyNametag: encryptField(fieldKey, counterpartyNametag) }
+              : {}),
+          },
+        ]);
+      } catch (err) {
+        logger.warn('Payments', 'history POST failed (kept locally; dedupKey makes retry safe):', err);
+      }
+    }
+
     // Notify listeners that a history entry was saved
     this.deps!.emitEvent('history:updated', historyEntry);
   }
 
   /**
-   * Load history from the local token storage provider into the in-memory cache.
-   * Also performs one-time migration from legacy KV storage.
+   * Load history into the in-memory cache.
+   *
+   * In the wallet-api composition (the `walletApi` client is present) the
+   * durable §10 history log lives on the SERVER — the thin storage provider
+   * keeps none — so the cache is rebuilt from `walletApi.listHistory()`. The
+   * twin of the #521 inventory reload bug: `_historyCache` is process-lifetime,
+   * so a reload (tab refresh) must re-pull it or render an empty history.
+   * Compositions WITHOUT `walletApi` keep the legacy local path below.
    */
   async loadHistory(): Promise<void> {
+    if (this.deps!.walletApi?.listHistory) {
+      await this.hydrateHistoryFromServer(this.deps!.walletApi);
+      return;
+    }
     const provider = this.getLocalTokenStorageProvider();
     if (provider?.getHistoryEntries) {
       this._historyCache = await provider.getHistoryEntries();
@@ -2755,6 +3726,96 @@ export class PaymentsModule {
           this._historyCache = [];
         }
       }
+    }
+  }
+
+  /**
+   * Rebuild `_historyCache` from the server's §10 history log (the wallet-api
+   * composition). Pages newest-first via the keyset cursor until `more:false`
+   * or the page cap; dedups by `dedupKey` (a hydrate-then-receive in the same
+   * session must not double-list). The S6 `memo` / `counterpartyNametag`
+   * envelopes are decrypted with the owner's own field key on the way in.
+   *
+   * Best-effort, like the §10 history POST: history is untrusted DISPLAY data,
+   * so a backend outage during hydration must NEVER fail `load()` (the money
+   * path) — the in-session cache is left intact and the pull retries next load.
+   */
+  private async hydrateHistoryFromServer(api: PaymentsWalletApiPort): Promise<void> {
+    // #583 defense-in-depth owner guard: capture the owner this hydration ran
+    // for and refuse to OVERWRITE `_historyCache` if the module's identity
+    // changed under us (a re-init mid-pull). Per-address isolation pins the
+    // client per owner so this can't normally happen; the guard ensures a stale
+    // pull never replaces the active owner's history with another owner's.
+    const owner = this.deps!.identity.chainPubkey;
+    const byDedupKey = new Map<string, TransactionHistoryEntry>();
+    try {
+      let before: string | undefined;
+      for (let page = 0; page < MAX_HISTORY_HYDRATION_PAGES; page++) {
+        const result = await api.listHistory(before !== undefined ? { before } : {});
+        for (const wire of result.records) {
+          if (!byDedupKey.has(wire.dedupKey)) {
+            byDedupKey.set(wire.dedupKey, this.historyEntryFromWire(wire));
+          }
+        }
+        if (!result.more || result.cursor === null) break;
+        before = result.cursor;
+      }
+    } catch (err) {
+      logger.warn('Payments', 'history hydration from server failed (kept in-memory; retries next load):', err);
+      return;
+    }
+    if (this.deps!.identity.chainPubkey !== owner) {
+      logger.warn('Payments', 'history hydration owner changed mid-pull — discarding stale result (owner guard)');
+      return;
+    }
+    this._historyCache = [...byDedupKey.values()];
+  }
+
+  /**
+   * Map one §16 history wire record onto the display
+   * {@link TransactionHistoryEntry}. `counterpartyNametag` lands on the role-
+   * appropriate field (sender for RECEIVED, recipient otherwise); the S6 memo +
+   * nametag envelopes decrypt under THIS wallet's field key (self-scoped at
+   * rest — §8.3), surfaced as absent if they don't decrypt rather than as
+   * ciphertext (same rule as mailbox/payment-request memos).
+   */
+  private historyEntryFromWire(wire: WalletApiHistoryRecord): TransactionHistoryEntry {
+    const asset = wire.assets[0];
+    const coinId = asset?.coinId ?? '';
+    const received = wire.type === 'RECEIVED';
+    const memo = this.tryDecryptField(wire.memo);
+    const nametag = this.tryDecryptField(wire.counterpartyNametag);
+    return {
+      id: wire.id,
+      dedupKey: wire.dedupKey,
+      type: wire.type as TransactionHistoryEntry['type'],
+      amount: asset?.amount ?? '0',
+      coinId,
+      symbol: this.getCoinSymbol(coinId),
+      timestamp: Date.parse(wire.ts),
+      ...(wire.transferId !== undefined ? { transferId: wire.transferId } : {}),
+      ...(wire.tokenId !== undefined ? { tokenId: wire.tokenId } : {}),
+      ...(wire.counterpartyPubkey !== undefined
+        ? received
+          ? { senderPubkey: wire.counterpartyPubkey }
+          : { recipientPubkey: wire.counterpartyPubkey }
+        : {}),
+      ...(nametag !== undefined
+        ? received
+          ? { senderNametag: nametag }
+          : { recipientNametag: nametag }
+        : {}),
+      ...(memo !== undefined ? { memo } : {}),
+    };
+  }
+
+  /** S6 field decrypt that surfaces an undecryptable envelope as absent (§8.3). */
+  private tryDecryptField(envelope?: string): string | undefined {
+    if (envelope === undefined) return undefined;
+    try {
+      return decryptField(this.getFieldEncryptionKey(), envelope);
+    } catch {
+      return undefined;
     }
   }
 
@@ -2835,6 +3896,23 @@ export class PaymentsModule {
    */
   getNametag(): NametagData | null {
     return this.nametags[0] ?? null;
+  }
+
+  /**
+   * The requester's CURRENT display nametag for outgoing memos: the canonical
+   * Sphere-level (Nostr-backed) store first, then the local minted-token store.
+   *
+   * The minted-token `nametags[]` is populated only by the best-effort,
+   * oracle-gated mint path, so in the real app it is empty at send time even
+   * when the user has a nametag — reading it dropped the nametag from the
+   * payment-request/delivery memo and the payer rendered a raw pubkey. The
+   * canonical store (injected via `getCurrentNametag`) is the one the UI shows
+   * and is reliably loaded on every startup. (#576, 6bd3058 regression)
+   *
+   * @returns The bare nametag name (no leading '@'), or `undefined`.
+   */
+  private currentNametagName(): string | undefined {
+    return this.deps?.getCurrentNametag?.() ?? this.nametags[0]?.name;
   }
 
   /**
@@ -2923,6 +4001,7 @@ export class PaymentsModule {
   private async storeEngineToken(
     engine: ITokenEngine,
     token: SphereToken,
+    opts: { criticalSave?: boolean } = {},
   ): Promise<{ uiToken: Token; added: boolean }> {
     // Re-encode from the decoded blob; byte-identical to the wire blob (canonical CBOR).
     const sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(token)));
@@ -2940,7 +4019,7 @@ export class PaymentsModule {
       updatedAt: Date.now(),
       sdkData,
     };
-    const added = await this.addToken(uiToken);
+    const added = await this.addToken(uiToken, opts);
     return { uiToken, added };
   }
 
@@ -2987,7 +4066,10 @@ export class PaymentsModule {
         recipientPubkey: engine.getIdentity().chainPubkey,
         value: { assets: [{ coinId: coinIdHex, amount }] },
       });
-      const { uiToken } = await this.storeEngineToken(engine, minted);
+      // #515 F2: the mint is user-facing — a failed save of the ACTIVE custody
+      // provider must fail the mint (a RAM-only blob behind a success modal is
+      // permanent loss on reload), not report success.
+      const { uiToken } = await this.storeEngineToken(engine, minted, { criticalSave: true });
       return { success: true, token: uiToken, tokenId: engine.tokenId(minted) };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -3401,8 +4483,15 @@ export class PaymentsModule {
    * Decode the blob, dedup by the genesis-stable token id, store it as a
    * confirmed token, and emit/record the receipt. No commitment / inclusion-proof
    * / finalization round-trip (contrast the v1 sourceToken+transferTx path).
+   *
+   * Transport-agnostic (sdk-changes S3): fed by the relay push subscription
+   * AND by the delivery port's incoming pump — the returned verdict lets the
+   * pump map outcomes onto `ack('claimed' | 'rejected')`.
    */
-  private async handleV2Transfer(payload: V2TransferPayload, senderPubkey: string): Promise<void> {
+  private async handleV2Transfer(
+    payload: V2TransferPayload,
+    senderPubkey: string
+  ): Promise<'stored' | 'duplicate' | 'storage-rejected' | 'invalid' | 'not-owned' | 'no-engine'> {
     this.ensureInitialized();
     if (!this.loaded && this.loadedPromise) {
       await this.loadedPromise;
@@ -3411,15 +4500,26 @@ export class PaymentsModule {
     const engine = this.deps!.tokenEngine;
     if (!engine) {
       logger.error('Payments', 'V2 transfer received but no token engine is configured — payload dropped. Supply the v2 oracle config (trust base + gateway URL).');
-      return;
+      return 'no-engine';
     }
 
     let token: SphereToken;
     try {
-      token = await engine.decodeToken(decodeTokenBlob(hexToBytes(payload.tokenBlob)));
+      // Tolerant read: peers/journals carry the sphere envelope, while the
+      // wallet-api mailbox serves RAW wire bytes (§5.2/§8.2). Either way the
+      // engine's decode re-derives the authoritative blob from the token
+      // itself, so the placeholder fields of a raw wrap are never trusted.
+      const bytes = hexToBytes(payload.tokenBlob);
+      let blob: TokenBlob;
+      try {
+        blob = decodeTokenBlob(bytes);
+      } catch {
+        blob = { v: TOKEN_BLOB_VERSION, network: 0, tokenId: '', token: bytes };
+      }
+      token = await engine.decodeToken(blob);
     } catch (err) {
       logger.error('Payments', 'V2 transfer: failed to decode token blob:', err);
-      return;
+      return 'invalid';
     }
 
     // Security: the sender hands us a FINISHED token — verify it cryptographically
@@ -3428,18 +4528,18 @@ export class PaymentsModule {
     const verdict = await engine.verify(token);
     if (!verdict.ok) {
       logger.warn('Payments', `V2 transfer rejected: verification failed (${verdict.reason ?? 'unknown'})`);
-      return;
+      return 'invalid';
     }
     if (!engine.isOwnedBy(token, engine.getIdentity().chainPubkey)) {
       logger.warn('Payments', 'V2 transfer rejected: token not addressed to this wallet');
-      return;
+      return 'not-owned';
     }
 
     // Dedup by genesis-stable id (a re-delivered identical token is ignored).
     const id = `v2_${engine.tokenId(token)}`;
     if (this.tokens.has(id)) {
       logger.debug('Payments', `V2 transfer ${id.slice(0, 16)}... already present, skipping`);
-      return;
+      return 'duplicate';
     }
 
     const { uiToken, added } = await this.storeEngineToken(engine, token);
@@ -3448,14 +4548,19 @@ export class PaymentsModule {
       // a duplicate race. Emitting transfer:incoming / writing RECEIVED history
       // here would announce a phantom payment for value the wallet does not hold.
       logger.warn('Payments', `V2 transfer ${id.slice(0, 16)}... rejected by storage (tombstoned/duplicate) — no event emitted`);
-      return;
+      return 'storage-rejected';
     }
+    // The sender's nametag rides the recipient-addressed delivery envelope
+    // (S6) — the PRIMARY counterparty identity. resolveSenderInfo (a Nostr
+    // transport-pubkey lookup that does NOT understand chain pubkeys) is only a
+    // best-effort FALLBACK and never gates receive.
     const senderInfo = await this.resolveSenderInfo(senderPubkey);
+    const senderNametag = payload.senderNametag ?? senderInfo.senderNametag;
 
     this.deps!.emitEvent('transfer:incoming', {
       id,
       senderPubkey,
-      senderNametag: senderInfo.senderNametag,
+      senderNametag,
       tokens: [uiToken],
       memo: payload.memo,
       receivedAt: Date.now(),
@@ -3469,9 +4574,11 @@ export class PaymentsModule {
       timestamp: Date.now(),
       senderPubkey,
       ...senderInfo,
+      ...(senderNametag !== undefined ? { senderNametag } : {}),
       memo: payload.memo,
       tokenId: id,
     });
+    return 'stored';
   }
 
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
@@ -3517,6 +4624,678 @@ export class PaymentsModule {
   }
 
   // ===========================================================================
+  // Delivery port: incoming pump + intent resume (sdk-changes S3/E.3)
+  // ===========================================================================
+
+  private teardownDeliveryPump(): void {
+    this.deliveryWakeUnsub?.();
+    this.deliveryWakeUnsub = null;
+    if (this.deliveryPollTimer !== null) {
+      clearInterval(this.deliveryPollTimer);
+      this.deliveryPollTimer = null;
+    }
+    if (this.inventoryPollTimer !== null) {
+      clearInterval(this.inventoryPollTimer);
+      this.inventoryPollTimer = null;
+    }
+  }
+
+  /**
+   * Route a §9 wake nudge to the matching stream's pull. The wake is
+   * best-effort — each branch also runs on a poll backstop, so a dropped wake
+   * only delays convergence, never breaks it:
+   * - `mailbox` → drain incoming deliveries;
+   * - `inventory` → debounced inventory resync (the owned-token set changed —
+   *   e.g. a top-up or a claim on another device/session);
+   * - `payment_requests` → pump the payment-request streams.
+   */
+  private handleWake(stream: WakeStream): void {
+    switch (stream) {
+      case 'mailbox':
+        void this.pumpIncomingDeliveries().catch((err) =>
+          logger.warn('Payments', 'Incoming delivery pump (wake) failed:', err)
+        );
+        return;
+      case 'inventory':
+        this.debouncedInventorySyncFromWake();
+        return;
+      case 'payment_requests':
+        void this.pumpPaymentRequests().catch((err) =>
+          logger.warn('Payments', 'Payment-request pump (wake) failed:', err)
+        );
+        return;
+    }
+  }
+
+  /**
+   * Debounced inventory resync driven by an `inventory` wake — coalesces a
+   * burst of wakes into one pull. Runs the same {@link resyncInventory} as the
+   * poll backstop: a wake just makes it fire sooner.
+   */
+  private debouncedInventorySyncFromWake(): void {
+    if (this.syncDebounceTimer) {
+      clearTimeout(this.syncDebounceTimer);
+    }
+    this.syncDebounceTimer = setTimeout(() => {
+      this.syncDebounceTimer = null;
+      void this.resyncInventory().catch((err) =>
+        logger.debug('Payments', 'Inventory resync (wake) failed:', err)
+      );
+    }, PaymentsModule.SYNC_DEBOUNCE_MS);
+  }
+
+  /**
+   * Pull the wallet-api inventory delta and re-merge the lazy view (§5.1/§9):
+   * a fresh {@link load} re-pulls from the durable cursor and re-merges the
+   * owned-token set, then emits the existing `sync:remote-update` so the
+   * frontend's realtime view lights up (the same event the storage `onEvent`
+   * path emits — DEAD in custodial mode without this). The owned-token count
+   * delta stands in for the per-provider add/remove counts (the thin provider's
+   * `sync()` reports none). Used by BOTH the `inventory` wake and the poll
+   * backstop, so convergence never depends on a wake arriving.
+   */
+  private async resyncInventory(): Promise<void> {
+    const before = this.tokens.size;
+    await this.load();
+    const after = this.tokens.size;
+    this.deps?.emitEvent('sync:remote-update', {
+      providerId: 'wallet-api',
+      name: 'inventory',
+      sequence: 0,
+      cid: '',
+      added: Math.max(0, after - before),
+      removed: Math.max(0, before - after),
+    });
+  }
+
+  /**
+   * Drain the delivery port's incoming feed through the transport-agnostic
+   * `handleV2Transfer` and acknowledge each delivery (S3):
+   * - verified + stored (or an idempotent duplicate) → `ack('claimed')`;
+   * - failed LOCAL verification / not addressed here / stale tombstoned
+   *   state → `ack('rejected')` (terminal for discovery only — the entry
+   *   stays claimable and its blob retained, §6) and surfaced to the app as
+   *   `transfer:invalid`;
+   * - engine unavailable / fetch failure → left unacknowledged (retried on
+   *   the next poll; the read pointer cannot advance past it, by design).
+   *
+   * Returns the number of newly stored tokens. Concurrent calls coalesce.
+   */
+  async pumpIncomingDeliveries(): Promise<number> {
+    if (!this.injectedDelivery) return 0;
+    if (this.pumpInFlight) return this.pumpInFlight;
+    this.pumpInFlight = this.doPumpIncomingDeliveries().finally(() => {
+      this.pumpInFlight = null;
+    });
+    return this.pumpInFlight;
+  }
+
+  /**
+   * receive() must observe deliveries present as of NOW — it must never coalesce
+   * onto a background pump (§9 wake/poll) that began before a just-arrived
+   * delivery, which would return without loading it. Await any in-flight pump,
+   * then start a fresh pull (a background pump's failure must not fail receive()).
+   */
+  private async pumpIncomingDeliveriesFresh(): Promise<number> {
+    const inFlight = this.pumpInFlight;
+    if (inFlight) {
+      try {
+        await inFlight;
+      } catch {
+        // re-pull regardless: a stale background pump's failure is not receive()'s
+      }
+    }
+    return this.pumpIncomingDeliveries();
+  }
+
+  private async doPumpIncomingDeliveries(): Promise<number> {
+    const delivery = this.injectedDelivery!;
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+    let stored = 0;
+    for await (const incoming of delivery.incoming()) {
+      try {
+        const accepted = await this.processIncomingDelivery(delivery, incoming);
+        if (accepted) stored++;
+      } catch (err) {
+        // Transient (network, blob fetch): leave unacked — the next poll
+        // retries; discovery of LATER entries continues regardless.
+        logger.warn(
+          'Payments',
+          `Incoming delivery ${incoming.deliveryId.slice(0, 12)}… failed transiently (will retry):`,
+          err
+        );
+      }
+    }
+    return stored;
+  }
+
+  /** Returns true when the delivery stored a new token. */
+  private async processIncomingDelivery(
+    delivery: DeliveryProvider,
+    incoming: IncomingDelivery
+  ): Promise<boolean> {
+    const bytes = await incoming.fetchBlob();
+    const payload: V2TransferPayload = {
+      type: 'V2_TRANSFER',
+      version: '2.0',
+      tokenBlob: bytesToHex(bytes),
+      // memo + senderNametag both ride the recipient-addressed delivery
+      // envelope (S6) the provider already decrypted — the nametag is the
+      // PRIMARY counterparty identity (no Nostr lookup; fixes "Someone").
+      memo: incoming.memo,
+      ...(incoming.senderNametag !== undefined ? { senderNametag: incoming.senderNametag } : {}),
+    };
+    const verdict = await this.handleV2Transfer(payload, incoming.senderPubkey ?? '');
+    switch (verdict) {
+      case 'stored':
+        await delivery.ack(incoming.deliveryId, 'claimed');
+        return true;
+      case 'duplicate':
+        // Idempotent re-delivery (e.g. claimed race with another device) —
+        // claim so the read pointer advances (claim is idempotent, §6).
+        await delivery.ack(incoming.deliveryId, 'claimed');
+        return false;
+      case 'invalid':
+      case 'not-owned':
+      case 'storage-rejected':
+        // Local verification failed (or the state is stale/tombstoned here):
+        // reject — terminal for DISCOVERY only; the entry stays claimable and
+        // its blob retained (§6), retryable after an app update (e.g. a
+        // trustbase fix). Surface as an invalid incoming payment.
+        await delivery.ack(incoming.deliveryId, 'rejected');
+        this.deps!.emitEvent('transfer:invalid', {
+          deliveryId: incoming.deliveryId,
+          senderPubkey: incoming.senderPubkey,
+          reason: verdict,
+        });
+        return false;
+      case 'no-engine':
+        // Not a verdict on the token at all — leave unacked for a later pump.
+        throw new SphereError('Token engine unavailable for incoming delivery', 'AGGREGATOR_ERROR');
+    }
+  }
+
+  // ===========================================================================
+  // wallet-api payment requests: incoming pump + outgoing refresh (S4 — §10/§16)
+  // ===========================================================================
+
+  /** The S4 capability slice — null unless the composed wallet-api port carries it. */
+  private paymentRequestsApi(): PaymentRequestsApi | null {
+    const api = this.deps?.walletApi;
+    if (
+      !api ||
+      typeof api.createPaymentRequest !== 'function' ||
+      typeof api.listPaymentRequests !== 'function' ||
+      typeof api.respondPaymentRequest !== 'function'
+    ) {
+      return null;
+    }
+    return api as PaymentRequestsApi;
+  }
+
+  private teardownPaymentRequestPump(): void {
+    if (this.prPollTimer !== null) {
+      clearInterval(this.prPollTimer);
+      this.prPollTimer = null;
+    }
+  }
+
+  // ── persisted cursor (per network + identity — mirrors the mailbox cursor) ──
+
+  private prCursorKey(): string {
+    const network = this.paymentRequestsApi()?.network ?? 'default';
+    return `wallet-api-pr:cursor:${network}:${this.deps!.identity.chainPubkey}`;
+  }
+
+  private async readPrCursorState(): Promise<{ cursor: bigint; syncEpoch: bigint } | null> {
+    const raw = await this.deps!.storage.get(this.prCursorKey());
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as { cursor?: string; syncEpoch?: string };
+      if (typeof parsed.cursor !== 'string' || typeof parsed.syncEpoch !== 'string') return null;
+      return { cursor: BigInt(parsed.cursor), syncEpoch: BigInt(parsed.syncEpoch) };
+    } catch {
+      return null;
+    }
+  }
+
+  private async persistPrCursorState(cursor: bigint, syncEpoch: bigint): Promise<void> {
+    await this.deps!.storage.set(
+      this.prCursorKey(),
+      JSON.stringify({ cursor: cursor.toString(), syncEpoch: syncEpoch.toString() })
+    );
+  }
+
+  // ── the pump ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Pull the wallet-api payment-request streams now (S4): drains the payer's
+   * incoming `?since=<seq>` stream (gap-free — §9/§16) into the existing
+   * handler/event surface and refreshes outgoing requests still awaiting a
+   * response. The poll interval and `load()` call this automatically; it is
+   * public for explicit fetch-now flows (mirrors {@link receive}). A no-op in
+   * compositions without the wallet-api payment-request capability — there
+   * the Nostr subscription is push-based.
+   */
+  async syncPaymentRequests(): Promise<void> {
+    await this.pumpPaymentRequests();
+  }
+
+  /** Coalesces concurrent pump runs (poll + wake + load can overlap). */
+  private async pumpPaymentRequests(): Promise<void> {
+    const api = this.paymentRequestsApi();
+    if (!api) return;
+    if (this.prPumpInFlight) return this.prPumpInFlight;
+    this.prPumpInFlight = this.doPumpPaymentRequests(api).finally(() => {
+      this.prPumpInFlight = null;
+    });
+    return this.prPumpInFlight;
+  }
+
+  private async doPumpPaymentRequests(api: PaymentRequestsApi): Promise<void> {
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+    await this.pumpIncomingPaymentRequests(api);
+    await this.refreshOutgoingPaymentRequests(api);
+  }
+
+  /**
+   * Drain the payer's gap-free `?since=<seq>` stream (§9/§16), mirroring the
+   * mailbox-cursor pattern: the persisted `{cursor, syncEpoch}` is the resume
+   * point; a `syncEpoch` change (server restore — §5.4) voids cursor
+   * continuity, so the tail re-pulls from 0 and the id-dedup in
+   * {@link surfaceIncomingPaymentRequest} absorbs the replays.
+   *
+   * Because the surfaced list is in-memory only, each session FIRST runs one
+   * full incoming hydration from `since=0` with NO status filter (#556 —
+   * mirrors {@link hydrateHistoryFromServer}): a fresh engine rebuilds the
+   * CURRENT state of ALL incoming requests — open AND resolved — so a request
+   * paid/declined/expired in a PRIOR session is still present (with its
+   * resolved status) instead of vanishing once the cursor advanced past it.
+   * Hydration NEVER fires the new-incoming handlers/events for resolved
+   * requests — only `open` ones notify (the status-aware
+   * {@link surfaceIncomingPaymentRequest}) — so reopening can't spam stale
+   * 'new request' notifications. After hydration the `since`-cursor delta poll
+   * picks up live updates from the resume point.
+   */
+  private async pumpIncomingPaymentRequests(api: PaymentRequestsApi): Promise<void> {
+    const persisted = await this.readPrCursorState();
+
+    if (!this.prBootstrapped) {
+      let scan = await api.listPaymentRequests({ role: 'incoming', since: 0n });
+      for (let pageCount = 0; pageCount < MAX_PR_HYDRATION_PAGES; pageCount++) {
+        for (const wire of scan.requests) this.surfaceIncomingPaymentRequest(wire);
+        if (!scan.more) break;
+        scan = await api.listPaymentRequests({ role: 'incoming', since: scan.cursor });
+      }
+      // Marked only after the hydration SUCCEEDS — a transient failure here must
+      // not skip recovery for the rest of the session (the next poll retries;
+      // the id-dedup makes a re-hydration safe).
+      this.prBootstrapped = true;
+    }
+
+    let page = await api.listPaymentRequests({ role: 'incoming', since: persisted?.cursor ?? 0n });
+    if (persisted !== null && page.syncEpoch !== persisted.syncEpoch) {
+      page = await api.listPaymentRequests({ role: 'incoming', since: 0n });
+    }
+    for (;;) {
+      for (const wire of page.requests) this.surfaceIncomingPaymentRequest(wire);
+      await this.persistPrCursorState(page.cursor, page.syncEpoch);
+      if (!page.more) break;
+      page = await api.listPaymentRequests({ role: 'incoming', since: page.cursor });
+    }
+  }
+
+  /**
+   * Decrypt a payment-request's recipient-addressed memo envelope into
+   * `{ memo, senderNametag }` (the requester's message + nametag). The key is
+   * the ECDH shared secret between THIS wallet (the payer) and the requester's
+   * chain pubkey (`wire.fromPubkey`) — symmetric with the requester's
+   * create-time derivation. Returns an empty bundle (and logs at debug) on any
+   * absence/failure so the incoming view never wedges on an unreadable memo
+   * (PR twin of #546/#547).
+   */
+  private decryptPaymentRequestMemo(
+    wire: WalletApiPaymentRequest
+  ): { memo?: string; senderNametag?: string } {
+    if (wire.memo === undefined) return {};
+    try {
+      const key = deriveDeliveryEncryptionKey(this.deps!.identity.privateKey, wire.fromPubkey);
+      return decryptDeliveryBundle(key, wire.memo);
+    } catch {
+      logger.debug('Payments', `Payment request ${wire.id.slice(0, 12)}… memo not addressed here / not decryptable`);
+      return {};
+    }
+  }
+
+  /** §16 wire status → the public {@link PaymentRequestStatus} display status. */
+  private static readonly PR_WIRE_STATUS: Record<
+    WalletApiPaymentRequest['status'],
+    PaymentRequestStatus
+  > = { open: 'pending', paid: 'paid', declined: 'rejected', expired: 'expired' };
+
+  /** Terminal local statuses: a re-surfaced wire may advance a request INTO one, never out of it. */
+  private static readonly PR_TERMINAL: ReadonlySet<PaymentRequestStatus> = new Set([
+    'paid',
+    'rejected',
+    'expired',
+  ]);
+
+  /**
+   * Map a §16 wire request onto the public {@link IncomingPaymentRequest}
+   * surface, deduped by id (the in-memory id-dedup doubles as the replay guard
+   * for cursor resets). Requests of EVERY status are surfaced so a reloaded
+   * thin wallet rebuilds the CURRENT state of its incoming view (#556) — open
+   * ones land as actionable `pending`, resolved ones carry their paid/declined
+   * (→ `rejected`)/expired status. Only `open` requests fire the new-incoming
+   * event + handlers; resolved requests are folded into the list silently, so a
+   * reload (or a `syncEpoch` re-pull) never re-notifies for already-resolved
+   * requests. Multi-asset requests surface their first asset (the module's
+   * request surface is single-asset; module-created requests always are).
+   */
+  private surfaceIncomingPaymentRequest(wire: WalletApiPaymentRequest): void {
+    // #583 defense-in-depth owner guard: only surface requests actually
+    // addressed to THIS module's owner. Per-address client isolation means an
+    // orphaned previous-address PR pump runs against its OWN client (its own
+    // owner), so a wire for a different owner should never arrive here — but if
+    // any shared state ever slips through, this drops it (and keeps it out of
+    // the wrong owner's actionable view + cursor) rather than bleeding a foreign
+    // request across addresses. Mirrors the engine.isOwnedBy delivery guard.
+    if (wire.toPubkey !== this.deps!.identity.chainPubkey) {
+      logger.warn(
+        'Payments',
+        `Incoming payment request ${wire.id.slice(0, 12)}… addressed to a different owner — skipping (owner guard)`
+      );
+      return;
+    }
+
+    const status = PaymentsModule.PR_WIRE_STATUS[wire.status];
+
+    // §16 upsert: a request re-surfaces in the incoming ?since= delta at a higher seq when it is
+    // resolved (paid/declined) or expired — on another device OR by THIS wallet's other session.
+    // If we already hold it, advance a still-actionable request to its terminal server state and
+    // emit the resolution event (so every session drops it from the actionable view); never
+    // downgrade, and never re-notify a request we've already surfaced.
+    const existing = this.paymentRequests.find((r) => r.id === wire.id);
+    if (existing !== undefined) {
+      if (PaymentsModule.PR_TERMINAL.has(status) && !PaymentsModule.PR_TERMINAL.has(existing.status)) {
+        this.updatePaymentRequestStatus(wire.id, status);
+      }
+      return;
+    }
+
+    const coinId = wire.assets[0]?.coinId ?? '';
+    const coinDef = TokenRegistry.getInstance().getDefinition(coinId);
+
+    // S6: the memo is a recipient-addressed envelope keyed off
+    // ECDH(payerPriv, requester chain pubkey = wire.fromPubkey) — symmetric
+    // with the requester's create-time derivation (the PR twin of #546/#547).
+    // It carries the requester's nametag AND message, so the payer renders
+    // "@requester" + the message instead of a raw pubkey. An envelope not
+    // addressed here, or any tamper, fails authentication and surfaces as
+    // absent — never garbage, and never thrown into the view path. Decrypted
+    // for resolved requests too (#554/dev.12), so a reloaded view renders the
+    // memo/nametag of a paid/declined request, not a raw pubkey.
+    const { memo: message, senderNametag } = this.decryptPaymentRequestMemo(wire);
+
+    const request: IncomingPaymentRequest = {
+      id: wire.id,
+      senderPubkey: wire.fromPubkey,
+      ...(senderNametag !== undefined ? { senderNametag } : {}),
+      amount: (wire.assets[0]?.amount ?? 0n).toString(),
+      coinId,
+      symbol: coinDef?.symbol || coinId.slice(0, 8),
+      ...(message !== undefined ? { message } : {}),
+      requestId: wire.id,
+      timestamp: wire.createdAt,
+      status,
+    };
+
+    // Add to list (newest first)
+    this.paymentRequests.unshift(request);
+
+    // Notify ONLY for actionable (open) requests — a reload-hydrated resolved
+    // request must not re-fire 'new incoming request' (#556). Open requests
+    // surfaced during hydration DO notify, exactly as the prior bootstrap did.
+    if (status === 'pending') {
+      this.deps?.emitEvent('payment_request:incoming', request);
+      for (const handler of this.paymentRequestHandlers) {
+        try {
+          handler(request);
+        } catch (error) {
+          logger.debug('Payments', 'Payment request handler error:', error);
+        }
+      }
+    }
+
+    logger.debug('Payments', `Incoming payment request: ${request.id} (${status}) for ${request.amount} ${request.symbol}`);
+  }
+
+  /**
+   * Outgoing requests are a `?before=` backfill view (§16 — newest-first, no
+   * gap-free tail): refresh only while something local still awaits a
+   * response, paging until every pending id is resolved or the view drains.
+   */
+  private async refreshOutgoingPaymentRequests(api: PaymentRequestsApi): Promise<void> {
+    const pendingIds = new Set(
+      [...this.outgoingPaymentRequests.values()].filter((r) => r.status === 'pending').map((r) => r.id)
+    );
+    if (pendingIds.size === 0) return;
+
+    let before: string | undefined;
+    for (;;) {
+      const page = await api.listPaymentRequests({
+        role: 'outgoing',
+        ...(before !== undefined ? { before } : {}),
+      });
+      for (const wire of page.requests) {
+        if (!pendingIds.delete(wire.id)) continue;
+        this.applyOutgoingPaymentRequestState(wire);
+      }
+      if (pendingIds.size === 0 || !page.more || page.cursor === null) return;
+      before = page.cursor;
+    }
+  }
+
+  /** Fold a server-side status change into the outgoing surface (responses + expiry). */
+  private applyOutgoingPaymentRequestState(wire: WalletApiPaymentRequest): void {
+    if (wire.status === 'open') return;
+    const outgoing = this.outgoingPaymentRequests.get(wire.id);
+    if (!outgoing || outgoing.status !== 'pending') return;
+
+    if (wire.status === 'expired') {
+      // §10: expiry is server-owned, not client-inferred — fold the status in;
+      // there is no responder, so no response is dispatched.
+      outgoing.status = 'expired';
+      return;
+    }
+
+    this.dispatchPaymentRequestResponse({
+      id: wire.id,
+      responderPubkey: wire.toPubkey,
+      requestId: wire.id,
+      responseType: wire.status === 'paid' ? 'paid' : 'rejected',
+      ...(wire.transferId !== null ? { transferId: wire.transferId } : {}),
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * E.3 resume: list this wallet's OPEN intents (server-side — any device),
+   * decrypt each payload, and re-run the engine with the SAME transferId and
+   * inputs — deterministic realization yields byte-identical transactions, so
+   * an interrupted transfer completes instead of failing (proof fetch →
+   * match-verify → apply, Part E). Called at sign-in (S4).
+   */
+  async resumeOpenIntents(): Promise<{ resumed: string[]; conflicted: string[]; failed: string[] }> {
+    this.ensureInitialized();
+    const walletApi = this.deps!.walletApi;
+    const engine = this.deps!.tokenEngine;
+    const outcome = { resumed: [] as string[], conflicted: [] as string[], failed: [] as string[] };
+    if (!walletApi || !engine) return outcome;
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+
+    const intents = await walletApi.listIntents('open');
+    for (const intent of intents) {
+      let payload: IntentPayloadV1;
+      try {
+        const plain = decryptField(this.getFieldEncryptionKey(), intent.payload);
+        payload = JSON.parse(plain) as IntentPayloadV1;
+        if (payload.v !== 1 || !Array.isArray(payload.direct)) {
+          throw new SphereError('Unknown intent payload shape', 'VALIDATION_ERROR');
+        }
+      } catch (err) {
+        logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… payload undecodable — skipped:`, err);
+        outcome.failed.push(intent.transferId);
+        continue;
+      }
+      try {
+        await this.resumeIntent(intent.transferId, payload);
+        outcome.resumed.push(intent.transferId);
+      } catch (err) {
+        if (err instanceof TransferConflictError) {
+          // E.2 lost race: abort (soft), never apply the foreign proof. The
+          // caller re-plans the remainder under a NEW transferId.
+          logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… lost its source to a concurrent transfer — aborted`);
+          try {
+            await walletApi.abortIntent(intent.transferId);
+          } catch (abortErr) {
+            logger.warn('Payments', 'abortIntent during resume failed:', abortErr);
+          }
+          outcome.conflicted.push(intent.transferId);
+        } else {
+          // Transient — the intent stays open; the next sign-in retries.
+          logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… resume failed (stays open):`, err);
+          outcome.failed.push(intent.transferId);
+        }
+      }
+    }
+    return outcome;
+  }
+
+  /**
+   * Re-run one intent end-to-end: getToken (works for tombstoned rows — §5.3
+   * recovery surface), engine re-run under the original transferId, journaled
+   * delivery, the single §7 apply (inventory custody only), uniform close,
+   * and the SENT history record (dedupKey'd by transferId — idempotent).
+   */
+  private async resumeIntent(transferId: string, payload: IntentPayloadV1): Promise<void> {
+    const engine = this.deps!.tokenEngine!;
+    const walletApi = this.deps!.walletApi!;
+    const delivery = this.delivery!;
+    const provider = this.getActiveTokenStorageProvider();
+    if (!provider) throw new SphereError('No token storage provider for intent resume', 'STORAGE_ERROR');
+
+    const serverApply = delivery.custody === 'inventory';
+    const recipientChainPubkey = hexToBytes(payload.recipient);
+    const memoData =
+      parseInvoiceMemoForOnChain(payload.memo, payload.invoiceRefundAddress, payload.invoiceContact) ??
+      undefined;
+
+    const deliverBlob = async (tokenBlobHex: string): Promise<void> => {
+      await this.savePendingV2Delivery({
+        transferId,
+        recipientPubkey: payload.recipient,
+        tokenBlob: tokenBlobHex,
+        memo: payload.memo,
+        createdAt: Date.now(),
+      });
+      const nm = this.currentNametagName();
+      await delivery.deliver(payload.recipient, hexToBytes(tokenBlobHex), {
+        transferId,
+        memo: payload.memo,
+        ...(nm !== undefined ? { senderNametag: nm } : {}),
+      });
+      await this.removePendingV2Delivery(tokenBlobHex);
+    };
+
+    const spent: string[] = [];
+    for (const [opIndex, genesisId] of payload.direct.entries()) {
+      const blob = await provider.getToken(genesisId);
+      const source = await engine.decodeToken(blob);
+      const finished = await engine.transfer(
+        { token: source, recipientPubkey: recipientChainPubkey, data: memoData },
+        // (transferId, opIndex) pairing replayed from the intent's persisted order (§8.1)
+        { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex }
+      );
+      await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(finished))));
+      spent.push(genesisId);
+    }
+
+    let changeOutput: SphereToken | null = null;
+    if (payload.split) {
+      const blob = await provider.getToken(payload.split.tokenId);
+      const source = await engine.decodeToken(blob);
+      const selfChainPubkey = hexToBytes(this.deps!.identity.chainPubkey);
+      const { outputs } = await engine.split(
+        {
+          token: source,
+          outputs: [
+            {
+              recipientPubkey: recipientChainPubkey,
+              coinId: payload.coinId,
+              amount: BigInt(payload.split.splitAmount),
+              data: memoData,
+            },
+            {
+              recipientPubkey: selfChainPubkey,
+              coinId: payload.coinId,
+              amount: BigInt(payload.split.remainderAmount),
+            },
+          ],
+        },
+        // Split opIndex follows the direct ops — replayed from the intent's order (§8.1).
+        { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: payload.direct.length }
+      );
+      changeOutput = outputs[1];
+      // critical (#515 F2): own-storage custody — persist-or-stay-open; a
+      // throw keeps the intent open and the next sign-in re-runs it.
+      if (!serverApply) await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
+      await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0]))));
+      spent.push(payload.split.tokenId);
+    }
+
+    if (serverApply) {
+      const added: { tokenId: string; key: string }[] = [];
+      if (changeOutput) {
+        const changeBytes = encodeTokenBlob(engine.encodeToken(changeOutput));
+        added.push({ tokenId: engine.tokenId(changeOutput), key: await this.uploadOutputBlob(changeBytes) });
+      }
+      await provider.applyDelta(transferId, spent, added);
+      if (changeOutput) await this.storeEngineToken(engine, changeOutput);
+    }
+
+    // Drop any local records of the consumed sources (present when resuming
+    // on the originating device).
+    for (const genesisId of spent) {
+      const local = this.tokens.get(`v2_${genesisId}`);
+      if (local) await this.removeToken(local.id, transferId);
+    }
+
+    // E.3 uniform close (idempotent; the apply above usually already did it).
+    await walletApi.completeIntent(transferId);
+
+    // §10: the SENT record — same dedupKey as the original attempt, so a
+    // resume after the history POST is a no-op server-side.
+    await this.addToHistory({
+      type: 'SENT',
+      amount: payload.amount,
+      coinId: payload.coinId,
+      symbol: this.getCoinSymbol(payload.coinId),
+      timestamp: Date.now(),
+      recipientPubkey: payload.recipient,
+      memo: payload.memo,
+      transferId,
+      tokenId: payload.direct[0] ? `v2_${payload.direct[0]}` : undefined,
+    });
+  }
+
+  // ===========================================================================
   // Private: Archive
   // ===========================================================================
 
@@ -3549,7 +5328,21 @@ export class PaymentsModule {
   // Private: Storage
   // ===========================================================================
 
-  private async save(): Promise<void> {
+  /**
+   * Persist the token state to every (non-disabled) token storage provider.
+   *
+   * #515 D3b/F2: `SaveResult.success` is CHECKED for the ACTIVE custody
+   * provider (the thin wallet-api provider deliberately returns
+   * `{success:false}` on failure instead of throwing) — silent acceptance let
+   * a mint certify on-chain with the blob in RAM only. On an active-provider
+   * failure:
+   *  - `critical: true` (user-facing mint/send paths) → throws STORAGE_ERROR,
+   *    so the flow reports failure instead of success;
+   *  - otherwise (background writers) → emits `storage:degraded`.
+   * Non-active (secondary) provider failures keep the existing log-only
+   * behavior.
+   */
+  private async save(opts: { critical?: boolean } = {}): Promise<void> {
     // Save to TokenStorageProviders (IndexedDB/files)
     const providers = this.getTokenStorageProviders();
     // Debug: log token serialization status
@@ -3559,19 +5352,29 @@ export class PaymentsModule {
     });
     logger.debug('Payments', `save(): providers=${providers.size}, tokens=[${tokenStats.join(', ')}]`);
 
-    if (providers.size > 0) {
-      const data = await this.createStorageData();
-      const dataKeys = Object.keys(data).filter(k => k.startsWith('token-'));
-      logger.debug('Payments', `save(): TXF keys=${dataKeys.length} (${dataKeys.join(', ')})`);
-      for (const [id, provider] of providers) {
-        try {
-          await provider.save(data);
-        } catch (err) {
-          logger.error('Payments', `Failed to save to provider ${id}:`, err);
-        }
-      }
-    } else {
+    if (providers.size === 0) {
       logger.debug('Payments', 'save(): No token storage providers - TXF not persisted');
+      return;
+    }
+    const data = await this.createStorageData();
+    const dataKeys = Object.keys(data).filter(k => k.startsWith('token-'));
+    logger.debug('Payments', `save(): TXF keys=${dataKeys.length} (${dataKeys.join(', ')})`);
+    const activeId = providers.keys().next().value;
+    for (const [id, provider] of providers) {
+      let error: string | null = null;
+      try {
+        const result = await provider.save(data);
+        if (!result.success) error = result.error ?? 'save failed';
+      } catch (err) {
+        error = err instanceof Error ? err.message : String(err);
+      }
+      if (error === null) continue;
+      logger.error('Payments', `Failed to save to provider ${id}: ${error}`);
+      if (id !== activeId) continue;
+      if (opts.critical) {
+        throw new SphereError(`Token storage save failed (${id}): ${error}`, 'STORAGE_ERROR');
+      }
+      this.deps!.emitEvent('storage:degraded', { providerId: id, error });
     }
   }
 
@@ -3601,46 +5404,133 @@ export class PaymentsModule {
     return data ? (JSON.parse(data) as PendingV2Delivery[]) : [];
   }
 
+  /** #517: run a journal read-modify-write atomically against all other journal mutations. */
+  private withJournalLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.journalMutation.then(fn, fn);
+    this.journalMutation = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
   private async savePendingV2Delivery(entry: PendingV2Delivery): Promise<void> {
-    const all = await this.loadPendingV2Deliveries();
-    if (!all.some((e) => e.tokenBlob === entry.tokenBlob)) {
-      all.push(entry);
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
-    }
+    await this.withJournalLock(async () => {
+      const all = await this.loadPendingV2Deliveries();
+      if (!all.some((e) => e.tokenBlob === entry.tokenBlob)) {
+        all.push(entry);
+        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
+      }
+    });
   }
 
   private async removePendingV2Delivery(tokenBlob: string): Promise<void> {
-    const all = await this.loadPendingV2Deliveries();
-    const filtered = all.filter((e) => e.tokenBlob !== tokenBlob);
-    if (filtered.length !== all.length) {
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
-    }
+    await this.withJournalLock(async () => {
+      const all = await this.loadPendingV2Deliveries();
+      const filtered = all.filter((e) => e.tokenBlob !== tokenBlob);
+      if (filtered.length !== all.length) {
+        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
+      }
+    });
   }
 
   /**
-   * Replay journaled finished-but-undelivered v2 blobs (kicked fire-and-forget
-   * from load()). The recipient dedups re-deliveries by the genesis-stable
-   * token id, so replaying an already-delivered blob is harmless. Entries that
-   * still fail to send are kept for the next load.
+   * Replay journaled finished-but-undelivered v2 blobs (kicked from load())
+   * through the delivery port (sdk-changes S3). Idempotent end to end: the
+   * mailbox deposit is idempotent by the content-derived entry_id — it succeeds
+   * even after the recipient claimed (§6) — and the relay path's recipient
+   * dedups by the genesis-stable token id.
+   *
+   * #517 item 1: instead of a silent unbounded fire-and-forget, each entry is
+   * retried with bounded exponential backoff, its cumulative failed-attempt
+   * count is journaled across loads, and an entry that exhausts
+   * {@link MAX_DELIVERY_REPLAY_ATTEMPTS} is SURFACED as poison
+   * (`delivery:undeliverable`) and left journaled but no longer auto-retried —
+   * so a journaled blob never sits undelivered invisibly.
    */
   private async replayPendingV2Deliveries(): Promise<void> {
-    const entries = await this.loadPendingV2Deliveries();
-    if (entries.length === 0) return;
-    logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
-    for (const e of entries) {
+    // #517: drop an overlapping pass — a replay started while one is in flight
+    // would read the same journal snapshot, re-deliver the same entries, and
+    // race the per-entry `attempts` read/modify/write. Dropped entries stay
+    // journaled and replay on the next load(), so nothing is lost.
+    if (this.replayInFlight) return;
+    this.replayInFlight = true;
+    try {
+      const entries = (await this.loadPendingV2Deliveries()).filter((e) => !e.undeliverable);
+      if (entries.length === 0) return;
+      logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
+      for (const e of entries) {
+        await this.replayOneDelivery(e);
+      }
+    } finally {
+      this.replayInFlight = false;
+    }
+  }
+
+  /** Replay a single journaled entry: backoff retries → success/removal, or → bounded poison. */
+  private async replayOneDelivery(entry: PendingV2Delivery): Promise<void> {
+    const tag = entry.transferId.slice(0, 8);
+    try {
+      await this.attemptDeliveryWithBackoff(entry);
+      await this.removePendingV2Delivery(entry.tokenBlob);
+      logger.debug('Payments', `Replayed undelivered v2 transfer ${tag}...`);
+    } catch (err) {
+      const attempts = (entry.attempts ?? 0) + 1;
+      const message = err instanceof Error ? err.message : String(err);
+      if (attempts >= MAX_DELIVERY_REPLAY_ATTEMPTS) {
+        await this.markDeliveryPoison(entry, attempts, message);
+        return;
+      }
+      await this.bumpDeliveryAttempts(entry.tokenBlob, attempts);
+      logger.warn('Payments', `Replay of undelivered v2 transfer ${tag}... failed (attempt ${attempts}/${MAX_DELIVERY_REPLAY_ATTEMPTS}, kept for next load):`, err);
+    }
+  }
+
+  /** One delivery with in-pass exponential backoff; throws the last error if all attempts fail. */
+  private async attemptDeliveryWithBackoff(entry: PendingV2Delivery): Promise<void> {
+    const nm = this.currentNametagName();
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= DELIVERY_REPLAY_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const delay = Math.min(this.replayBackoffBaseMs * 2 ** (attempt - 1), DELIVERY_REPLAY_MAX_DELAY_MS);
+        if (delay > 0) await sleep(delay);
+      }
       try {
-        await this.deps!.transport.sendTokenTransfer(e.recipientPubkey, {
-          type: 'V2_TRANSFER',
-          version: '2.0',
-          tokenBlob: e.tokenBlob,
-          memo: e.memo,
-        } as unknown as import('../../transport').TokenTransferPayload);
-        await this.removePendingV2Delivery(e.tokenBlob);
-        logger.debug('Payments', `Replayed undelivered v2 transfer ${e.transferId.slice(0, 8)}...`);
+        await this.delivery!.deliver(entry.recipientPubkey, hexToBytes(entry.tokenBlob), {
+          transferId: entry.transferId,
+          memo: entry.memo,
+          ...(nm !== undefined ? { senderNametag: nm } : {}),
+        });
+        return;
       } catch (err) {
-        logger.warn('Payments', `Replay of undelivered v2 transfer ${e.transferId.slice(0, 8)}... failed (kept for next load):`, err);
+        lastErr = err;
       }
     }
+    throw lastErr;
+  }
+
+  /** Mark a journal entry poison (keep it, stop retrying) and surface it (#517 item 1). */
+  private async markDeliveryPoison(entry: PendingV2Delivery, attempts: number, error: string): Promise<void> {
+    await this.updatePendingV2Delivery(entry.tokenBlob, (e) => { e.attempts = attempts; e.undeliverable = true; });
+    logger.error('Payments', `Undelivered v2 transfer ${entry.transferId.slice(0, 8)}... is POISON after ${attempts} attempts — surfaced, kept journaled, no longer auto-retried:`, error);
+    this.deps!.emitEvent('delivery:undeliverable', {
+      transferId: entry.transferId,
+      recipientPubkey: entry.recipientPubkey,
+      attempts,
+      error,
+    });
+  }
+
+  private async bumpDeliveryAttempts(tokenBlob: string, attempts: number): Promise<void> {
+    await this.updatePendingV2Delivery(tokenBlob, (e) => { e.attempts = attempts; });
+  }
+
+  /** Mutate one journaled entry in place (keyed by tokenBlob) and persist. No-op if gone. */
+  private async updatePendingV2Delivery(tokenBlob: string, mutate: (e: PendingV2Delivery) => void): Promise<void> {
+    await this.withJournalLock(async () => {
+      const all = await this.loadPendingV2Deliveries();
+      const target = all.find((e) => e.tokenBlob === tokenBlob);
+      if (!target) return;
+      mutate(target);
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
+    });
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {

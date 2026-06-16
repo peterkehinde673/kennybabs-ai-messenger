@@ -72,6 +72,13 @@ export interface Token {
   readonly createdAt: number;
   updatedAt: number;
   readonly sdkData?: string;
+  /**
+   * Lazy inventory record (sdk-changes S2): the token's VALUE metadata came
+   * from the storage provider's `listInventory()` view and its blob has not
+   * been downloaded — `sdkData` is absent and the blob is fetched on demand
+   * (`getToken`) only when the token is selected for a spend.
+   */
+  readonly lazy?: boolean;
 }
 
 export interface Asset {
@@ -90,8 +97,16 @@ export interface Asset {
   readonly confirmedTokenCount: number;
   /** Number of unconfirmed tokens aggregated */
   readonly unconfirmedTokenCount: number;
-  /** Number of tokens currently being sent */
+  /** Number of tokens currently being sent (in-flight, NOT spendable) */
   readonly transferringTokenCount: number;
+  /**
+   * Sum of in-flight (`'transferring'`) token amounts (smallest units). These
+   * tokens are LEAVING the wallet during an active send, so they are excluded
+   * from {@link totalAmount}, {@link confirmedAmount}, and
+   * {@link unconfirmedAmount} — surfaced here so a UI can still show a "Sending"
+   * badge without inflating the spendable balance.
+   */
+  readonly transferringAmount: string;
   /** Price per whole unit in USD (null if PriceProvider not configured) */
   readonly priceUsd: number | null;
   /** Price per whole unit in EUR (null if PriceProvider not configured) */
@@ -375,10 +390,12 @@ export type SphereEventType =
   | 'transfer:incoming'
   | 'transfer:confirmed'
   | 'transfer:failed'
+  | 'transfer:invalid'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
   | 'payment_request:paid'
+  | 'payment_request:expired'
   | 'payment_request:response'
   | 'message:dm'
   | 'message:read'
@@ -389,6 +406,11 @@ export type SphereEventType =
   | 'sync:completed'
   | 'sync:provider'
   | 'sync:error'
+  | 'storage:degraded'
+  | 'inventory:conflict'
+  | 'delivery:undeliverable'
+  | 'walletapi:session'
+  | 'realtime:status'
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
@@ -448,10 +470,18 @@ export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
   'transfer:confirmed': TransferResult;
   'transfer:failed': TransferResult;
+  /**
+   * An incoming delivery failed LOCAL verification and was rejected back to
+   * the delivery rail (sdk-changes S3): terminal for discovery only — the
+   * entry stays claimable server-side and may be retried after an app update
+   * (e.g. a trustbase fix).
+   */
+  'transfer:invalid': { deliveryId: string; senderPubkey?: string; reason: string };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;
   'payment_request:rejected': IncomingPaymentRequest;
   'payment_request:paid': IncomingPaymentRequest;
+  'payment_request:expired': IncomingPaymentRequest;
   'payment_request:response': PaymentRequestResponse;
   'message:dm': DirectMessage;
   'message:read': { messageIds: string[]; peerPubkey: string };
@@ -462,6 +492,49 @@ export interface SphereEventMap {
   'sync:completed': { source: string; count: number };
   'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
+  /**
+   * The ACTIVE custody token-storage provider failed a background save
+   * (#515 D3b): the in-memory token state is NOT durably persisted until a
+   * later save succeeds. User-facing flows (mint/send) fail loudly instead of
+   * emitting this.
+   */
+  'storage:degraded': { providerId: string; error: string };
+  /**
+   * A send lost a race on a source token (#517): coin-selection planned from a
+   * lazy-inventory view that was stale (missing another device's spend), so the
+   * engine raised `TransferConflictError` (Part E.2 — `TRANSACTION_HASH_MISMATCH`).
+   * The send fails cleanly and the conflicted source is reconciled to 'spent';
+   * this surfaces the otherwise-silent recoverable condition so a UI can prompt
+   * "refresh and retry". `transferId` is the aborted send's id.
+   */
+  'inventory:conflict': { transferId: string; coinId: string; error: string };
+  /**
+   * A journaled finished-but-undelivered v2 transfer blob (#517) has exhausted
+   * its bounded replay budget and is now POISON: it stays journaled (the deposit
+   * is idempotent, so a later app version may still land it) but is no longer
+   * auto-retried, so it does not sit undelivered invisibly. `attempts` counts
+   * failed replay PASSES (one per `load()`), NOT underlying delivery calls — each
+   * pass internally retries with backoff, so the real number of delivery attempts
+   * is higher. Surfacing trips once `attempts` reaches the bounded budget.
+   */
+  'delivery:undeliverable': { transferId: string; recipientPubkey: string; attempts: number; error: string };
+  /**
+   * wallet-api session state change (#515 F3): 'offline' = sign-in failed and
+   * the wallet runs degraded (no intents barrier, no server custody writes);
+   * flips to 'online' when a later sign-in succeeds. Readable any time via
+   * `sphere.walletApiSessionStatus`.
+   */
+  'walletapi:session': { status: 'online' | 'offline'; error?: string };
+  /**
+   * True liveness of the realtime wake socket (§9), DISTINCT from sign-in
+   * session state (`walletapi:session`) and from provider connectivity
+   * (`connection:changed`): `connected` — a wake socket is open; `reconnecting`
+   * — it dropped and the supervisor is backing off (the poll backstop carries
+   * correctness meanwhile); `closed` — torn down on logout/destroy. The wake is
+   * only a nudge, so this is a frontend "live" indicator, never a correctness
+   * gate.
+   */
+  'realtime:status': { status: 'connecting' | 'connected' | 'reconnecting' | 'closed' };
   'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };

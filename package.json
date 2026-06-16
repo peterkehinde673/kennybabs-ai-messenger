@@ -1,6 +1,6 @@
 {
   "name": "@unicitylabs/sphere-sdk",
-  "version": "0.9.0",
+  "version": "0.9.1-dev.17",
   "description": "Modular TypeScript SDK for Unicity wallet operations",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -35,6 +35,16 @@
         "default": "./dist/impl/nodejs/index.cjs"
       }
     },
+    "./impl/shared/wallet-api": {
+      "import": {
+        "types": "./dist/impl/shared/wallet-api/index.d.ts",
+        "default": "./dist/impl/shared/wallet-api/index.js"
+      },
+      "require": {
+        "types": "./dist/impl/shared/wallet-api/index.d.cts",
+        "default": "./dist/impl/shared/wallet-api/index.cjs"
+      }
+    },
     "./core": {
       "import": {
         "types": "./dist/core/index.d.ts",
@@ -43,6 +53,26 @@
       "require": {
         "types": "./dist/core/index.d.cts",
         "default": "./dist/core/index.cjs"
+      }
+    },
+    "./token-engine": {
+      "import": {
+        "types": "./dist/token-engine/index.d.ts",
+        "default": "./dist/token-engine/index.js"
+      },
+      "require": {
+        "types": "./dist/token-engine/index.d.cts",
+        "default": "./dist/token-engine/index.cjs"
+      }
+    },
+    "./wallet-api": {
+      "import": {
+        "types": "./dist/wallet-api/index.d.ts",
+        "default": "./dist/wallet-api/index.js"
+      },
+      "require": {
+        "types": "./dist/wallet-api/index.d.cts",
+        "default": "./dist/wallet-api/index.cjs"
       }
     },
     "./l1": {
@@ -92,14 +122,16 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "node scripts/build.mjs",
     "build:watch": "tsup --watch",
     "clean": "rm -rf dist",
-    "prepublishOnly": "npm run clean && npm run build",
+    "prepublishOnly": "node -e \"const fs=require('fs');const must=['dist/index.d.ts','dist/core/index.d.ts','dist/token-engine/index.d.ts','dist/wallet-api/index.d.ts','dist/token-engine/index.js','dist/wallet-api/index.js'];const missing=must.filter(f=>!fs.existsSync(f));if(missing.length){console.error('prepublishOnly: dist is stale or incomplete — run npm run build first. Missing: '+missing.join(', '));process.exit(1)}\"",
     "test": "vitest",
     "test:run": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:relay": "vitest run --config vitest.relay.config.ts",
+    "test:harness": "vitest run --config vitest.harness.config.ts",
+    "test:e2e:live": "vitest run --config vitest.live.config.ts",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
     "cli": "echo 'The CLI has moved to @unicity-sphere/cli — install it with: npm install -g @unicity-sphere/cli' && exit 1"
@@ -119,10 +151,11 @@
     "url": "https://github.com/unicity-sphere/sphere-sdk.git"
   },
   "dependencies": {
+    "@noble/ciphers": "^2.2.0",
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
     "@unicitylabs/nostr-js-sdk": "^0.5.0",
-    "@unicitylabs/state-transition-sdk": "2.0.0-rc.6027e82",
+    "@unicitylabs/state-transition-sdk": "2.0.0-rc.68bc1e5",
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
     "canonicalize": "^3.0.0",
