@@ -81,6 +81,13 @@ export const STORAGE_KEYS_ADDRESS = {
   TRANSACTION_HISTORY: 'transaction_history',
   /** Pending V5 finalization tokens (unconfirmed instant split tokens) */
   PENDING_V5_TOKENS: 'pending_v5_tokens',
+  /**
+   * FINISHED v2 token blobs awaiting transport delivery. Written the moment a
+   * transfer/split output is certified on-chain (the source is already spent),
+   * removed after successful delivery — survives transport failures + crashes
+   * so the recipient's token is never lost with the process.
+   */
+  PENDING_V2_DELIVERIES: 'pending_v2_deliveries',
   /** Group chat: joined groups for this address */
   GROUP_CHAT_GROUPS: 'group_chat_groups',
   /** Group chat: messages for this address */
@@ -114,6 +121,52 @@ export const STORAGE_KEYS_ADDRESS = {
   /** Lightweight index array for listing */
   SWAP_INDEX: 'swap_index',
 } as const;
+
+/**
+ * Per-address keys that are ALSO per-network: token/payment operational state. Mixing these
+ * across networks is unsafe (e.g. a testnet2 auto-return ledger firing a real send on mainnet).
+ * Chat/identity per-address keys (CONVERSATIONS/MESSAGES/GROUP_CHAT_*) are network-AGNOSTIC and
+ * are deliberately NOT listed — they stay per-address only.
+ */
+const NETWORK_SCOPED_ADDRESS_KEYS: readonly string[] = [
+  STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS,
+  STORAGE_KEYS_ADDRESS.OUTBOX,
+  STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY,
+  STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
+  STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES,
+  STORAGE_KEYS_ADDRESS.PROCESSED_SPLIT_GROUP_IDS,
+  STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS,
+  STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
+  STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
+  STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
+  STORAGE_KEYS_ADDRESS.AUTO_RETURN,
+  STORAGE_KEYS_ADDRESS.AUTO_RETURN_LEDGER,
+  STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX,
+  STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE,
+  STORAGE_KEYS_ADDRESS.SWAP_INDEX,
+];
+
+/** Composite per-address key prefixes (modules store `{addressId}_{prefix}{id}`) — per-network. */
+const NETWORK_SCOPED_ADDRESS_PREFIXES: readonly string[] = [
+  STORAGE_KEYS_ADDRESS.SWAP_RECORD_PREFIX, // 'swap:'
+  'inv_ledger:', // AccountingModule INV_LEDGER_PREFIX
+];
+
+/**
+ * True if a storage key is a per-NETWORK token/payment key (so the storage provider adds the
+ * network segment). Handles the bare form ('auto_return_ledger'), the module-built addressId
+ * form ('DIRECT_a_b_auto_return_ledger'), and composites ('{addressId}_swap:{id}'). Chat/identity
+ * keys return false — they remain per-address, network-agnostic.
+ */
+export function isNetworkScopedAddressKey(key: string): boolean {
+  for (const k of NETWORK_SCOPED_ADDRESS_KEYS) {
+    if (key === k || key.endsWith(`_${k}`)) return true;
+  }
+  for (const p of NETWORK_SCOPED_ADDRESS_PREFIXES) {
+    if (key.startsWith(p) || key.includes(`_${p}`)) return true;
+  }
+  return false;
+}
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
 export const STORAGE_KEYS = {
@@ -238,8 +291,6 @@ export const TEST_AGGREGATOR_URL = 'https://goggregator-test.unicity.network' as
 /** Default aggregator request timeout (ms) */
 export const DEFAULT_AGGREGATOR_TIMEOUT = 30000;
 
-/** Default API key for aggregator authentication */
-export const DEFAULT_AGGREGATOR_API_KEY = 'sk_06365a9c44654841a366068bcfc68986' as const;
 
 // =============================================================================
 // IPFS Defaults
@@ -333,6 +384,22 @@ export const DEFAULT_GROUP_RELAYS = [
   'wss://sphere-relay.unicity.network',
 ] as const;
 
+/**
+ * Complete configuration for one network. Every field is required, so adding a
+ * network (or a field) that is missing any of these is a COMPILE error at the
+ * NETWORKS literal below (via `satisfies`) — a half-configured network can never
+ * be defined silently.
+ */
+export interface NetworkConfig {
+  readonly name: string;
+  readonly aggregatorUrl: string;
+  readonly nostrRelays: readonly string[];
+  readonly ipfsGateways: readonly string[];
+  readonly electrumUrl: string;
+  readonly groupRelays: readonly string[];
+  readonly tokenRegistryUrl: string;
+}
+
 /** Network configurations */
 export const NETWORKS = {
   mainnet: {
@@ -344,15 +411,34 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
+  // v1 cutover: 'testnet' now POINTS AT TESTNET2 (the v2 gateway network). The
+  // old goggregator testnet spoke the removed v1 protocol — a v2 engine cannot
+  // run against it. 'testnet2' stays as an alias of the same configuration.
   testnet: {
-    name: 'Testnet',
-    aggregatorUrl: TEST_AGGREGATOR_URL,
-    nostrRelays: TEST_NOSTR_RELAYS,
+    name: 'Testnet2',
+    // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
+    aggregatorUrl: 'https://gateway.testnet2.unicity.network',
+    nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs/electrum)
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
-    tokenRegistryUrl: TOKEN_REGISTRY_URL,
+    tokenRegistryUrl:
+      'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
   },
+  testnet2: {
+    name: 'Testnet2',
+    // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
+    aggregatorUrl: 'https://gateway.testnet2.unicity.network',
+    nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs/electrum)
+    ipfsGateways: DEFAULT_IPFS_GATEWAYS,
+    electrumUrl: TEST_ELECTRUM_URL,
+    groupRelays: DEFAULT_GROUP_RELAYS,
+    tokenRegistryUrl:
+      'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
+  },
+  // NOTE: mainnet/dev still point at v1-era aggregators. The v2 engine cannot
+  // operate against them until their gateways are cut over to the v2 protocol —
+  // wallet operations on these networks fail loudly (AGGREGATOR_ERROR) until then.
   dev: {
     name: 'Development',
     aggregatorUrl: DEV_AGGREGATOR_URL,
@@ -362,10 +448,9 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
-} as const;
+} as const satisfies Record<string, NetworkConfig>;
 
 export type NetworkType = keyof typeof NETWORKS;
-export type NetworkConfig = (typeof NETWORKS)[NetworkType];
 
 // =============================================================================
 // Timeouts & Limits

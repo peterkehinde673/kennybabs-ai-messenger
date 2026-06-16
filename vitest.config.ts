@@ -18,6 +18,7 @@ export default defineConfig({
         'storage/**/*.ts',
         'transport/**/*.ts',
         'oracle/**/*.ts',
+        'token-engine/**/*.ts',
       ],
       exclude: ['**/index.ts', '**/*.test.ts'],
     },

@@ -3,7 +3,7 @@
  * Utility functions for resolving provider configurations with extend/override pattern
  */
 
-import { NETWORKS, DEFAULT_AGGREGATOR_API_KEY, type NetworkType, type NetworkConfig } from '../../constants';
+import { NETWORKS, type NetworkType, type NetworkConfig } from '../../constants';
 import type {
   BaseTransportConfig,
   BaseOracleConfig,
@@ -110,7 +110,7 @@ export function resolveOracleConfig(
 
   return {
     url: config?.url ?? networkConfig.aggregatorUrl,
-    apiKey: config?.apiKey ?? DEFAULT_AGGREGATOR_API_KEY,
+    apiKey: config?.apiKey,
     timeout: config?.timeout,
     skipVerification: config?.skipVerification,
     debug: config?.debug,

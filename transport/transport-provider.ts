@@ -60,7 +60,7 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Resolve nametag to full peer information
-   * Returns transportPubkey, chainPubkey, l1Address, directAddress, proxyAddress
+   * Returns transportPubkey, chainPubkey, l1Address, directAddress
    */
   resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
 
@@ -239,31 +239,6 @@ export interface TransportProvider extends BaseProvider {
    */
   isRelayConnected?(relayUrl: string): boolean;
 
-  // ===========================================================================
-  // Instant Split Support (optional)
-  // ===========================================================================
-
-  /**
-   * Send an instant split bundle to a recipient.
-   * This is a specialized method for INSTANT_SPLIT V5 bundles.
-   *
-   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
-   * @param bundle - The InstantSplitBundleV5 to send
-   * @returns Event ID
-   */
-  sendInstantSplitBundle?(
-    recipientTransportPubkey: string,
-    bundle: InstantSplitBundlePayload
-  ): Promise<string>;
-
-  /**
-   * Subscribe to incoming instant split bundles.
-   *
-   * @param handler - Handler for received bundles
-   * @returns Unsubscribe function
-   */
-  onInstantSplitReceived?(handler: InstantSplitBundleHandler): () => void;
-
   /**
    * Set fallback 'since' timestamp for event subscriptions.
    * Used when switching to an address that has never subscribed before.
@@ -300,44 +275,6 @@ export interface TransportProvider extends BaseProvider {
    */
   onChatReady?(handler: () => void): () => void;
 }
-
-// =============================================================================
-// Instant Split Types
-// =============================================================================
-
-/**
- * Payload for sending instant split bundles
- */
-export interface InstantSplitBundlePayload {
-  /** The bundle JSON string (InstantSplitBundleV5 serialized) */
-  bundle: string;
-  /** Optional memo */
-  memo?: string;
-  /** Sender info */
-  sender?: {
-    transportPubkey: string;
-    nametag?: string;
-  };
-}
-
-/**
- * Incoming instant split bundle
- */
-export interface IncomingInstantSplitBundle {
-  /** Event ID */
-  id: string;
-  /** Transport-specific pubkey of sender */
-  senderTransportPubkey: string;
-  /** The bundle JSON string */
-  bundle: string;
-  /** Timestamp */
-  timestamp: number;
-}
-
-/**
- * Handler for instant split bundles
- */
-export type InstantSplitBundleHandler = (bundle: IncomingInstantSplitBundle) => void;
 
 // =============================================================================
 // Message Types
@@ -518,7 +455,7 @@ export type TransportProviderFactory<TConfig, TProvider extends TransportProvide
 /**
  * Resolved peer identity information.
  * Returned by resolve methods — contains all public address formats for a peer.
- * Fields nametag and proxyAddress are optional (only present if nametag is registered).
+ * The nametag field is optional (only present if a nametag is registered).
  */
 export interface PeerInfo {
   /** Nametag name (without @), if registered */
@@ -531,8 +468,6 @@ export interface PeerInfo {
   l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress: string;
-  /** L3 PROXY address derived from nametag hash (PROXY:...), only if nametag registered */
-  proxyAddress?: string;
   /** Event timestamp */
   timestamp: number;
 }

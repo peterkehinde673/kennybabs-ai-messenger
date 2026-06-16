@@ -16,6 +16,7 @@ import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvid
 import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
 import type { TransportProvider, OracleProvider, TokenStorageProvider, TxfStorageDataBase } from '../../index';
 import type { ProviderStatus } from '../../types';
+import { TEST_NETWORK } from '../test-network';
 
 // Mock L1 to avoid real WebSocket connections
 vi.mock('../../l1/network', () => ({
@@ -155,6 +156,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -182,6 +184,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -207,6 +210,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -234,6 +238,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -257,6 +262,7 @@ describe('Provider disable/enable integration', () => {
       storage: new FileStorageProvider({ dataDir: DATA_DIR }),
       transport: transport2,
       oracle: oracle2,
+      network: TEST_NETWORK,
       tokenStorage: freshReal,
       mnemonic: mnemonic!,
     });
@@ -281,6 +287,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });
@@ -312,6 +319,7 @@ describe('Provider disable/enable integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageReal,
       autoGenerate: true,
     });

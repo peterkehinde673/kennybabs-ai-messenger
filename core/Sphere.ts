@@ -10,13 +10,14 @@
  *
  * const storage = createLocalStorageProvider();
  * const transport = createNostrTransportProvider();
- * const oracle = createUnicityAggregatorProvider({ url: '/rpc' });
+ * const oracle = createUnicityAggregatorProvider({ url: '/rpc', network: 'testnet2' });
  *
  * // Option 1: Unified init (recommended)
  * const { sphere, created, generatedMnemonic } = await Sphere.init({
  *   storage,
  *   transport,
  *   oracle,
+ *   network: 'testnet2', // required: selects registry/trustbase/aggregator
  *   mnemonic: 'your twelve words...', // optional - will load if wallet exists
  *   autoGenerate: true, // generate new mnemonic if needed
  * });
@@ -27,9 +28,9 @@
  *
  * // Option 2: Manual create/load
  * if (await Sphere.exists(storage)) {
- *   const sphere = await Sphere.load({ storage, transport, oracle });
+ *   const sphere = await Sphere.load({ storage, transport, oracle, network: 'testnet2' });
  * } else {
- *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle });
+ *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle, network: 'testnet2' });
  * }
  *
  * // Use the wallet
@@ -89,6 +90,7 @@ import {
   deriveAddressInfo,
   getPublicKey,
   sha256,
+  hexToBytes,
   publicKeyToAddress,
   signMessage as signMessageCrypto,
   type MasterKey,
@@ -117,10 +119,7 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
-import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
-import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
+import { createSphereTokenEngine, createUnicityIdMinter, deriveDirectAddress, type ITokenEngine } from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -277,6 +276,10 @@ export interface SphereImportOptions {
   derivationMode?: DerivationMode;
   /** Optional nametag to register for this wallet (e.g., 'alice' for @alice). Token is auto-minted. */
   nametag?: string;
+  /** Network this wallet runs on — drives TokenRegistry config. Without it, import
+   *  falls back to NETWORKS.testnet and a non-testnet wallet loads the wrong registry
+   *  (symbols resolve via baked values but icons/metadata don't) until a reload. */
+  network?: NetworkType;
   /** Storage provider instance */
   storage: StorageProvider;
   /** Optional token storage provider */
@@ -403,28 +406,22 @@ export interface SphereInitResult {
 // L3 Predicate Address Derivation
 // =============================================================================
 
-/** Token type for Unicity network (used for L3 predicate address derivation) */
-const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
-
 /**
- * Derive L3 predicate address (DIRECT://...) from private key
- * Uses UnmaskedPredicateReference for stable wallet address
+ * Derive the wallet's legacy L3 identity address (DIRECT://...) from a private key.
+ *
+ * Delegates to the shared, golden-locked `deriveDirectAddress` helper (token-engine,
+ * A6) so the engine and the wallet derive byte-identical addresses from ONE recipe.
+ *
+ * XP-CRITICAL (Path A / D10): Quest XP and Unicity IDs are keyed on this address, so it
+ * MUST stay byte-identical across the v1→v2 migration. The legacy v1 derivation ran the
+ * secret through `SigningService.createFromSecret`, which SHA-256-hashes the secret before
+ * using it as the signing scalar — so the address is a function of
+ * `getPublicKey(SHA256(privateKey))`, NOT of the raw `chainPubkey`. That pre-hash is
+ * reproduced here and locked by tests/unit/core/Sphere.l3-identity-address.golden.test.ts.
  */
 async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
-  const secret = Buffer.from(privateKey, 'hex');
-  const signingService = await SigningService.createFromSecret(secret);
-
-  const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');
-  const tokenType = new TokenType(tokenTypeBytes);
-
-  const predicateRef = UnmaskedPredicateReference.create(
-    tokenType,
-    signingService.algorithm,
-    signingService.publicKey,
-    HashAlgorithm.SHA256
-  );
-
-  return (await (await predicateRef).toAddress()).toString();
+  const prehashedPublicKey = getPublicKey(sha256(privateKey, 'hex'));
+  return deriveDirectAddress(hexToBytes(prehashedPublicKey));
 }
 
 // =============================================================================
@@ -453,6 +450,8 @@ export interface AddressModuleSet {
   market: MarketModule | null;
   transportAdapter: AddressTransportAdapter | null;
   tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
+  /** v2 token engine for THIS address (bound to its signing key). */
+  tokenEngine: ITokenEngine | undefined;
   initialized: boolean;
 }
 
@@ -481,8 +480,6 @@ export class Sphere {
   private _addressIdToIndex: Map<string, number> = new Map();
   /** Nametag cache: addressId -> (nametagIndex -> nametag). Separate from tracked addresses. */
   private _addressNametags: Map<string, Map<number, string>> = new Map();
-  /** Cached PROXY address (computed once when nametag is set) */
-  private _cachedProxyAddress: string | undefined = undefined;
 
   // Providers
   private _storage: StorageProvider;
@@ -490,6 +487,8 @@ export class Sphere {
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
+  /** v2 token engine (built per active address from the oracle); injected into modules. */
+  private _tokenEngine: ITokenEngine | undefined;
 
   // Modules (single-instance — backward compat, delegates to active address)
   private _payments: PaymentsModule;
@@ -642,6 +641,7 @@ export class Sphere {
     if (walletExists) {
       // Load existing wallet
       const sphere = await Sphere.load({
+        network: options.network, // forward network so load's configureTokenRegistry uses it (not the testnet default)
         storage: options.storage,
         transport: options.transport,
         oracle: options.oracle,
@@ -682,6 +682,7 @@ export class Sphere {
 
     const sphere = await Sphere.create({
       mnemonic,
+      network: options.network, // forward network so create's configureTokenRegistry uses it (not the testnet default)
       storage: options.storage,
       transport: options.transport,
       oracle: options.oracle,
@@ -721,14 +722,16 @@ export class Sphere {
     network?: NetworkType,
   ): GroupChatModuleConfig | undefined {
     if (!config) return undefined;
+    // Fail loud: relays differ per network — never silently default to mainnet.
+    if (!network) {
+      throw new SphereError('network is required to resolve group chat relays.', 'INVALID_CONFIG');
+    }
     if (config === true) {
-      const netConfig = network ? NETWORKS[network] : NETWORKS.mainnet;
-      return { relays: [...netConfig.groupRelays] };
+      return { relays: [...NETWORKS[network].groupRelays] };
     }
     // If relays not specified, fill from network defaults
     if (!config.relays || config.relays.length === 0) {
-      const netConfig = network ? NETWORKS[network] : NETWORKS.mainnet;
-      return { ...config, relays: [...netConfig.groupRelays] };
+      return { ...config, relays: [...NETWORKS[network].groupRelays] };
     }
     return config;
   }
@@ -785,8 +788,15 @@ export class Sphere {
    * This method ensures the main bundle's TokenRegistry is properly configured.
    */
   private static configureTokenRegistry(storage: StorageProvider, network?: NetworkType): void {
-    const netConfig = network ? NETWORKS[network] : NETWORKS.testnet;
-    TokenRegistry.configure({ remoteUrl: netConfig.tokenRegistryUrl, storage });
+    // Fail loud: a dropped/missing network would silently load the wrong-network
+    // registry (testnet vs mainnet). Every Sphere entry point must forward options.network.
+    if (!network) {
+      throw new SphereError(
+        'network is required to configure the TokenRegistry. Every Sphere entry point must forward options.network.',
+        'INVALID_CONFIG',
+      );
+    }
+    TokenRegistry.configure({ remoteUrl: NETWORKS[network].tokenRegistryUrl, storage });
   }
 
   /**
@@ -874,6 +884,9 @@ export class Sphere {
       // Now publish identity binding (with recovered nametag if found)
       progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
       await sphere.syncIdentityWithTransport();
+      // Re-mint + store the on-chain Unicity ID claim if it is missing
+      // (best-effort, idempotent — no-op without a nametag).
+      sphere.ensureUnicityIdTokenStored();
     }
 
     // Auto-discover previously used HD addresses
@@ -954,23 +967,6 @@ export class Sphere {
     sphere._initialized = true;
     Sphere.instance = sphere;
 
-    // If nametag name exists but token is missing, try to mint it.
-    // This handles the case where the token was lost from IndexedDB.
-    if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
-      progress?.({ step: 'registering_nametag', message: 'Restoring nametag token...' });
-      logger.debug('Sphere', `Unicity ID @${sphere._identity.nametag} has no token, attempting to mint...`);
-      try {
-        const result = await sphere.mintNametag(sphere._identity.nametag);
-        if (result.success) {
-          logger.debug('Sphere', `Nametag token minted successfully on load`);
-        } else {
-          logger.warn('Sphere', `Could not mint nametag token: ${result.error}`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', `Nametag token mint failed:`, err);
-      }
-    }
-
     // Auto-discover previously used HD addresses
     if (options.discoverAddresses !== false && sphere._transport.discoverAddresses && sphere._masterKey) {
       progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
@@ -1028,7 +1024,13 @@ export class Sphere {
       logger.debug('Sphere', 'Storage reconnected');
     }
 
-    const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat);
+    // Configure TokenRegistry for THIS network in the main bundle context.
+    // import() previously omitted this (unlike init/create/load), leaving the
+    // registry on a stale/default network — so imported wallets resolved tokens
+    // against the wrong-network registry (no icons) until a reload.
+    Sphere.configureTokenRegistry(options.storage, options.network);
+
+    const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
     const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
     const swapConfig = Sphere.resolveSwapConfig(options.swap);
@@ -1094,6 +1096,9 @@ export class Sphere {
       // Publish identity binding (with recovered nametag if found)
       progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
       await sphere.syncIdentityWithTransport();
+      // Re-mint + store the on-chain Unicity ID claim if it is missing
+      // (best-effort, idempotent — no-op without a nametag).
+      sphere.ensureUnicityIdTokenStored();
     }
 
     // Mark wallet as created only after successful initialization
@@ -2319,7 +2324,8 @@ export class Sphere {
         moduleSet.identity = newIdentity;
         // Use per-address transport if available
         const addressTransport: TransportProvider = moduleSet.transportAdapter ?? this._transport;
-        // Re-initialize with updated identity (nametag change)
+        // Re-initialize with updated identity (nametag change). The signing key is
+        // unchanged (only the nametag label), so reuse this address's token engine.
         moduleSet.payments.initialize({
           identity: newIdentity,
           storage: this._storage,
@@ -2329,6 +2335,7 @@ export class Sphere {
           emitEvent: this.emitEvent.bind(this),
           chainCode: this._masterKey?.chainCode || undefined,
           price: this._priceProvider ?? undefined,
+          tokenEngine: moduleSet.tokenEngine,
         });
       }
     }
@@ -2336,7 +2343,6 @@ export class Sphere {
     // Switch the active pointer — instant, no destroy
     this._identity = newIdentity;
     this._currentAddressIndex = index;
-    await this._updateCachedProxyAddress();
 
     // Update active module references for backward compatibility
     const activeModules = this._addressModules.get(index)!;
@@ -2393,42 +2399,21 @@ export class Sphere {
       await this.syncIdentityWithTransport();
     }
 
-    // If new nametag was registered, persist cache and mint token
+    // If a new nametag was registered on switch, persist the cache and emit. The Nostr
+    // binding stays the registration record (D5); the on-chain UnicityIdToken claim is
+    // additionally minted + stored below, best-effort.
     if (newNametag) {
       await this.persistAddressNametags();
-
-      if (!this._payments.hasNametag()) {
-        logger.debug('Sphere', `Minting nametag token for @${newNametag}...`);
-        try {
-          const result = await this.mintNametag(newNametag);
-          if (result.success) {
-            logger.debug('Sphere', `Nametag token minted successfully`);
-          } else {
-            logger.warn('Sphere', `Could not mint nametag token: ${result.error}`);
-          }
-        } catch (err) {
-          logger.warn('Sphere', `Nametag token mint failed:`, err);
-        }
-      }
 
       this.emitEvent('nametag:registered', {
         nametag: newNametag,
         addressIndex: index,
       });
-    } else if (this._identity?.nametag && !this._payments.hasNametag()) {
-      // Existing address with nametag but missing token — mint it
-      logger.debug('Sphere', `Unicity ID @${this._identity.nametag} has no token after switch, minting...`);
-      try {
-        const result = await this.mintNametag(this._identity.nametag);
-        if (result.success) {
-          logger.debug('Sphere', `Nametag token minted successfully after switch`);
-        } else {
-          logger.warn('Sphere', `Could not mint nametag token after switch: ${result.error}`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', `Nametag token mint failed after switch:`, err);
-      }
     }
+
+    // Mint + store the on-chain Unicity ID claim for this address if missing
+    // (covers both a newly registered and a recovered nametag; no-op otherwise).
+    this.ensureUnicityIdTokenStored();
   }
 
   /**
@@ -2477,6 +2462,9 @@ export class Sphere {
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
 
+    // v2 token engine for THIS address (bound to its signing key).
+    const tokenEngine = await this.buildTokenEngine(identity);
+
     // Initialize with address-specific identity and per-address transport
     payments.initialize({
       identity,
@@ -2487,6 +2475,7 @@ export class Sphere {
       emitEvent,
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
+      tokenEngine,
     });
 
     communications.initialize({
@@ -2510,26 +2499,17 @@ export class Sphere {
     if (this._accounting) {
       const accountingTokenStorage = tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
-        // Resolve trustBase from oracle for invoice proof verification
-        let trustBase: unknown = null;
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
-        } catch {
-          logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
-        }
-
         this._accounting.initialize({
           payments,
           tokenStorage: accountingTokenStorage,
           oracle: this._oracle,
-          trustBase,
           identity,
           getActiveAddresses: () => this._getActiveAddressesInternal(),
           emitEvent,
           on: this.on.bind(this),
           storage: this._storage,
           communications,
+          tokenEngine,
         });
       } else {
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
@@ -2595,6 +2575,7 @@ export class Sphere {
       market,
       transportAdapter: adapter,
       tokenStorageProviders: new Map(tokenStorageProviders),
+      tokenEngine,
       initialized: true,
     };
 
@@ -3277,15 +3258,6 @@ export class Sphere {
     return !!this._identity?.nametag;
   }
 
-  /**
-   * Get the PROXY address for the current nametag
-   * PROXY addresses are derived from the nametag hash and require
-   * the nametag token to claim funds sent to them
-   * @returns PROXY address string or undefined if no nametag
-   */
-  getProxyAddress(): string | undefined {
-    return this._cachedProxyAddress;
-  }
 
   /**
    * Resolve any identifier to full peer information.
@@ -3324,17 +3296,6 @@ export class Sphere {
     }
   }
 
-  /** Compute and cache the PROXY address from the current nametag */
-  private async _updateCachedProxyAddress(): Promise<void> {
-    const nametag = this._identity?.nametag;
-    if (!nametag) {
-      this._cachedProxyAddress = undefined;
-      return;
-    }
-    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-    const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-    this._cachedProxyAddress = proxyAddr.toString();
-  }
 
   /**
    * Register a nametag for the current active address
@@ -3368,22 +3329,10 @@ export class Sphere {
       throw new SphereError(`Unicity ID already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
     }
 
-    // 1. Mint nametag token on-chain FIRST
-    // Required for receiving tokens via @nametag (PROXY address finalization).
-    // Minting before publishing ensures the nametag is backed by an on-chain token.
-    if (!this._payments.hasNametag()) {
-      logger.debug('Sphere', `Minting nametag token for @${cleanNametag}...`);
-      const result = await this.mintNametag(cleanNametag);
-      if (!result.success) {
-        throw new SphereError(
-          `Failed to mint nametag token: ${result.error}`,
-          'AGGREGATOR_ERROR',
-        );
-      }
-      logger.debug('Sphere', `Nametag token minted successfully`);
-    }
-
-    // 2. Publish identity binding with nametag to Nostr AFTER minting succeeds
+    // Register the nametag by publishing the Nostr identity binding (name ↔ chainPubkey).
+    // D5: nametags are Nostr bindings only — there is no on-chain nametag token. Receive is
+    // always SignaturePredicate(chainPubkey); the binding is the sole registration act, and its
+    // first-seen-wins failure path below is the uniqueness guard.
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
@@ -3396,9 +3345,8 @@ export class Sphere {
       }
     }
 
-    // 3. Update local state
+    // Update local state.
     this._identity!.nametag = cleanNametag;
-    await this._updateCachedProxyAddress();
 
     // Update nametag cache
     const currentAddressId = this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
@@ -3419,6 +3367,69 @@ export class Sphere {
       addressIndex: this._currentAddressIndex,
     });
     logger.debug('Sphere', `Unicity ID registered for address ${this._currentAddressIndex}:`, cleanNametag);
+
+    // Mint + store the on-chain claim (best-effort, never blocks registration).
+    this.ensureUnicityIdTokenStored();
+  }
+
+  /**
+   * Best-effort: mint + store the self-issued v2 UnicityIdToken for the current
+   * address's nametag. The on-chain claim is kept minted + stored at creation
+   * (as the v1 nametag mint did), while RUNTIME name resolution stays
+   * Nostr-binding-only per D5 — the token is not consumed anywhere yet.
+   *
+   * Fire-and-forget: a gateway outage or missing v2 oracle config never fails
+   * registration/load; the mint is deterministic per (name, address key), so a
+   * later load re-mints the identical token (lost-storage recovery).
+   */
+  private ensureUnicityIdTokenStored(): void {
+    const name = this._identity?.nametag;
+    if (!name) return;
+    // Capture the address-bound collaborators NOW: the mint below is a
+    // multi-second network round-trip, and switchToAddress() swaps
+    // this._payments/this._identity synchronously — a late re-read would store
+    // address A's token into address B's nametag list.
+    const payments = this._payments;
+    const privateKey = this._identity?.privateKey;
+    void (async () => {
+      try {
+        // Already stored for this address? (v2 entries carry the CBOR hex string.)
+        const existing = payments
+          .getNametags()
+          .find((n) => n.name === name && n.format === 'v2-cbor' && typeof n.token === 'string');
+        if (existing) return;
+
+        const oracle = this._oracle as {
+          getTrustBaseJson?: () => unknown;
+          getAggregatorUrl?: () => string;
+          getApiKey?: () => string | undefined;
+        };
+        const trustBaseJson = oracle.getTrustBaseJson?.() ?? null;
+        const aggregatorUrl = oracle.getAggregatorUrl?.();
+        if (!trustBaseJson || !aggregatorUrl || !privateKey) {
+          logger.warn('Sphere', `Unicity ID token for @${name} not minted (no v2 oracle config) — retried on next load`);
+          return;
+        }
+
+        const minter = createUnicityIdMinter({
+          aggregatorUrl,
+          apiKey: oracle.getApiKey?.(),
+          privateKey: hexToBytes(privateKey),
+          trustBaseJson,
+        });
+        const result = await minter.mintUnicityIdToken(name);
+        await payments.setNametag({
+          name,
+          token: result.tokenCborHex,
+          timestamp: Date.now(),
+          format: 'v2-cbor',
+          version: '2.0',
+        });
+        logger.debug('Sphere', `Unicity ID token minted + stored for @${name} (${result.tokenId.slice(0, 12)}...)`);
+      } catch (err) {
+        logger.warn('Sphere', `Unicity ID token mint failed for @${name} (non-fatal, retried on next load):`, err);
+      }
+    })();
   }
 
   /**
@@ -3438,36 +3449,19 @@ export class Sphere {
   }
 
   /**
-   * Mint a nametag token on-chain (like Sphere wallet and lottery)
-   * This creates the nametag token required for receiving tokens via PROXY addresses (@nametag)
+   * Check whether a nametag is available to register.
    *
-   * @param nametag - The nametag to mint (e.g., "alice" or "@alice")
-   * @returns MintNametagResult with success status and token if successful
+   * D5: nametags are Nostr bindings (name ↔ chainPubkey), not on-chain tokens. Availability is
+   * first-seen-wins — a name is available iff no binding resolves for it.
    *
-   * @example
-   * ```typescript
-   * // Mint nametag token for receiving via @alice
-   * const result = await sphere.mintNametag('alice');
-   * if (result.success) {
-   *   console.log('Nametag minted:', result.nametagData?.name);
-   * } else {
-   *   console.error('Mint failed:', result.error);
-   * }
-   * ```
-   */
-  async mintNametag(nametag: string): Promise<import('../modules/payments').MintNametagResult> {
-    this.ensureReady();
-    return this._payments.mintNametag(nametag);
-  }
-
-  /**
-   * Check if a nametag is available for minting
    * @param nametag - The nametag to check (e.g., "alice" or "@alice")
-   * @returns true if available, false if taken or error
+   * @returns true if available, false if already taken
    */
   async isNametagAvailable(nametag: string): Promise<boolean> {
     this.ensureReady();
-    return this._payments.isNametagAvailable(nametag);
+    if (!this._transport.resolveNametag) return true;
+    const bound = await this._transport.resolveNametag(this.cleanNametag(nametag));
+    return bound == null;
   }
 
   /**
@@ -3684,7 +3678,6 @@ export class Sphere {
 
             if (recoveredNametag && !this._identity?.nametag) {
               (this._identity as MutableFullIdentity).nametag = recoveredNametag;
-              await this._updateCachedProxyAddress();
 
               const entry = await this.ensureAddressTracked(this._currentAddressIndex);
               let nametags = this._addressNametags.get(entry.addressId);
@@ -3804,7 +3797,6 @@ export class Sphere {
       // Update identity with recovered nametag
       if (this._identity) {
         (this._identity as MutableFullIdentity).nametag = recoveredNametag;
-        await this._updateCachedProxyAddress();
       }
 
       // Update nametag cache
@@ -4071,7 +4063,6 @@ export class Sphere {
       // Restore nametag from cache
       this._identity.nametag = nametag;
     }
-    await this._updateCachedProxyAddress();
   }
 
   private async initializeIdentityFromMnemonic(
@@ -4297,6 +4288,44 @@ export class Sphere {
     this._lastProviderConnected.clear();
   }
 
+  /**
+   * Construct the v2 token engine for a given address identity (defaults to the
+   * active one) from the oracle's gateway URL + trust base and that address's
+   * signing key. The engine is per-address — each address signs with its own key.
+   * The trust base is the single source of truth for the network id (so any id
+   * works — e.g. testnet2 = 4 — with no enum entry). Returns undefined (modules
+   * keep their legacy path) when the oracle can't supply a trust base / url, or
+   * construction fails — a misconfigured oracle never breaks initialization.
+   */
+  private async buildTokenEngine(identity?: FullIdentity): Promise<ITokenEngine | undefined> {
+    const oracle = this._oracle as {
+      getTrustBaseJson?: () => unknown;
+      getAggregatorUrl?: () => string;
+      getApiKey?: () => string | undefined;
+    };
+    const privateKey = (identity ?? this._identity)?.privateKey;
+    const trustBaseJson = oracle.getTrustBaseJson?.() ?? null;
+    const aggregatorUrl = oracle.getAggregatorUrl?.();
+    if (!trustBaseJson || !aggregatorUrl || !privateKey) {
+      logger.warn('Sphere', 'v2 token engine not constructed (oracle has no trust base / url, or no identity) — legacy path');
+      return undefined;
+    }
+    try {
+      return await createSphereTokenEngine({
+        aggregatorUrl,
+        apiKey: oracle.getApiKey?.(),
+        privateKey: hexToBytes(privateKey),
+        trustBaseJson,
+      });
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `Failed to construct v2 token engine — modules use the legacy path: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return undefined;
+    }
+  }
+
   private async initializeModules(): Promise<void> {
     const emitEvent = this.emitEvent.bind(this);
 
@@ -4304,6 +4333,11 @@ export class Sphere {
     // from the start. The original transport stays connected for resolve operations.
     const adapter = await this.ensureTransportMux(this._currentAddressIndex, this._identity!);
     const moduleTransport: TransportProvider = adapter ?? this._transport;
+
+    // Build the v2 token engine for this active address (from the oracle's gateway +
+    // trust base + this address's key). Injected into the caller modules below.
+    this._tokenEngine = await this.buildTokenEngine();
+    const tokenEngine = this._tokenEngine;
 
     this._payments.initialize({
       identity: this._identity!,
@@ -4316,6 +4350,7 @@ export class Sphere {
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
       disabledProviderIds: this._disabledProviders,
+      tokenEngine,
     });
 
     this._communications.initialize({
@@ -4339,26 +4374,17 @@ export class Sphere {
     if (this._accounting) {
       const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
-        // Resolve trustBase from oracle for invoice proof verification
-        let trustBase: unknown = null;
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
-        } catch {
-          logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
-        }
-
         this._accounting.initialize({
           payments: this._payments,
           tokenStorage: accountingTokenStorage,
           oracle: this._oracle,
-          trustBase,
           identity: this._identity!,
           getActiveAddresses: () => this._getActiveAddressesInternal(),
           emitEvent,
           on: this.on.bind(this),
           storage: this._storage,
           communications: this._communications,
+          tokenEngine,
         });
       } else {
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
@@ -4426,6 +4452,7 @@ export class Sphere {
       market: this._market,
       transportAdapter: adapter,
       tokenStorageProviders: new Map(this._tokenStorageProviders),
+      tokenEngine: this._tokenEngine,
       initialized: true,
     });
   }

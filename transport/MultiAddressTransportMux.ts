@@ -51,9 +51,6 @@ import type {
   IncomingReadReceipt,
   TypingIndicatorHandler,
   IncomingTypingIndicator,
-  InstantSplitBundlePayload,
-  InstantSplitBundleHandler,
-  IncomingInstantSplitBundle,
 } from './transport-provider';
 import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
@@ -1638,7 +1635,6 @@ export class AddressTransportAdapter implements TransportProvider {
   private readReceiptHandlers: Set<ReadReceiptHandler> = new Set();
   private typingIndicatorHandlers: Set<TypingIndicatorHandler> = new Set();
   private composingHandlers: Set<ComposingHandler> = new Set();
-  private instantSplitBundleHandlers: Set<InstantSplitBundleHandler> = new Set();
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
   private pendingMessages: IncomingMessage[] = [];
@@ -1775,23 +1771,6 @@ export class AddressTransportAdapter implements TransportProvider {
     await this.mux.sendComposingIndicator(this.addressIndex, recipientPubkey, content);
   }
 
-  async sendInstantSplitBundle(
-    recipientPubkey: string,
-    bundle: InstantSplitBundlePayload
-  ): Promise<string> {
-    const content = 'token_transfer:' + JSON.stringify({
-      type: 'instant_split',
-      ...bundle,
-    });
-    const uniqueD = `instant-split-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    return this.mux.createAndPublishEncryptedEvent(
-      this.addressIndex,
-      EVENT_KINDS.TOKEN_TRANSFER,
-      content,
-      [['p', recipientPubkey], ['d', uniqueD], ['type', 'instant_split']]
-    );
-  }
-
   // ===========================================================================
   // Subscription handlers — per-address
   // ===========================================================================
@@ -1837,11 +1816,6 @@ export class AddressTransportAdapter implements TransportProvider {
   onComposing(handler: ComposingHandler): () => void {
     this.composingHandlers.add(handler);
     return () => this.composingHandlers.delete(handler);
-  }
-
-  onInstantSplitReceived(handler: InstantSplitBundleHandler): () => void {
-    this.instantSplitBundleHandlers.add(handler);
-    return () => this.instantSplitBundleHandlers.delete(handler);
   }
 
   subscribeToBroadcast(tags: string[], handler: BroadcastHandler): () => void {
@@ -1979,12 +1953,6 @@ export class AddressTransportAdapter implements TransportProvider {
   dispatchComposingIndicator(indicator: any): void {
     for (const handler of this.composingHandlers) {
       try { handler(indicator); } catch (e) { logger.debug('MuxAdapter', 'Composing handler error:', e); }
-    }
-  }
-
-  dispatchInstantSplitBundle(bundle: IncomingInstantSplitBundle): void {
-    for (const handler of this.instantSplitBundleHandlers) {
-      try { handler(bundle); } catch (e) { logger.debug('MuxAdapter', 'Instant split handler error:', e); }
     }
   }
 

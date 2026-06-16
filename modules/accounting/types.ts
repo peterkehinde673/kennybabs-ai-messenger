@@ -11,6 +11,7 @@ import type { FullIdentity, TrackedAddress, SphereEventType, SphereEventMap, Tra
 import type { TxfToken } from '../../types/txf';
 import type { StorageProvider, TokenStorageProvider } from '../../storage/storage-provider';
 import type { OracleProvider } from '../../oracle/oracle-provider';
+import type { ITokenEngine } from '../../token-engine';
 import type { PaymentsModule } from '../payments/PaymentsModule';
 import type { CommunicationsModule } from '../communications/CommunicationsModule';
 
@@ -392,8 +393,11 @@ export interface CreateInvoiceResult {
   readonly success: boolean;
   /** Invoice token ID (if successful) */
   readonly invoiceId?: string;
-  /** Invoice token in TXF format (if successful) */
-  readonly token?: TxfToken;
+  /**
+   * The transmittable v2 invoice blob, hex-encoded (if successful) — pass it
+   * to `importInvoice` on the receiving side.
+   */
+  readonly token?: string;
   /** Parsed invoice terms (if successful) */
   readonly terms?: InvoiceTerms;
   /** Error message (if failed) */
@@ -630,17 +634,17 @@ export interface AccountingModuleDependencies {
   payments: PaymentsModule;
   /** Token storage for invoice tokens (same provider as currency/nametag tokens) */
   tokenStorage: TokenStorageProvider;
-  /** Oracle for minting invoice tokens (also provides stateTransitionClient via getStateTransitionClient()) */
+  /** Oracle (network/trust-base config source for the token engine) */
   oracle: OracleProvider;
-  /**
-   * Trust base for aggregator proof verification.
-   * Required by waitInclusionProof() and Token.mint() during invoice minting.
-   * Follows the same pattern as NametagMinterConfig.trustBase.
-   * Obtained via the oracle/aggregator configuration at init time.
-   */
-  trustBase: unknown;
   /** Current wallet identity */
   identity: FullIdentity;
+  /**
+   * Token engine (v2). Required for invoice create/import — invoices are minted
+   * as v2 data tokens (engine.mintDataToken) and verified via engine.verify.
+   * Optional in the type so read-only accounting (status/history queries over
+   * already-stored invoices) keeps working without an engine.
+   */
+  tokenEngine?: ITokenEngine;
   /**
    * All tracked wallet addresses — used for target check in close/cancel/return.
    * Target validation compares TrackedAddress.directAddress against

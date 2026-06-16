@@ -245,6 +245,22 @@ export class TokenRegistry {
   // ===========================================================================
 
   /**
+   * Per-network cache keys. The registry cache MUST be namespaced by remoteUrl:
+   * testnet and testnet2 ship DIFFERENT coinIds for the same symbol, so a single
+   * global key let a stale testnet snapshot be served for a testnet2 request —
+   * wrong/missing icons AND self-mint resolving the wrong-network coinId. Keying
+   * by remoteUrl isolates the snapshots so a network can never read another's.
+   */
+  private cacheKeys(): { data: string; ts: string } {
+    const base = STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE;
+    const baseTs = STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS;
+    // No remoteUrl configured (local-only usage): keep the legacy bare key.
+    if (!this.remoteUrl) return { data: base, ts: baseTs };
+    // Namespace by remoteUrl so testnet and testnet2 snapshots never collide.
+    return { data: `${base}:${this.remoteUrl}`, ts: `${baseTs}:${this.remoteUrl}` };
+  }
+
+  /**
    * Load definitions from StorageProvider cache.
    * Only applies if cache exists and is fresh (within refreshIntervalMs).
    */
@@ -252,9 +268,10 @@ export class TokenRegistry {
     if (!this.storage) return false;
 
     try {
+      const { data: dataKey, ts: tsKey } = this.cacheKeys();
       const [cached, cachedTs] = await Promise.all([
-        this.storage.get(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE),
-        this.storage.get(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS),
+        this.storage.get(dataKey),
+        this.storage.get(tsKey),
       ]);
 
       if (!cached || !cachedTs) return false;
@@ -287,9 +304,10 @@ export class TokenRegistry {
     if (!this.storage) return;
 
     try {
+      const { data: dataKey, ts: tsKey } = this.cacheKeys();
       await Promise.all([
-        this.storage.set(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE, JSON.stringify(definitions)),
-        this.storage.set(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS, String(Date.now())),
+        this.storage.set(dataKey, JSON.stringify(definitions)),
+        this.storage.set(tsKey, String(Date.now())),
       ]);
     } catch {
       // Cache save failure is non-critical

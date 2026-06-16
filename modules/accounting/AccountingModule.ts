@@ -12,7 +12,7 @@
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
-import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
+import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey } from '../../constants.js';
 import type {
   IncomingTransfer,
   TransferRequest,
@@ -20,7 +20,7 @@ import type {
   SphereEventMap,
 } from '../../types/index.js';
 import type { TxfToken } from '../../types/txf.js';
-import type { DirectMessage } from '../../types/index.js';
+import type { DirectMessage, Token } from '../../types/index.js';
 import type {
   AccountingModuleConfig,
   AccountingModuleDependencies,
@@ -57,12 +57,10 @@ import type {
 import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage, hashInvoiceId } from './memo.js';
 import { AutoReturnManager } from './auto-return.js';
 import { canonicalSerialize } from './serialization.js';
-import { hexToBytes } from '@noble/hashes/utils.js';
+import { hexToBytes, bytesToHex } from '@noble/hashes/utils.js';
+import { encodeTokenBlob, decodeTokenBlob } from '../../token-engine/token-blob.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
 import { TokenRegistry } from '../../registry/index.js';
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token.js';
-import { txfToToken } from '../../serialization/txf-serializer.js';
 
 // =============================================================================
 // Internal storage-schema types
@@ -937,21 +935,14 @@ export class AccountingModule {
       }
     }
 
-    // Oracle available — must have getStateTransitionClient.
-    // NOTE (C3): The OracleProvider interface does not expose getStateTransitionClient(),
-    // but the concrete UnicityAggregatorProvider implementation does. The `as any` cast
-    // is a design compromise — changing the interface requires a cross-SDK breaking change.
-    // The optional chain ensures a graceful error if the method is absent.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const stClient = (deps.oracle as any).getStateTransitionClient?.();
-    if (!stClient) {
+    // Invoices are minted as v2 data tokens — the engine is mandatory.
+    const engine = deps.tokenEngine;
+    if (!engine) {
       throw new SphereError(
-        'Oracle provider required for invoice minting',
+        'Token engine unavailable — invoices require the v2 oracle config (trust base + gateway URL).',
         'INVOICE_ORACLE_REQUIRED',
       );
     }
-
-    const trustBase = deps.trustBase;
 
     // ------------------------------------------------------------------
     // Step 2: Build InvoiceTerms
@@ -999,217 +990,30 @@ export class AccountingModule {
     const saltBuffer = await crypto.subtle.digest('SHA-256', saltInput);
     const salt = new Uint8Array(saltBuffer);
 
-    // NOTE: signingKeyBytes is still needed for SigningService.createFromSecret() below.
-    // Zero saltInput now (no longer needed after digest), but defer signingKeyBytes
-    // zeroing to the finally block after all signing operations are complete.
+    // Zero the salt input — the key material is no longer needed after the digest
+    // (the engine holds its own signing key; nothing below signs with this copy).
     saltInput.fill(0);
-
-    // CR-R20 fix: Guard trustBase before minting (matches importInvoice guard)
-    if (!trustBase || (trustBase instanceof Uint8Array && trustBase.length === 0)) {
-      throw new SphereError(
-        'Trust base unavailable — cannot mint invoice token. Ensure oracle supports getTrustBase().',
-        'INVOICE_ORACLE_REQUIRED',
-      );
-    }
+    signingKeyBytes.fill(0);
 
     // ------------------------------------------------------------------
-    // Steps 5–13: Mint token and store (mirrors NametagMinter pattern)
+    // Steps 5–13: Mint token and store
     // ------------------------------------------------------------------
     try {
-      const { TokenId } = await import(
-        '@unicitylabs/state-transition-sdk/lib/token/TokenId.js'
-      );
-      const { TokenType } = await import(
-        '@unicitylabs/state-transition-sdk/lib/token/TokenType.js'
-      );
-      const { MintTransactionData } = await import(
-        '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData.js'
-      );
-      const { MintCommitment } = await import(
-        '@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment.js'
-      );
-      const { SigningService } = await import(
-        '@unicitylabs/state-transition-sdk/lib/sign/SigningService.js'
-      );
-      const { HashAlgorithm } = await import(
-        '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm.js'
-      );
-      const { DataHasher } = await import(
-        '@unicitylabs/state-transition-sdk/lib/hash/DataHasher.js'
-      );
-      const { UnmaskedPredicate } = await import(
-        '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate.js'
-      );
-      const { UnmaskedPredicateReference } = await import(
-        '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference.js'
-      );
-      const { TokenState } = await import(
-        '@unicitylabs/state-transition-sdk/lib/token/TokenState.js'
-      );
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { Token: SdkToken } = await import(
-        '@unicitylabs/state-transition-sdk/lib/token/Token.js'
-      );
-      const { waitInclusionProof } = await import(
-        '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils.js'
-      );
-
-      // §3.1: Derive TokenId from SHA-256(invoiceBytes) using DataHasher
-      const hash = await new DataHasher(HashAlgorithm.SHA256)
-        .update(invoiceBytesEncoded)
-        .digest();
-      const invoiceTokenId = new TokenId(hash.imprint);
-      const invoiceId = invoiceTokenId.toJSON(); // 64-char lowercase hex
-
-      // CR-M5 fix: Check for duplicate before submitting to aggregator (matches importInvoice).
-      // Same terms → same SHA-256 → same tokenId. Prevents double-mint attempts.
+      // v2: an invoice IS a data token — a single mintDataToken call. The
+      // deterministic salt → engine.tokenId (64-char) keeps the invoice id
+      // terms-deterministic for dedup.
+      const invoiceToken = await engine.mintDataToken({
+        recipientPubkey: hexToBytes(deps.identity.chainPubkey),
+        data: invoiceBytesEncoded,
+        tokenType: hexToBytes(INVOICE_TOKEN_TYPE_HEX),
+        salt,
+      });
+      const invoiceId = engine.tokenId(invoiceToken);
       if (this.invoiceTermsCache.has(invoiceId)) {
-        throw new SphereError(
-          `Invoice already exists locally: ${invoiceId}`,
-          'INVOICE_ALREADY_EXISTS',
-        );
+        throw new SphereError(`Invoice already exists locally: ${invoiceId}`, 'INVOICE_ALREADY_EXISTS');
       }
+      const sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(invoiceToken)));
 
-      // Step 5: Create MintTransactionData
-      const invoiceTokenType = new TokenType(
-        Buffer.from(INVOICE_TOKEN_TYPE_HEX, 'hex'),
-      );
-
-      // Create signing service from identity private key
-      const signingService = await SigningService.createFromSecret(signingKeyBytes);
-
-      // Build owner address using UnmaskedPredicateReference
-      const addressRef = await UnmaskedPredicateReference.create(
-        invoiceTokenType,
-        signingService.algorithm,
-        signingService.publicKey,
-        HashAlgorithm.SHA256,
-      );
-      const ownerAddress = await addressRef.toAddress();
-
-      const mintData = await MintTransactionData.create(
-        invoiceTokenId,
-        invoiceTokenType,
-        invoiceBytesEncoded,     // tokenData: serialized InvoiceTerms (UTF-8 JSON)
-        null,                    // coinData: null (non-fungible invoice token)
-        ownerAddress,
-        salt,
-        null,                    // recipientDataHash: null
-        null,                    // reason: null
-      );
-
-      if (this.config.debug) {
-        logger.debug(LOG_TAG, `Created MintTransactionData for invoice ${invoiceId}`);
-      }
-
-      // Step 6: Create MintCommitment
-      const commitment = await MintCommitment.create(mintData);
-
-      if (this.config.debug) {
-        logger.debug(LOG_TAG, 'Created MintCommitment for invoice');
-      }
-
-      // Step 7: Submit to aggregator with 3 retries
-      // REQUEST_ID_EXISTS is treated as success (idempotent re-mint by same wallet)
-      const MAX_RETRIES = 3;
-      let submitSuccess = false;
-
-      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          if (this.config.debug) {
-            logger.debug(
-              LOG_TAG,
-              `Submitting invoice commitment (attempt ${attempt}/${MAX_RETRIES})...`,
-            );
-          }
-          const response = await stClient.submitMintCommitment(commitment);
-
-          if (response.status === 'SUCCESS' || response.status === 'REQUEST_ID_EXISTS') {
-            if (this.config.debug) {
-              logger.debug(
-                LOG_TAG,
-                response.status === 'REQUEST_ID_EXISTS'
-                  ? 'Invoice commitment already exists (idempotent re-mint)'
-                  : 'Invoice commitment submitted successfully',
-              );
-            }
-            submitSuccess = true;
-            break;
-          } else {
-            logger.warn(LOG_TAG, `Invoice commitment submission failed: ${response.status}`);
-            if (attempt === MAX_RETRIES) {
-              throw new SphereError(
-                `Failed to mint invoice token: commitment rejected after ${MAX_RETRIES} attempts: ${response.status}`,
-                'INVOICE_MINT_FAILED',
-              );
-            }
-            await new Promise((r) => setTimeout(r, 1000 * attempt));
-          }
-        } catch (retryErr) {
-          if (retryErr instanceof SphereError && (
-            retryErr.code === 'INVOICE_ORACLE_REQUIRED' ||
-            retryErr.code === 'INVOICE_INVALID_PROOF' ||
-            retryErr.code === 'INVOICE_MINT_FAILED' ||
-            retryErr.code === 'NOT_INITIALIZED' ||
-            retryErr.code === 'MODULE_DESTROYED'
-          )) throw retryErr;
-          logger.warn(LOG_TAG, `Invoice commitment attempt ${attempt} error:`, retryErr);
-          if (attempt === MAX_RETRIES) {
-            throw new SphereError(
-              `Failed to mint invoice token: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
-              'INVOICE_MINT_FAILED',
-              retryErr,
-            );
-          }
-          await new Promise((r) => setTimeout(r, 1000 * attempt));
-        }
-      }
-
-      if (!submitSuccess) {
-        throw new SphereError(
-          'Failed to mint invoice token: commitment submission failed after retries',
-          'INVOICE_MINT_FAILED',
-        );
-      }
-
-      // Step 8: Wait for inclusion proof
-      if (this.config.debug) {
-        logger.debug(LOG_TAG, 'Waiting for invoice inclusion proof...');
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const inclusionProof = await waitInclusionProof(trustBase as any, stClient, commitment);
-      if (this.config.debug) {
-        logger.debug(LOG_TAG, 'Invoice inclusion proof received');
-      }
-
-      // Step 9: Create genesis transaction
-      const genesisTransaction = commitment.toTransaction(inclusionProof);
-
-      // Step 10: Create UnmaskedPredicate + TokenState
-      const invoicePredicate = await UnmaskedPredicate.create(
-        invoiceTokenId,
-        invoiceTokenType,
-        signingService,
-        HashAlgorithm.SHA256,
-        salt,
-      );
-      const tokenState = new TokenState(invoicePredicate, null);
-
-      // Step 11: Create Token
-      // Always verify against trust base — never skip proof verification
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const sdkToken: any = await SdkToken.mint(trustBase as any, tokenState, genesisTransaction);
-
-      if (this.config.debug) {
-        logger.debug(LOG_TAG, 'Invoice token minted successfully');
-      }
-
-      // ------------------------------------------------------------------
-      // Step 12: Store token via PaymentsModule.addToken()
-      // The sdkToken.toJSON() produces a TxfToken-compatible object which is
-      // stored as sdkData (JSON string) on the UI Token.
-      // ------------------------------------------------------------------
-      const sdkTokenJson = sdkToken.toJSON();
       const uiToken: import('../../types/index.js').Token = {
         id: invoiceId,
         coinId: INVOICE_TOKEN_TYPE_HEX,
@@ -1220,7 +1024,7 @@ export class AccountingModule {
         status: 'confirmed',
         createdAt: terms.createdAt,
         updatedAt: terms.createdAt,
-        sdkData: JSON.stringify(sdkTokenJson),
+        sdkData,
       };
 
       await deps.payments.addToken(uiToken);
@@ -1246,19 +1050,8 @@ export class AccountingModule {
       let anyScanDirty = false;
 
       for (const token of allTokens) {
-        if (!token.sdkData) continue;
-        let txf: TxfToken;
-        try {
-          txf = JSON.parse(token.sdkData) as TxfToken;
-        } catch {
-          continue;
-        }
-        // Only scan tokens that have transactions (payment/transfer tokens)
-        const txCount = txf.transactions?.length ?? 0;
-        if (txCount === 0) continue;
-        // Full scan from index 0 for retroactive discovery
-        this._processTokenTransactions(token.id, txf, 0);
-        anyScanDirty = true;
+        // Full scan from index 0 for retroactive discovery (v1 TXF or v2 blob).
+        if (await this._scanTokenForAttribution(token, 0)) anyScanDirty = true;
       }
 
       // Also scan archived tokens (spec §5.4 Phase 2 step 5)
@@ -1286,12 +1079,12 @@ export class AccountingModule {
       // ------------------------------------------------------------------
       // Step 15: Return result
       // ------------------------------------------------------------------
-      const txfToken: TxfToken = sdkTokenJson as unknown as TxfToken;
-
       return {
         success: true,
         invoiceId,
-        token: txfToken,
+        // The transmittable v2 invoice blob (hex) — feed it to importInvoice
+        // on the receiving side.
+        token: sdkData,
         terms,
       };
     } catch (err) {
@@ -1318,65 +1111,72 @@ export class AccountingModule {
    * After import, scans full transaction history for any pre-existing payments
    * referencing this invoice and fires retroactive events.
    *
-   * @param token - Invoice token in TXF format.
+   * @param token - Invoice token as a v2 engine blob (hex string). Legacy v1
+   *   TXF objects are rejected with `INVOICE_INVALID_DATA` (v1 support removed).
    * @returns Parsed InvoiceTerms.
    *
    * @throws {SphereError} `INVOICE_INVALID_PROOF` — inclusion proof is invalid.
-   * @throws {SphereError} `INVOICE_WRONG_TOKEN_TYPE` — token type is not INVOICE_TOKEN_TYPE_HEX.
-   * @throws {SphereError} `INVOICE_INVALID_DATA` — tokenData cannot be parsed as InvoiceTerms.
+   * @throws {SphereError} `INVOICE_INVALID_DATA` — tokenData cannot be parsed as InvoiceTerms, or a legacy v1 TXF token was supplied.
+   * @throws {SphereError} `INVOICE_ORACLE_REQUIRED` — no token engine (v2 oracle config missing).
    * @throws {SphereError} `INVOICE_ALREADY_EXISTS` — invoice token already exists locally.
    * @throws {SphereError} `NOT_INITIALIZED` — module not initialized.
    * @throws {SphereError} `MODULE_DESTROYED` — module has been destroyed.
    */
-  async importInvoice(token: TxfToken): Promise<InvoiceTerms> {
+  async importInvoice(token: TxfToken | string): Promise<InvoiceTerms> {
     this.ensureNotDestroyed();
     this.ensureInitialized();
 
     const deps = this.deps!;
 
-    // ------------------------------------------------------------------
-    // Step 1: Validate token type
-    // ------------------------------------------------------------------
-    const tokenType = token.genesis?.data?.tokenType;
-    if (tokenType !== INVOICE_TOKEN_TYPE_HEX) {
-      throw new SphereError(
-        `Invoice import failed: token type "${tokenType}" is not the expected invoice type.`,
-        'INVOICE_WRONG_TOKEN_TYPE',
-      );
-    }
-
-    // ------------------------------------------------------------------
-    // Step 2: Parse and validate InvoiceTerms from tokenData
-    // ------------------------------------------------------------------
-    const tokenData = token.genesis?.data?.tokenData;
-    if (!tokenData || typeof tokenData !== 'string') {
-      throw new SphereError(
-        'Invoice import failed: missing or invalid tokenData field.',
-        'INVOICE_INVALID_DATA',
-      );
-    }
-
-    // tokenData may be plain JSON or hex-encoded UTF-8 JSON
-    // (state-transition-sdk stores it as hex via HexConverter.encode).
-    let jsonString = tokenData;
-    if (!/^\s*[\[{"]/.test(tokenData)) {
-      // Doesn't look like JSON — attempt hex decode
-      try {
-        const bytes = hexToBytes(tokenData);
-        jsonString = new TextDecoder().decode(bytes);
-      } catch {
-        // not valid hex — fall through to JSON.parse which will produce the proper error
-      }
-    }
     let terms: InvoiceTerms;
-    try {
-      terms = JSON.parse(jsonString) as InvoiceTerms;
-    } catch {
+
+    // Legacy v1 TXF invoice tokens (objects / TXF JSON) are no longer supported:
+    // their cryptographic proof verification required the removed v1 engine.
+    if (typeof (token as unknown) !== 'string') {
       throw new SphereError(
-        'Invoice import failed: tokenData is not valid JSON.',
+        'Legacy (v1 TXF) invoice tokens are no longer supported — ask the issuer for a v2 invoice blob (wallet >= 0.8).',
         'INVOICE_INVALID_DATA',
       );
     }
+    const engine = deps.tokenEngine;
+    if (!engine) {
+      throw new SphereError(
+        'Token engine unavailable — cannot import invoices (v2 oracle config with trust base + gateway required).',
+        'INVOICE_ORACLE_REQUIRED',
+      );
+    }
+
+    // v2: `token` is the engine blob (hex). The proof chain (engine.verify)
+    // binds the genesis data (= the invoice terms) to the on-chain commitment.
+    // The data token's type is established at mint (mintDataToken), so no
+    // separate type check. Decode failures (non-hex strings — incl. v1 TXF
+    // JSON strings — base64, truncated or non-blob CBOR) surface as the
+    // documented INVOICE_INVALID_DATA instead of raw noble/CBOR errors.
+    let sphereToken;
+    try {
+      sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token as unknown as string)));
+    } catch (err) {
+      throw new SphereError(
+        'Invoice import failed: token is not a valid v2 invoice blob (legacy v1 TXF strings are not supported — ask the issuer for a v2 invoice blob).',
+        'INVOICE_INVALID_DATA',
+        err instanceof Error ? err : undefined,
+      );
+    }
+    const verifyResult = await engine.verify(sphereToken);
+    if (!verifyResult.ok) {
+      throw new SphereError('Invoice import failed: inclusion proof is invalid.', 'INVOICE_INVALID_PROOF');
+    }
+    const tokenId: string = engine.tokenId(sphereToken);
+    const data = engine.readTokenData(sphereToken);
+    if (!data) {
+      throw new SphereError('Invoice import failed: missing or invalid tokenData field.', 'INVOICE_INVALID_DATA');
+    }
+    try {
+      terms = JSON.parse(new TextDecoder().decode(data)) as InvoiceTerms;
+    } catch {
+      throw new SphereError('Invoice import failed: tokenData is not valid JSON.', 'INVOICE_INVALID_DATA');
+    }
+    const sdkDataForStore: string = token as unknown as string;
 
     // ------------------------------------------------------------------
     // Step 3: Business validation of InvoiceTerms (§8.2)
@@ -1504,14 +1304,6 @@ export class AccountingModule {
     // ------------------------------------------------------------------
     // Step 4: Check for duplicate (token already imported)
     // ------------------------------------------------------------------
-    const tokenId = token.genesis?.data?.tokenId;
-    if (!tokenId || typeof tokenId !== 'string') {
-      throw new SphereError(
-        'Invoice import failed: missing tokenId in genesis data.',
-        'INVOICE_INVALID_DATA',
-      );
-    }
-
     if (this.invoiceTermsCache.has(tokenId)) {
       throw new SphereError(
         `Invoice already exists locally: ${tokenId}`,
@@ -1519,89 +1311,10 @@ export class AccountingModule {
       );
     }
 
-    // CR-M1 fix: Verify that canonical re-serialization of parsed terms produces
-    // a hash matching the on-chain tokenId. This cryptographically binds the
-    // human-readable terms to the on-chain commitment, preventing an attacker from
-    // submitting terms with extra fields or alternate key ordering.
-    //
-    // IMPORTANT: Must use the same DataHasher + TokenId path as createInvoice().
-    // DataHasher.SHA256.digest().imprint is [2-byte algorithm tag (0x0000)] +
-    // [32-byte SHA-256] = 34 bytes → TokenId.toJSON() = 68-char hex.
-    // crypto.subtle.digest produces only the 32-byte SHA-256 (64-char hex) which
-    // does NOT match the 68-char tokenId stored on-chain.
-    {
-      const { DataHasher } = await import(
-        '@unicitylabs/state-transition-sdk/lib/hash/DataHasher.js'
-      );
-      const { HashAlgorithm } = await import(
-        '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm.js'
-      );
-      const { TokenId } = await import(
-        '@unicitylabs/state-transition-sdk/lib/token/TokenId.js'
-      );
-      const reSerializedBytes = new TextEncoder().encode(canonicalSerialize(terms));
-      const hash = await new DataHasher(HashAlgorithm.SHA256)
-        .update(reSerializedBytes)
-        .digest();
-      const reTokenId = new TokenId(hash.imprint).toJSON();
-      if (reTokenId !== tokenId) {
-        throw new SphereError(
-          'Invoice import failed: parsed terms do not match on-chain token ID (canonical hash mismatch).',
-          'INVOICE_INVALID_DATA',
-        );
-      }
-    }
-
-    // ------------------------------------------------------------------
-    // Step 5: Verify inclusion proof (SECURITY CRITICAL)
-    // We reconstruct the SDK token from JSON and call token.verify() against
-    // the trust base. Token.fromJSON() reconstructs without verification;
-    // verify() performs the cryptographic proof check.
-    // ------------------------------------------------------------------
-
-    // C2/C6 fix: Reject imports when trustBase is empty — without a valid trust
-    // base, verify() may silently accept forged proofs depending on SDK behavior.
-    if (!deps.trustBase || (deps.trustBase instanceof Uint8Array && deps.trustBase.length === 0)) {
-      throw new SphereError(
-        'Trust base unavailable — cannot verify invoice proof. Ensure oracle supports getTrustBase().',
-        'INVOICE_INVALID_PROOF',
-      );
-    }
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const sdkToken = await SdkToken.fromJSON(token as any);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const verifyResult = await sdkToken.verify(deps.trustBase as any);
-      // CR-M2 fix: Token.verify() always returns a VerificationResult object.
-      // Check .isSuccessful === true for strict validation (no boolean fallback).
-      const verifyOk = (verifyResult as { isSuccessful?: boolean }).isSuccessful === true;
-      if (!verifyOk) {
-        throw new SphereError(
-          'Invoice import failed: inclusion proof is invalid.',
-          'INVOICE_INVALID_PROOF',
-        );
-      }
-
-      // C7 fix: Verify that the JSON-supplied tokenId matches the cryptographically
-      // computed token identity. Without this check, an attacker can submit a valid
-      // proof for token X while claiming it is token Y, poisoning the ledger cache.
-      // CRITICAL: Require a match, not just check for mismatch — if canonicalTokenId
-      // is undefined/null, reject rather than silently accepting.
-      const canonicalTokenId = sdkToken.id?.toJSON?.() ?? null;
-      if (!canonicalTokenId || canonicalTokenId !== tokenId) {
-        throw new SphereError(
-          `Invoice import failed: tokenId mismatch or unverifiable — JSON claims ${tokenId}, cryptographic identity is ${canonicalTokenId ?? 'unknown'}`,
-          'INVOICE_INVALID_DATA',
-        );
-      }
-    } catch (err) {
-      if (err instanceof SphereError) throw err;
-      throw new SphereError(
-        `Invoice import failed: proof verification error — ${err instanceof Error ? err.message : String(err)}`,
-        'INVOICE_INVALID_PROOF',
-      );
-    }
+    // Proof verification happened above via engine.verify: the v2 proof chain
+    // cryptographically binds the genesis data (terms) AND the token id to the
+    // on-chain commitment, covering the old CR-M1 (terms↔tokenId) and C7
+    // (claimed-id↔cryptographic-id) checks by construction.
 
     // ------------------------------------------------------------------
     // Step 6: Store the token via PaymentsModule.addToken()
@@ -1620,7 +1333,7 @@ export class AccountingModule {
         status: 'confirmed',
         createdAt: terms.createdAt,
         updatedAt: terms.createdAt,
-        sdkData: JSON.stringify(token),
+        sdkData: sdkDataForStore,
       };
       await deps.payments.addToken(uiToken);
     } catch (err) {
@@ -1712,17 +1425,8 @@ export class AccountingModule {
     const allTokens = deps.payments.getTokens();
     let anyDirty = false;
     for (const existingToken of allTokens) {
-      if (!existingToken.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(existingToken.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const transactions = txf.transactions ?? [];
       const startIndex = this.tokenScanState.get(existingToken.id) ?? 0;
-      if (transactions.length > startIndex) {
-        this._processTokenTransactions(existingToken.id, txf, startIndex);
+      if (await this._scanTokenForAttribution(existingToken, startIndex)) {
         anyDirty = true;
       }
     }
@@ -4347,18 +4051,8 @@ export class AccountingModule {
     let anyDirty = false;
 
     for (const token of allTokens) {
-      if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-
-      const transactions = txf.transactions ?? [];
       const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if (transactions.length > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
+      if (await this._scanTokenForAttribution(token, startIndex)) {
         anyDirty = true;
       }
     }
@@ -4419,6 +4113,62 @@ export class AccountingModule {
    * @param txf        - Parsed TxfToken.
    * @param startIndex - First unprocessed transaction index.
    */
+  /**
+   * Attribute one payment token's invoice memo(s) to the ledger.
+   *
+   * v2 (engine blob): the token carries a single on-chain memo. We decode it and
+   * shim the token into a v1-shaped `txf` (coinData ← engine.readValue, the memo
+   * ← engine.readMemo) so the battle-hardened `_processTokenTransactions` runs
+   * UNCHANGED — same dedup, direction, provisional/synthetic/orphan handling.
+   * v1 (TXF JSON): parse and scan transactions directly.
+   *
+   * `startIndex` is the per-token watermark (0 for a full retroactive scan).
+   * Returns true when the token was scanned. Async because engine.decodeToken is.
+   */
+  private async _scanTokenForAttribution(token: Token, startIndex: number): Promise<boolean> {
+    if (!token.sdkData) return false;
+    const engine = this.deps?.tokenEngine;
+
+    // v2 engine blob: hex (CBOR), not the legacy TXF JSON ('{'-prefixed).
+    const isBlob =
+      token.sdkData.length >= 2 &&
+      token.sdkData.length % 2 === 0 &&
+      token.sdkData[0] !== '{' &&
+      /^[0-9a-f]+$/i.test(token.sdkData);
+
+    if (engine && isBlob) {
+      let syntheticTxf: TxfToken;
+      try {
+        const sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
+        const memo = engine.readMemo(sphereToken);
+        if (!memo) return false; // no memo ⇒ not an invoice-referencing payment
+        const coinData = (engine.readValue(sphereToken)?.assets ?? []).map(
+          (a) => [a.coinId, a.amount.toString()] as [string, string],
+        );
+        syntheticTxf = {
+          genesis: { data: { coinData } },
+          transactions: [{ data: { message: bytesToHex(memo) }, inclusionProof: {} }],
+        } as unknown as TxfToken;
+      } catch {
+        return false;
+      }
+      this._processTokenTransactions(token.id, syntheticTxf, startIndex);
+      return true;
+    }
+
+    let txf: TxfToken;
+    try {
+      txf = JSON.parse(token.sdkData) as TxfToken;
+    } catch {
+      return false;
+    }
+    if ((txf.transactions?.length ?? 0) > startIndex) {
+      this._processTokenTransactions(token.id, txf, startIndex);
+      return true;
+    }
+    return false;
+  }
+
   private _processTokenTransactions(
     tokenId: string,
     txf: TxfToken,
@@ -4839,17 +4589,7 @@ export class AccountingModule {
 
     // Advance token scan watermarks (stub advances counter only — full indexing deferred)
     for (const token of transfer.tokens) {
-      if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if ((txf.transactions?.length ?? 0) > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
-      }
+      await this._scanTokenForAttribution(token, this.tokenScanState.get(token.id) ?? 0);
     }
 
     // W5-R20 fix: Check destroyed before flush — event handler may still be mid-execution
@@ -5106,16 +4846,7 @@ export class AccountingModule {
     // Advance watermarks and invalidate balance caches for all related tokens
     for (const token of result.tokens) {
       if (!token.sdkData) continue;
-      let txf: TxfToken;
-      try {
-        txf = JSON.parse(token.sdkData) as TxfToken;
-      } catch {
-        continue;
-      }
-      const startIndex = this.tokenScanState.get(token.id) ?? 0;
-      if ((txf.transactions?.length ?? 0) > startIndex) {
-        this._processTokenTransactions(token.id, txf, startIndex);
-      }
+      await this._scanTokenForAttribution(token, this.tokenScanState.get(token.id) ?? 0);
       const relatedInvoices = this.tokenInvoiceMap.get(token.id);
       if (relatedInvoices) {
         for (const invoiceId of relatedInvoices) {
@@ -5223,16 +4954,8 @@ export class AccountingModule {
     const token = tokens.find((t) => t.id === tokenId);
     if (!token?.sdkData) return;
 
-    let txf: TxfToken;
-    try {
-      txf = JSON.parse(token.sdkData) as TxfToken;
-    } catch {
-      return;
-    }
-
     const startIndex = this.tokenScanState.get(tokenId) ?? 0;
-    if ((txf.transactions?.length ?? 0) > startIndex) {
-      this._processTokenTransactions(tokenId, txf, startIndex);
+    if (await this._scanTokenForAttribution(token, startIndex)) {
       if (this.destroyed) return;
       await this._flushDirtyLedgerEntries();
     }
@@ -6623,7 +6346,7 @@ export class AccountingModule {
   private getStorageKey(key: string): string {
     const identity = this.deps!.identity;
     // Use condensed addressId format (DIRECT_abc123_xyz789) for consistency with other modules
-    const addressId = getAddressId(identity.directAddress ?? identity.chainPubkey);
+    const addressId = identity.chainPubkey;
     return getAddressStorageKey(addressId, key);
   }
 

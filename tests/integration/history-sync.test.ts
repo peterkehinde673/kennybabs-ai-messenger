@@ -28,6 +28,7 @@ import type {
 } from '../../index';
 import type { ProviderStatus } from '../../types';
 import type { SaveResult, LoadResult, SyncResult } from '../../storage';
+import { TEST_NETWORK } from '../test-network';
 
 // Mock L1 to avoid real WebSocket connections
 vi.mock('../../l1/network', () => ({
@@ -187,6 +188,7 @@ describe('History sync integration (multi-device)', () => {
       storage: storageA,
       transport: createMockTransport(),
       oracle: createMockOracle(),
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageA,
       autoGenerate: true,
     });
@@ -235,6 +237,7 @@ describe('History sync integration (multi-device)', () => {
       storage: storageB,
       transport: createMockTransport(),
       oracle: createMockOracle(),
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageB,
       mnemonic: generatedMnemonic!,
     });
@@ -275,6 +278,7 @@ describe('History sync integration (multi-device)', () => {
       storage: storageA,
       transport: createMockTransport(),
       oracle: createMockOracle(),
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageA,
       autoGenerate: true,
     });
@@ -312,6 +316,7 @@ describe('History sync integration (multi-device)', () => {
       storage: storageB,
       transport: createMockTransport(),
       oracle: createMockOracle(),
+      network: TEST_NETWORK,
       tokenStorage: tokenStorageB,
       mnemonic: generatedMnemonic!,
     });

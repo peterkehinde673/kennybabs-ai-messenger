@@ -28,6 +28,8 @@ export type {
 // =============================================================================
 
 import { logger as sdkLogger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
+import { assertNetworkConsistency } from '../shared/network';
 import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
@@ -362,7 +364,14 @@ function resolveTokenSyncConfig(
  * ```
  */
 export function createBrowserProviders(config?: BrowserProvidersConfig): BrowserProviders {
-  const network = config?.network ?? 'mainnet';
+  // Fail loud: a missing network would silently load the wrong-network providers.
+  if (!config?.network) {
+    throw new SphereError('createBrowserProviders: config.network is required.', 'INVALID_CONFIG');
+  }
+  const network = config.network;
+  // Refuse provably-broken networks (e.g. a null/mismatched trust base would
+  // silently accept unverified tokens) before building any provider.
+  assertNetworkConsistency(network);
 
   // Configure global logger: top-level debug enables all, per-provider overrides are additive.
   // Only override global debug flag when explicitly provided — don't reset a previously-configured value.
@@ -379,7 +388,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
 
-  const storage = createIndexedDBStorageProvider(config?.storage);
+  const storage = createIndexedDBStorageProvider({ ...config?.storage, network });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
@@ -388,6 +397,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     ? createBrowserIpfsStorageProvider({
         gateways: ipfsConfig.gateways,
         debug: config?.tokenSync?.ipfs?.useDht, // reuse debug-like flag
+        network,
       })
     : undefined;
 
@@ -422,7 +432,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       debug: oracleConfig.debug,
       network,
     }),
-    tokenStorage: createIndexedDBTokenStorageProvider(),
+    tokenStorage: createIndexedDBTokenStorageProvider({ network }),
     l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,

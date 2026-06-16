@@ -20,6 +20,7 @@ import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenSto
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
 import { vi } from 'vitest';
+import { TEST_NETWORK } from '../test-network';
 
 // =============================================================================
 // Test directories
@@ -113,7 +114,6 @@ function cleanTestDir(): void {
 describe('Tracked addresses integration', () => {
   let storage: FileStorageProvider;
   let tokenStorage: FileTokenStorageProvider;
-  let mintSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     cleanTestDir();
@@ -123,13 +123,9 @@ describe('Tracked addresses integration', () => {
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
-    // Mock minting so registerNametag (mint-before-publish) succeeds without a real aggregator
-    mintSpy = vi.spyOn(Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> }, 'mintNametag')
-      .mockResolvedValue({ success: true, token: null, nametagData: null });
   });
 
   afterEach(() => {
-    mintSpy.mockRestore();
     (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     clearNostrRelay();
@@ -144,6 +140,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -170,6 +167,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -191,6 +189,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -237,6 +236,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -281,6 +281,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -301,6 +302,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -334,6 +336,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -364,6 +367,7 @@ describe('Tracked addresses integration', () => {
         storage: storage2,
         transport: transport2,
         oracle: oracle2,
+        network: TEST_NETWORK,
         tokenStorage: tokenStorage2,
       });
 
@@ -416,6 +420,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -454,6 +459,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -497,6 +503,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -534,6 +541,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -558,6 +566,7 @@ describe('Tracked addresses integration', () => {
         storage: storage2,
         transport: createMockTransport(),
         oracle: createMockOracle(),
+        network: TEST_NETWORK,
         tokenStorage: tokenStorage2,
         autoGenerate: true,
       });
@@ -585,6 +594,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -625,6 +635,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -656,6 +667,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -693,6 +705,7 @@ describe('Tracked addresses integration', () => {
         storage,
         transport,
         oracle,
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });

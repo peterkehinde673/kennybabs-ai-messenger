@@ -167,7 +167,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
     try {
       // Derive IPNS key pair and name from wallet private key
-      const { keyPair, ipnsName } = await deriveIpnsIdentity(this.identity.privateKey);
+      const { keyPair, ipnsName } = await deriveIpnsIdentity(this.identity.privateKey, this._config?.network);
       this.ipnsKeyPair = keyPair;
       this.ipnsName = ipnsName;
       this.log(`IPNS name derived: ${ipnsName}`);

@@ -17,6 +17,7 @@ import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenSto
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
 import { vi } from 'vitest';
+import { TEST_NETWORK } from '../test-network';
 
 // =============================================================================
 // Test directories
@@ -106,7 +107,6 @@ function cleanTestDir(): void {
 describe('Nametag normalization integration', () => {
   let storage: FileStorageProvider;
   let tokenStorage: FileTokenStorageProvider;
-  let mintSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     cleanTestDir();
@@ -116,13 +116,9 @@ describe('Nametag normalization integration', () => {
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
-    // Mock minting so registerNametag (mint-before-publish) succeeds without a real aggregator
-    mintSpy = vi.spyOn(Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> }, 'mintNametag')
-      .mockResolvedValue({ success: true, token: null, nametagData: null });
   });
 
   afterEach(() => {
-    mintSpy.mockRestore();
     (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     nostrRelayNametags.clear();
@@ -136,6 +132,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -156,6 +153,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
       nametag: 'BOB',
@@ -174,6 +172,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -193,6 +192,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -210,6 +210,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -227,6 +228,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -246,6 +248,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });

@@ -174,16 +174,9 @@ export type {
 } from './transport';
 
 export type {
-  // Oracle (Aggregator)
+  // Oracle (Aggregator) — v2: network-config provider for the token engine
   OracleProvider,
-  TransferCommitment,
-  SubmitResult,
-  InclusionProof,
-  WaitOptions,
   ValidationResult,
-  TokenState,
-  MintParams,
-  MintResult,
   OracleEvent,
   OracleEventType,
   OracleEventCallback,
@@ -373,8 +366,6 @@ export type {
   SpentTokenInfo,
   SpentTokenResult,
   ValidationResult as TokenValidationResult,
-  AggregatorClient,
-  TrustBaseLoader,
 } from './validation';
 
 // =============================================================================

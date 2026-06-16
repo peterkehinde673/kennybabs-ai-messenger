@@ -34,7 +34,8 @@
     "validation/**/*.ts",
     "impl/**/*.ts",
     "l1/**/*.ts",
-    "registry/**/*.ts"
+    "registry/**/*.ts",
+    "token-engine/**/*.ts"
   ],
   "exclude": [
     "node_modules",

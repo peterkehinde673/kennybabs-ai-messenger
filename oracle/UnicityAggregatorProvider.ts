@@ -1,9 +1,13 @@
 /**
  * Unicity Aggregator Provider
- * Platform-independent implementation using @unicitylabs/state-transition-sdk
  *
- * The oracle is a trusted service that provides verifiable truth
- * about token state through cryptographic inclusion proofs.
+ * Post v1-cutover this is a thin NETWORK-CONFIG provider for the v2 token
+ * engine: it loads the root trust base (JSON) via the injected platform loader
+ * and exposes the gateway URL + API key. The engine (token-engine/) builds its
+ * own SDK clients from these — no state-transition SDK objects live here.
+ *
+ * `validateToken` remains as a best-effort JSON-RPC check for LEGACY v1 TXF
+ * tokens still present in storage (display-path only).
  *
  * TrustBaseLoader is injected for platform-specific loading:
  * - Browser: fetch from URL
@@ -14,47 +18,26 @@ import { logger } from '../core/logger';
 import type { ProviderStatus } from '../types';
 import type {
   OracleProvider,
-  TransferCommitment,
-  SubmitResult,
-  InclusionProof,
-  WaitOptions,
   ValidationResult,
-  TokenState,
-  MintParams,
-  MintResult,
   OracleEvent,
   OracleEventCallback,
   TrustBaseLoader,
 } from './oracle-provider';
-import { DEFAULT_AGGREGATOR_TIMEOUT, TIMEOUTS } from '../constants';
+import { DEFAULT_AGGREGATOR_TIMEOUT } from '../constants';
 import { SphereError } from '../core/errors';
-
-// SDK imports - using direct imports from the SDK
-import { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
-import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient';
-import { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
-import type { TransferCommitment as SdkTransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
-
-// SDK MintCommitment type - using interface to avoid generic complexity
-interface SdkMintCommitment {
-  requestId?: { toString(): string };
-  [key: string]: unknown;
-}
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
 export interface UnicityAggregatorProviderConfig {
-  /** Aggregator URL */
+  /** Aggregator (gateway) URL */
   url: string;
   /** API key for authentication */
   apiKey?: string;
   /** Request timeout (ms) */
   timeout?: number;
-  /** Skip trust base verification (dev only) */
+  /** Skip trust base loading (dev only) */
   skipVerification?: boolean;
   /** Enable debug logging */
   debug?: boolean;
@@ -66,15 +49,6 @@ export interface UnicityAggregatorProviderConfig {
 // RPC Response Types
 // =============================================================================
 
-interface RpcSubmitResponse {
-  requestId?: string;
-}
-
-interface RpcProofResponse {
-  proof?: unknown;
-  roundNumber?: number;
-}
-
 interface RpcValidateResponse {
   valid?: boolean;
   spent?: boolean;
@@ -82,36 +56,15 @@ interface RpcValidateResponse {
   error?: string;
 }
 
-interface RpcSpentResponse {
-  spent?: boolean;
-}
-
-interface RpcTokenStateResponse {
-  state?: {
-    stateHash?: string;
-    spent?: boolean;
-    roundNumber?: number;
-  };
-}
-
-interface RpcMintResponse {
-  requestId?: string;
-  tokenId?: string;
-}
-
 // =============================================================================
 // Implementation
 // =============================================================================
 
-/**
- * Unicity Aggregator Provider
- * Concrete implementation of OracleProvider using Unicity's aggregator service
- */
 export class UnicityAggregatorProvider implements OracleProvider {
   readonly id = 'unicity-aggregator';
   readonly name = 'Unicity Aggregator';
   readonly type = 'network' as const;
-  readonly description = 'Unicity state transition aggregator (oracle implementation)';
+  readonly description = 'Unicity gateway network config (trust base + URL + API key) for the v2 token engine';
 
   private config: Required<Omit<UnicityAggregatorProviderConfig, 'trustBaseLoader'>> & {
     trustBaseLoader?: TrustBaseLoader;
@@ -119,27 +72,10 @@ export class UnicityAggregatorProvider implements OracleProvider {
   private status: ProviderStatus = 'disconnected';
   private eventCallbacks: Set<OracleEventCallback> = new Set();
 
-  // SDK clients
-  private aggregatorClient: AggregatorClient | null = null;
-  private stateTransitionClient: StateTransitionClient | null = null;
-  private trustBase: RootTrustBase | null = null;
+  /** Raw trust-base JSON as loaded (the v2 token engine parses it itself). */
+  private trustBaseJson: unknown | null = null;
 
-  /** Get the current trust base */
-  getTrustBase(): RootTrustBase | null {
-    return this.trustBase;
-  }
-
-  /** Get the state transition client */
-  getStateTransitionClient(): StateTransitionClient | null {
-    return this.stateTransitionClient;
-  }
-
-  /** Get the aggregator client */
-  getAggregatorClient(): AggregatorClient | null {
-    return this.aggregatorClient;
-  }
-
-  // Cache for spent states (immutable)
+  // Cache for spent states reported by validateToken (immutable once spent)
   private spentCache: Map<string, boolean> = new Map();
 
   constructor(config: UnicityAggregatorProviderConfig) {
@@ -154,6 +90,25 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   // ===========================================================================
+  // v2 token-engine config surface
+  // ===========================================================================
+
+  /** Raw trust-base JSON (for constructing the v2 token engine); null when unavailable. */
+  getTrustBaseJson(): unknown | null {
+    return this.trustBaseJson;
+  }
+
+  /** The gateway URL this provider is configured against. */
+  getAggregatorUrl(): string {
+    return this.config.url;
+  }
+
+  /** The gateway API key (for the v2 token engine); undefined when none is configured. */
+  getApiKey(): string | undefined {
+    return this.config.apiKey || undefined;
+  }
+
+  // ===========================================================================
   // BaseProvider Implementation
   // ===========================================================================
 
@@ -162,9 +117,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
 
     this.status = 'connecting';
 
-    // Mark as connected - actual connectivity will be verified on first operation
-    // The aggregator requires requestId in params even for status checks,
-    // which the SDK client doesn't support directly
+    // Mark as connected — actual connectivity is verified on first operation.
     this.status = 'connected';
     this.emitEvent({ type: 'oracle:connected', timestamp: Date.now() });
     this.log('Connected to oracle:', this.config.url);
@@ -188,22 +141,14 @@ export class UnicityAggregatorProvider implements OracleProvider {
   // OracleProvider Implementation
   // ===========================================================================
 
-  async initialize(trustBase?: RootTrustBase): Promise<void> {
-    // Initialize SDK clients with optional API key
-    this.aggregatorClient = new AggregatorClient(
-      this.config.url,
-      this.config.apiKey || null
-    );
-    this.stateTransitionClient = new StateTransitionClient(this.aggregatorClient);
-
-    if (trustBase) {
-      this.trustBase = trustBase;
+  async initialize(trustBaseJson?: unknown): Promise<void> {
+    if (trustBaseJson) {
+      this.trustBaseJson = trustBaseJson;
     } else if (!this.config.skipVerification && this.config.trustBaseLoader) {
-      // Load trust base using injected loader
       try {
-        const trustBaseJson = await this.config.trustBaseLoader.load();
-        if (trustBaseJson) {
-          this.trustBase = RootTrustBase.fromJSON(trustBaseJson);
+        const loaded = await this.config.trustBaseLoader.load();
+        if (loaded) {
+          this.trustBaseJson = loaded;
         }
       } catch (error) {
         this.log('Failed to load trust base:', error);
@@ -211,179 +156,17 @@ export class UnicityAggregatorProvider implements OracleProvider {
     }
 
     await this.connect();
-    this.log('Initialized with trust base:', !!this.trustBase);
+    this.log('Initialized with trust base JSON:', !!this.trustBaseJson);
   }
 
   /**
-   * Submit a transfer commitment to the aggregator.
-   * Accepts either an SDK TransferCommitment or a simple commitment object.
+   * Best-effort RPC validation for LEGACY v1 TXF tokens (display path only).
+   * v2 blob tokens are verified via the token engine and never reach this.
    */
-  async submitCommitment(commitment: TransferCommitment | SdkTransferCommitment): Promise<SubmitResult> {
-    this.ensureConnected();
-
-    try {
-      let requestId: string;
-
-      // Check if it's an SDK commitment (has submitTransferCommitment method signature)
-      if (this.isSdkTransferCommitment(commitment)) {
-        // Use SDK client directly
-        const response = await this.stateTransitionClient!.submitTransferCommitment(commitment);
-        requestId = commitment.requestId?.toString() ?? response.status;
-      } else {
-        // Fallback to RPC for simple commitment objects
-        const response = await this.rpcCall<RpcSubmitResponse>('submitCommitment', {
-          sourceToken: commitment.sourceToken,
-          recipient: commitment.recipient,
-          salt: Array.from(commitment.salt),
-          data: commitment.data,
-        });
-        requestId = response.requestId ?? '';
-      }
-
-      this.emitEvent({
-        type: 'commitment:submitted',
-        timestamp: Date.now(),
-        data: { requestId },
-      });
-
-      return {
-        success: true,
-        requestId,
-        timestamp: Date.now(),
-      };
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      return {
-        success: false,
-        error: errorMsg,
-        timestamp: Date.now(),
-      };
-    }
-  }
-
-  /**
-   * Submit a mint commitment to the aggregator (SDK only)
-   * @param commitment - SDK MintCommitment instance
-   */
-  async submitMintCommitment(commitment: SdkMintCommitment): Promise<SubmitResult> {
-    this.ensureConnected();
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const response = await this.stateTransitionClient!.submitMintCommitment(commitment as any);
-      const requestId = commitment.requestId?.toString() ?? response.status;
-
-      this.emitEvent({
-        type: 'commitment:submitted',
-        timestamp: Date.now(),
-        data: { requestId },
-      });
-
-      return {
-        success: true,
-        requestId,
-        timestamp: Date.now(),
-      };
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      return {
-        success: false,
-        error: errorMsg,
-        timestamp: Date.now(),
-      };
-    }
-  }
-
-  private isSdkTransferCommitment(commitment: unknown): commitment is SdkTransferCommitment {
-    return (
-      commitment !== null &&
-      typeof commitment === 'object' &&
-      'requestId' in commitment &&
-      typeof (commitment as SdkTransferCommitment).requestId?.toString === 'function'
-    );
-  }
-
-  async getProof(requestId: string): Promise<InclusionProof | null> {
-    this.ensureConnected();
-
-    try {
-      const response = await this.rpcCall<RpcProofResponse>('getInclusionProof', { requestId });
-
-      if (!response.proof) {
-        return null;
-      }
-
-      return {
-        requestId,
-        roundNumber: response.roundNumber ?? 0,
-        proof: response.proof,
-        timestamp: Date.now(),
-      };
-    } catch (error) {
-      logger.warn('Aggregator', 'getProof failed', error);
-      return null;
-    }
-  }
-
-  async waitForProof(requestId: string, options?: WaitOptions): Promise<InclusionProof> {
-    const timeout = options?.timeout ?? this.config.timeout;
-    const pollInterval = options?.pollInterval ?? TIMEOUTS.PROOF_POLL_INTERVAL;
-    const startTime = Date.now();
-    let attempt = 0;
-
-    while (Date.now() - startTime < timeout) {
-      options?.onPoll?.(++attempt);
-
-      const proof = await this.getProof(requestId);
-      if (proof) {
-        this.emitEvent({
-          type: 'proof:received',
-          timestamp: Date.now(),
-          data: { requestId, roundNumber: proof.roundNumber },
-        });
-        return proof;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
-    }
-
-    throw new SphereError(`Timeout waiting for proof: ${requestId}`, 'TIMEOUT');
-  }
-
   async validateToken(tokenData: unknown): Promise<ValidationResult> {
     this.ensureConnected();
 
     try {
-      // Try SDK validation first if we have trust base
-      if (this.trustBase && !this.config.skipVerification) {
-        try {
-          const sdkToken = await SdkToken.fromJSON(tokenData);
-          const verifyResult = await sdkToken.verify(this.trustBase);
-
-          // Calculate state hash
-          const stateHash = await sdkToken.state.calculateHash();
-          const stateHashStr = stateHash.toJSON();
-
-          const valid = verifyResult.isSuccessful;
-
-          this.emitEvent({
-            type: 'validation:completed',
-            timestamp: Date.now(),
-            data: { valid },
-          });
-
-          return {
-            valid,
-            spent: false, // Spend check is separate
-            stateHash: stateHashStr,
-            error: valid ? undefined : 'SDK verification failed',
-          };
-        } catch (sdkError) {
-          this.log('SDK validation failed, falling back to RPC:', sdkError);
-        }
-      }
-
-      // Fallback to RPC validation
       const response = await this.rpcCall<RpcValidateResponse>('validateToken', { token: tokenData });
 
       const valid = response.valid ?? false;
@@ -410,107 +193,6 @@ export class UnicityAggregatorProvider implements OracleProvider {
       return {
         valid: false,
         spent: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  /**
-   * Wait for inclusion proof using SDK (for SDK commitments)
-   */
-  async waitForProofSdk(
-    commitment: SdkTransferCommitment | SdkMintCommitment,
-    signal?: AbortSignal
-  ): Promise<unknown> {
-    this.ensureConnected();
-
-    if (!this.trustBase) {
-      throw new SphereError('Trust base not initialized', 'NOT_INITIALIZED');
-    }
-
-    return await waitInclusionProof(
-      this.trustBase,
-      this.stateTransitionClient!,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      commitment as any,
-      signal
-    );
-  }
-
-  async isSpent(stateHash: string): Promise<boolean> {
-    // Check cache first (spent is immutable)
-    if (this.spentCache.has(stateHash)) {
-      return this.spentCache.get(stateHash)!;
-    }
-
-    this.ensureConnected();
-
-    try {
-      const response = await this.rpcCall<RpcSpentResponse>('isSpent', { stateHash });
-      const spent = response.spent ?? false;
-
-      // Cache result
-      if (spent) {
-        this.spentCache.set(stateHash, true);
-      }
-
-      return spent;
-    } catch (error) {
-      logger.warn('Aggregator', 'isSpent check failed, assuming unspent', error);
-      return false;
-    }
-  }
-
-  async getTokenState(tokenId: string): Promise<TokenState | null> {
-    this.ensureConnected();
-
-    try {
-      const response = await this.rpcCall<RpcTokenStateResponse>('getTokenState', { tokenId });
-
-      if (!response.state) {
-        return null;
-      }
-
-      return {
-        tokenId,
-        stateHash: response.state.stateHash ?? '',
-        spent: response.state.spent ?? false,
-        roundNumber: response.state.roundNumber,
-        lastUpdated: Date.now(),
-      };
-    } catch (error) {
-      logger.warn('Aggregator', 'getTokenState failed', error);
-      return null;
-    }
-  }
-
-  async getCurrentRound(): Promise<number> {
-    if (this.aggregatorClient) {
-      const blockHeight = await this.aggregatorClient.getBlockHeight();
-      return Number(blockHeight);
-    }
-    return 0;
-  }
-
-  async mint(params: MintParams): Promise<MintResult> {
-    this.ensureConnected();
-
-    try {
-      const response = await this.rpcCall<RpcMintResponse>('mint', {
-        coinId: params.coinId,
-        amount: params.amount,
-        recipientAddress: params.recipientAddress,
-        recipientPubkey: params.recipientPubkey,
-      });
-
-      return {
-        success: true,
-        requestId: response.requestId,
-        tokenId: response.tokenId,
-      };
-    } catch (error) {
-      return {
-        success: false,
         error: error instanceof Error ? error.message : String(error),
       };
     }

@@ -13,6 +13,7 @@
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hexToBytes } from '../../../core/crypto';
+import type { NetworkType } from '../../../constants';
 
 // =============================================================================
 // Constants
@@ -72,10 +73,15 @@ export function deriveEd25519KeyMaterial(
  */
 export async function deriveIpnsIdentity(
   privateKeyHex: string,
+  network?: NetworkType,
 ): Promise<{ keyPair: unknown; ipnsName: string }> {
   const { generateKeyPairFromSeed, peerIdFromPrivateKey } = await loadLibp2pModules();
 
-  const derivedKey = deriveEd25519KeyMaterial(privateKeyHex);
+  // Per-network IPNS: bake the network into the HKDF info so the same wallet key derives a
+  // DISTINCT IPNS identity per network — prevents a v2 wallet re-pulling v1 tokens from the
+  // old (shared) IPNS record. No network → legacy info (backward compatible).
+  const info = network ? `${IPNS_HKDF_INFO}:${network}` : IPNS_HKDF_INFO;
+  const derivedKey = deriveEd25519KeyMaterial(privateKeyHex, info);
   const keyPair = await generateKeyPairFromSeed('Ed25519', derivedKey);
   const peerId = peerIdFromPrivateKey(keyPair);
 
@@ -94,7 +100,8 @@ export async function deriveIpnsIdentity(
  */
 export async function deriveIpnsName(
   privateKeyHex: string,
+  network?: NetworkType,
 ): Promise<string> {
-  const { ipnsName } = await deriveIpnsIdentity(privateKeyHex);
+  const { ipnsName } = await deriveIpnsIdentity(privateKeyHex, network);
   return ipnsName;
 }

@@ -242,6 +242,36 @@ export function txfToToken(tokenId: string, txf: TxfToken): Token {
 // Storage Data Building
 // =============================================================================
 
+// =============================================================================
+// v2 token blob storage (opaque CBOR blob in sdkData, not v1 JSON TXF)
+// =============================================================================
+
+/** True when sdkData is an even-length lowercase-hex CBOR blob (a v2 token), not JSON TXF. */
+function isV2TokenBlob(sdkData: string | undefined): sdkData is string {
+  return (
+    typeof sdkData === 'string' &&
+    sdkData.length >= 2 &&
+    sdkData.length % 2 === 0 &&
+    sdkData[0] !== '{' &&
+    /^[0-9a-f]+$/i.test(sdkData)
+  );
+}
+
+/** Genesis token id for a v2 token's storage key (`v2_` is the UI-id prefix convention). */
+function v2TokenId(token: Token): string {
+  return token.id.startsWith('v2_') ? token.id.slice(3) : token.id;
+}
+
+/** A v2 storage entry is the UI token record itself (blob sdkData, no v1 `genesis`). */
+function isV2TokenEntry(entry: unknown): entry is Token {
+  return (
+    typeof entry === 'object' &&
+    entry !== null &&
+    !('genesis' in entry) &&
+    isV2TokenBlob((entry as Token).sdkData)
+  );
+}
+
 /**
  * Build TXF storage data from tokens and metadata
  */
@@ -290,12 +320,18 @@ export async function buildTxfStorageData(
     (storageData as TxfStorageData & { _history: HistoryRecord[] })._history = options.historyEntries;
   }
 
-  // Add active tokens
+  // Add active tokens. v2 tokens carry an opaque hex blob in sdkData (not JSON TXF),
+  // so tokenToTxf returns null for them — store the UI token record directly under
+  // its genesis token id (the v2 storage entry).
   for (const token of tokens) {
     const txf = tokenToTxf(token);
     if (txf) {
       const actualTokenId = txf.genesis.data.tokenId;
       storageData[keyFromTokenId(actualTokenId)] = txf;
+    } else if (isV2TokenBlob(token.sdkData)) {
+      // The v2 entry (a UI token record) lives in the token slot; parse reads it back
+      // via isV2TokenEntry. Cast because TxfStorageData's value union predates v2.
+      storageData[keyFromTokenId(v2TokenId(token))] = token as unknown as TxfToken;
     }
   }
 
@@ -466,6 +502,9 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
         if (txfToken?.genesis?.data?.tokenId) {
           const token = txfToToken(tokenId, txfToken);
           result.tokens.push(token);
+        } else if (isV2TokenEntry(storageData[key])) {
+          // v2 storage entry — the UI token record (opaque blob in sdkData).
+          result.tokens.push(storageData[key] as Token);
         }
       } catch (err) {
         result.validationErrors.push(`Token ${tokenId}: ${err}`);

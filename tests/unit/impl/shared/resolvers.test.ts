@@ -30,10 +30,10 @@ describe('getNetworkConfig', () => {
     expect(config.aggregatorUrl).toBe(NETWORKS.mainnet.aggregatorUrl);
   });
 
-  it('should return testnet config when specified', () => {
+  it('should return testnet config when specified (alias of testnet2 since the v1 cutover)', () => {
     const config = getNetworkConfig('testnet');
-    expect(config.name).toBe('Testnet');
-    expect(config.aggregatorUrl).toBe(NETWORKS.testnet.aggregatorUrl);
+    expect(config.name).toBe('Testnet2');
+    expect(config.aggregatorUrl).toBe(NETWORKS.testnet2.aggregatorUrl);
   });
 
   it('should return dev config when specified', () => {
@@ -180,12 +180,17 @@ describe('resolveOracleConfig', () => {
       expect(result.trustBasePath).toBe('./trustbase.json');
     });
 
-    it('should use default API key when not specified', () => {
+    it('should NOT set an API key when not specified (no bundled default)', () => {
       const result = resolveOracleConfig('testnet');
-      // Default API key is set in constants for trustbase authentication
-      expect(result.apiKey).toBe('sk_06365a9c44654841a366068bcfc68986');
+      // The SDK no longer ships a default key — consumers inject config.oracle.apiKey from env.
+      expect(result.apiKey).toBeUndefined();
       expect(result.timeout).toBeUndefined();
       expect(result.skipVerification).toBeUndefined();
+    });
+
+    it('should pass through an explicitly provided API key', () => {
+      const result = resolveOracleConfig('testnet', { apiKey: 'sk_custom' });
+      expect(result.apiKey).toBe('sk_custom');
     });
   });
 });

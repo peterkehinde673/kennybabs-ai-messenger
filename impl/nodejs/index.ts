@@ -25,6 +25,8 @@ export type {
 // =============================================================================
 
 import { logger as sdkLogger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
+import { assertNetworkConsistency } from '../shared/network';
 import { createFileStorageProvider, createFileTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
@@ -200,7 +202,14 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     }
   }
 
-  const network = config?.network ?? 'mainnet';
+  // Fail loud: a missing network would silently load the wrong-network providers.
+  if (!config?.network) {
+    throw new SphereError('createNodeProviders: config.network is required.', 'INVALID_CONFIG');
+  }
+  const network = config.network;
+  // Refuse provably-broken networks (e.g. a null/mismatched trust base would
+  // silently accept unverified tokens) before building any provider.
+  assertNetworkConsistency(network);
 
   // Configure global logger: top-level debug enables all, per-provider overrides are additive
   const globalDebug = config?.debug ?? false;
@@ -217,13 +226,14 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const storage = createFileStorageProvider({
     dataDir: config?.dataDir ?? './sphere-data',
     ...(config?.walletFileName ? { fileName: config.walletFileName } : {}),
+    network,
   });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
   const ipfsSync = config?.tokenSync?.ipfs;
   const ipfsTokenStorage = ipfsSync?.enabled
-    ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
+    ? createNodeIpfsStorageProvider({ ...ipfsSync.config, network }, storage)
     : undefined;
 
   // Resolve group chat config
@@ -242,6 +252,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     market,
     tokenStorage: createFileTokenStorageProvider({
       tokensDir: config?.tokensDir ?? './sphere-tokens',
+      network,
     }),
     transport: createNostrTransportProvider({
       relays: transportConfig.relays,

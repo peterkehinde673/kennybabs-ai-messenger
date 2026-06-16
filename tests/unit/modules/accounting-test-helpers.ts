@@ -843,6 +843,8 @@ export function createTestAccountingModule(overrides?: {
   trackedAddresses?: TrackedAddress[];
   // C6-R17: Allow overriding trustBase for security tests (null/empty = rejection)
   trustBase?: unknown;
+  // Path B: inject a token engine to exercise the v2 mint/read paths.
+  tokenEngine?: AccountingModuleDependencies['tokenEngine'];
 }): {
   module: AccountingModule;
   mocks: TestAccountingModuleMocks;
@@ -864,6 +866,7 @@ export function createTestAccountingModule(overrides?: {
     oracle: oracle as unknown as AccountingModuleDependencies['oracle'],
     trustBase: overrides?.trustBase !== undefined ? overrides.trustBase : new Uint8Array([1, 2, 3]),
     identity,
+    tokenEngine: overrides?.tokenEngine,
     getActiveAddresses: vi.fn().mockReturnValue(trackedAddresses),
     emitEvent: vi.fn(),
     on: vi.fn().mockImplementation(

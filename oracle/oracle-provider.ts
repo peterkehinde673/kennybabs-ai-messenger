@@ -2,10 +2,14 @@
  * Oracle Provider Interface
  * Platform-independent Unicity oracle abstraction
  *
- * The oracle is a trusted third-party service that provides verifiable truth
- * about the state of tokens in the Unicity network. It aggregates state
- * transitions into rounds and provides inclusion proofs that cryptographically
- * verify token ownership and transfers.
+ * Post v1-cutover the oracle is a thin NETWORK-CONFIG provider: it loads the
+ * root trust base (JSON) and exposes the gateway URL + API key. The v2 token
+ * engine (token-engine/) builds its own aggregator clients from these — no
+ * SDK client objects cross this boundary anymore.
+ *
+ * `validateToken` survives as a best-effort JSON-RPC check for LEGACY v1 TXF
+ * tokens still present in storage (display-path only); v2 blob tokens are
+ * verified via the engine (`engine.verify` + `engine.isSpent`).
  */
 
 import type { BaseProvider } from '../types';
@@ -14,119 +18,33 @@ import type { BaseProvider } from '../types';
 // Oracle Provider Interface
 // =============================================================================
 
-/**
- * Unicity state transition oracle provider
- *
- * The oracle serves as the source of truth for:
- * - Token state validation (spent/unspent)
- * - State transition inclusion proofs
- * - Round-based commitment aggregation
- */
 export interface OracleProvider extends BaseProvider {
   /**
-   * Initialize with trust base
+   * Initialize the provider. Loads the trust base JSON via the configured
+   * platform loader when none is passed explicitly.
+   *
+   * @param trustBaseJson - Optional raw trust-base JSON (overrides the loader).
    */
-  initialize(trustBase?: unknown): Promise<void>;
+  initialize(trustBaseJson?: unknown): Promise<void>;
 
   /**
-   * Submit transfer commitment
-   */
-  submitCommitment(commitment: TransferCommitment): Promise<SubmitResult>;
-
-  /**
-   * Get inclusion proof for a request
-   */
-  getProof(requestId: string): Promise<InclusionProof | null>;
-
-  /**
-   * Wait for inclusion proof with polling
-   */
-  waitForProof(requestId: string, options?: WaitOptions): Promise<InclusionProof>;
-
-  /**
-   * Validate token against aggregator
+   * Validate a LEGACY v1 TXF token against the aggregator (best-effort RPC).
+   * v2 blob tokens never reach this — they are verified via the token engine.
    */
   validateToken(tokenData: unknown): Promise<ValidationResult>;
 
-  /**
-   * Check if token state is spent
-   */
-  isSpent(stateHash: string): Promise<boolean>;
+  // ── v2 token-engine config surface ─────────────────────────────────────────
+  // Sphere.buildTokenEngine reads exactly these three accessors; the engine
+  // constructs its own StateTransitionClient/AggregatorClient/RootTrustBase.
 
-  /**
-   * Get token state
-   */
-  getTokenState(tokenId: string): Promise<TokenState | null>;
+  /** Raw trust-base JSON (the engine parses it; the networkId comes from it). */
+  getTrustBaseJson(): unknown | null;
 
-  /**
-   * Get current round number
-   */
-  getCurrentRound(): Promise<number>;
+  /** Gateway (aggregator) base URL. */
+  getAggregatorUrl(): string;
 
-  /**
-   * Mint new tokens (for faucet/testing)
-   */
-  mint?(params: MintParams): Promise<MintResult>;
-
-  /**
-   * Get underlying StateTransitionClient (if available)
-   * Used for advanced SDK operations like commitment creation
-   */
-  getStateTransitionClient?(): unknown;
-
-  /**
-   * Get underlying AggregatorClient (if available)
-   * Used for direct aggregator API access
-   */
-  getAggregatorClient?(): unknown;
-
-  /**
-   * Wait for inclusion proof using SDK commitment (if available)
-   * Used for transfer flows with SDK TransferCommitment
-   */
-  waitForProofSdk?(commitment: unknown, signal?: AbortSignal): Promise<unknown>;
-}
-
-// =============================================================================
-// Commitment Types
-// =============================================================================
-
-export interface TransferCommitment {
-  /** Source token (SDK format) */
-  sourceToken: unknown;
-  /** Recipient address/predicate */
-  recipient: string;
-  /** Random salt (non-reproducible) */
-  salt: Uint8Array;
-  /** Optional additional data */
-  data?: unknown;
-}
-
-export interface SubmitResult {
-  success: boolean;
-  requestId?: string;
-  error?: string;
-  timestamp: number;
-}
-
-// =============================================================================
-// Proof Types
-// =============================================================================
-
-export interface InclusionProof {
-  requestId: string;
-  roundNumber: number;
-  proof: unknown;
-  timestamp: number;
-}
-
-export interface WaitOptions {
-  /** Timeout in ms (default: 30000) */
-  timeout?: number;
-  /** Poll interval in ms (default: 1000) */
-  pollInterval?: number;
-  /** Callback on each poll attempt */
-  onPoll?: (attempt: number) => void;
+  /** Gateway API key, when the gateway requires one (e.g. testnet2). */
+  getApiKey(): string | undefined;
 }
 
 // =============================================================================
@@ -140,32 +58,6 @@ export interface ValidationResult {
   stateHash?: string;
 }
 
-export interface TokenState {
-  tokenId: string;
-  stateHash: string;
-  spent: boolean;
-  roundNumber?: number;
-  lastUpdated: number;
-}
-
-// =============================================================================
-// Mint Types
-// =============================================================================
-
-export interface MintParams {
-  coinId: string;
-  amount: string;
-  recipientAddress: string;
-  recipientPubkey?: string;
-}
-
-export interface MintResult {
-  success: boolean;
-  requestId?: string;
-  tokenId?: string;
-  error?: string;
-}
-
 // =============================================================================
 // Oracle Events
 // =============================================================================
@@ -174,8 +66,6 @@ export type OracleEventType =
   | 'oracle:connected'
   | 'oracle:disconnected'
   | 'oracle:error'
-  | 'commitment:submitted'
-  | 'proof:received'
   | 'validation:completed';
 
 export interface OracleEvent {
