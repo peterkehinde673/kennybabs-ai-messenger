@@ -30,8 +30,6 @@ export const RPC_METHODS = {
   GET_FIAT_BALANCE: 'sphere_getFiatBalance',
   GET_TOKENS: 'sphere_getTokens',
   GET_HISTORY: 'sphere_getHistory',
-  L1_GET_BALANCE: 'sphere_l1GetBalance',
-  L1_GET_HISTORY: 'sphere_l1GetHistory',
   RESOLVE: 'sphere_resolve',
   SUBSCRIBE: 'sphere_subscribe',
   UNSUBSCRIBE: 'sphere_unsubscribe',
@@ -52,7 +50,6 @@ export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
 
 export const INTENT_ACTIONS = {
   SEND: 'send',
-  L1_SEND: 'l1_send',
   DM: 'dm',
   PAYMENT_REQUEST: 'payment_request',
   RECEIVE: 'receive',
@@ -195,7 +192,6 @@ export interface DAppMetadata {
 
 export interface PublicIdentity {
   readonly chainPubkey: string;
-  readonly l1Address: string;
   readonly directAddress?: string;
   readonly nametag?: string;
 }

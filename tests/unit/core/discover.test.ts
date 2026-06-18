@@ -14,7 +14,6 @@ function makeDeriveFunc() {
   return (index: number) => ({
     transportPubkey: `pubkey_${index}`,
     chainPubkey: `02pubkey_${index}`,
-    l1Address: `alpha1_${index}`,
     directAddress: `DIRECT://addr_${index}`,
   });
 }
@@ -31,7 +30,6 @@ function makeBatchResolve(foundIndices: number[], nametags?: Record<number, stri
         return {
           transportPubkey: pk,
           chainPubkey: `02pubkey_${idx}`,
-          l1Address: `alpha1_${idx}`,
           directAddress: `DIRECT://addr_${idx}`,
           nametag: nametags?.[idx],
           timestamp: Date.now(),
@@ -150,7 +148,6 @@ describe('discoverAddressesImpl', () => {
       return [{
         transportPubkey: pubkeys[0],
         chainPubkey: '', // missing
-        l1Address: '', // missing
         directAddress: '', // missing
         timestamp: Date.now(),
       }];
@@ -163,9 +160,8 @@ describe('discoverAddressesImpl', () => {
     );
 
     expect(result.addresses).toHaveLength(1);
-    // Should fallback to derived values
+    // Should fallback to derived values when the binding event has empty fields.
     expect(result.addresses[0].chainPubkey).toBe('02pubkey_0');
-    expect(result.addresses[0].l1Address).toBe('alpha1_0');
     expect(result.addresses[0].directAddress).toBe('DIRECT://addr_0');
   });
 

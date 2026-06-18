@@ -28,7 +28,6 @@ import type {
   TombstoneEntry,
   NametagData,
 } from '../../types/txf';
-import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import type { ITokenEngine, SphereToken, TokenBlob } from '../../token-engine';
 import { TransferConflictError } from '../../token-engine';
@@ -249,9 +248,9 @@ function enrichWithRegistry(info: ParsedTokenInfo): ParsedTokenInfo {
  */
 export async function parseTokenInfo(tokenData: unknown, engine?: ITokenEngine): Promise<ParsedTokenInfo> {
   const defaultInfo: ParsedTokenInfo = {
-    coinId: 'ALPHA',
-    symbol: 'ALPHA',
-    name: 'Alpha Token',
+    coinId: 'UNKNOWN',
+    symbol: 'UNKNOWN',
+    name: 'Unknown Token',
     decimals: 0,
     amount: '0',
   };
@@ -647,8 +646,6 @@ export interface PaymentsModuleConfig {
   maxRetries?: number;
   /** Enable debug logging */
   debug?: boolean;
-  /** L1 (ALPHA blockchain) configuration. Set to null to explicitly disable L1. */
-  l1?: L1PaymentsModuleConfig | null;
 }
 
 // =============================================================================
@@ -847,10 +844,6 @@ export interface PaymentsModuleDependencies {
    */
   tokenEngine?: ITokenEngine;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
-  /** Chain code for BIP32 HD derivation (for L1 multi-address support) */
-  chainCode?: string;
-  /** Additional L1 addresses to watch */
-  l1Addresses?: string[];
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
   /** Set of disabled provider IDs — disabled providers are skipped during sync/save */
@@ -932,11 +925,8 @@ function assertLegalCustodyComposition(deps: PaymentsModuleDependencies): void {
 // =============================================================================
 
 export class PaymentsModule {
-  private readonly moduleConfig: Omit<Required<PaymentsModuleConfig>, 'l1'>;
+  private readonly moduleConfig: Required<PaymentsModuleConfig>;
   private deps: PaymentsModuleDependencies | null = null;
-
-  /** L1 (ALPHA blockchain) payments sub-module (null if disabled) */
-  readonly l1: L1PaymentsModule | null;
 
   // Token State
   private tokens: Map<string, Token> = new Map();
@@ -1056,11 +1046,6 @@ export class PaymentsModule {
       debug: config?.debug ?? false,
     };
 
-    // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
-    // Only skip if l1 is explicitly set to null. The module is lazy — it won't
-    // open a WebSocket until the first L1 operation is performed.
-    this.l1 = config?.l1 === null ? null : new L1PaymentsModule(config?.l1);
-
     // Initialize spend queue (requires ledger, planner, and access to this.tokens)
     this.spendQueue = new SpendQueue(
       this.reservationLedger,
@@ -1071,11 +1056,11 @@ export class PaymentsModule {
   }
 
   /**
-   * Get the current module configuration (excluding L1 config).
+   * Get the current module configuration.
    *
    * @returns Resolved configuration with all defaults applied.
    */
-  getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
+  getConfig(): Required<PaymentsModuleConfig> {
     return this.moduleConfig;
   }
 
@@ -1194,16 +1179,6 @@ export class PaymentsModule {
       chainPubkey: deps.identity.chainPubkey,
     });
 
-    // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
-    if (this.l1) {
-      this.l1.initialize({
-        identity: deps.identity,
-        chainCode: deps.chainCode,
-        addresses: deps.l1Addresses,
-        transport: deps.transport,
-      });
-    }
-
     // Incoming assets (sdk-changes S3/S4): with an injected delivery port the
     // mailbox pull (poll + wake) is the ONLY asset channel — the Nostr
     // token-transfer subscription is not installed. Without one, the relay
@@ -1299,12 +1274,16 @@ export class PaymentsModule {
         try {
           const result = await provider.load();
           if (result.success && result.data) {
-            // Address guard: reject data from a different address
+            // Address guard: reject data persisted under a different address.
+            // _meta.address holds chainPubkey for current writes; legacy records
+            // hold an alpha1 value (pre-L1-removal) and are tolerated — the token
+            // store is partitioned by chainPubkey, and the record is rewritten to
+            // chainPubkey on the next save.
             const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
-            if (loadedMeta?.address && currentL1 && loadedMeta.address !== currentL1 && loadedMeta.address !== currentChain) {
-              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            const isLegacyAlpha = loadedMeta?.address?.startsWith('alpha1') ?? false;
+            if (loadedMeta?.address && currentChain && !isLegacyAlpha && loadedMeta.address !== currentChain) {
+              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentChain.slice(0, 20)}...)`);
               continue;
             }
 
@@ -1473,7 +1452,7 @@ export class PaymentsModule {
    * Cleanup all subscriptions, polling jobs, and pending resolvers.
    *
    * Should be called when the wallet is being shut down or the module is
-   * no longer needed. Also destroys the L1 sub-module if present.
+   * no longer needed.
    */
   destroy(): void {
     this.unsubscribeTransfers?.();
@@ -1501,10 +1480,6 @@ export class PaymentsModule {
 
     // Clean up storage event subscriptions
     this.unsubscribeStorageEvents();
-
-    if (this.l1) {
-      this.l1.destroy();
-    }
   }
 
   // ===========================================================================
@@ -4144,10 +4119,10 @@ export class PaymentsModule {
             // Stale IPFS records may contain tokens from a previously active
             // address if a write-behind flush raced with an address switch.
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
-            if (mergedMeta?.address && currentL1 && mergedMeta.address !== currentL1 && mergedMeta.address !== currentChain) {
-              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            const isLegacyAlpha = mergedMeta?.address?.startsWith('alpha1') ?? false;
+            if (mergedMeta?.address && currentChain && !isLegacyAlpha && mergedMeta.address !== currentChain) {
+              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentChain.slice(0, 20)}...)`);
               continue;
             }
 
@@ -5539,7 +5514,7 @@ export class PaymentsModule {
       Array.from(this.tokens.values()),
       {
         version: 1,
-        address: this.deps!.identity.l1Address,
+        address: this.deps!.identity.chainPubkey,
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {

@@ -34,7 +34,7 @@
  * }
  *
  * // Use the wallet
- * await sphere.payments.send({ coinId: 'ALPHA', amount: '1000', recipient: '@alice' });
+ * await sphere.payments.send({ coinId: 'UCT', amount: '1000', recipient: '@alice' });
  * ```
  */
 
@@ -93,19 +93,14 @@ import {
   getPublicKey,
   sha256,
   hexToBytes,
-  publicKeyToAddress,
+  generateAddressFromMasterKey,
   signMessage as signMessageCrypto,
   type MasterKey,
   type AddressInfo,
 } from './crypto';
 import { encryptSimple, decryptSimple, decryptWithSalt } from './encryption';
-import { scanAddressesImpl } from './scan';
-import type { ScanAddressesOptions, ScanAddressesResult } from './scan';
 import { discoverAddressesImpl } from './discover';
 import type { DiscoverAddressesOptions, DiscoverAddressesResult } from './discover';
-import { vestingClassifier } from '../l1/vesting';
-import { generateAddressFromMasterKey } from '../l1/address';
-import { isWebSocketConnected } from '../l1/network';
 import {
   parseWalletText,
   parseAndDecryptWalletText,
@@ -208,8 +203,6 @@ export interface SphereCreateOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
-  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
-  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -232,7 +225,7 @@ export interface SphereCreateOptions {
   password?: string;
   /**
    * Auto-discover previously used HD addresses after creation.
-   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
    * - false/undefined: no auto-discovery (default)
    */
@@ -265,8 +258,6 @@ export interface SphereLoadOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
-  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
-  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -289,7 +280,7 @@ export interface SphereLoadOptions {
   password?: string;
   /**
    * Auto-discover previously used HD addresses on load.
-   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
    * - false/undefined: no auto-discovery (default)
    */
@@ -340,8 +331,6 @@ export interface SphereImportOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
-  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
-  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
@@ -358,7 +347,7 @@ export interface SphereImportOptions {
   password?: string;
   /**
    * Auto-discover previously used HD addresses after import.
-   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
    * - false/undefined: no auto-discovery (default)
    */
@@ -367,16 +356,6 @@ export interface SphereImportOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
-}
-
-/** L1 (ALPHA blockchain) configuration */
-export interface L1Config {
-  /** Fulcrum WebSocket URL (default: wss://fulcrum.alpha.unicity.network:50004) */
-  electrumUrl?: string;
-  /** Default fee rate in sat/byte (default: 10) */
-  defaultFeeRate?: number;
-  /** Enable vesting classification (default: true) */
-  enableVesting?: boolean;
 }
 
 /** Options for unified init (auto-create or load) */
@@ -409,8 +388,6 @@ export interface SphereInitOptions {
   derivationPath?: string;
   /** Optional nametag to register (only on create). Token is auto-minted. */
   nametag?: string;
-  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
-  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -437,7 +414,7 @@ export interface SphereInitOptions {
   /**
    * Auto-discover previously used HD addresses when creating from mnemonic.
    * Only applies when wallet is newly created (not on load of existing wallet).
-   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
    * - false/undefined: no auto-discovery (default)
    */
@@ -541,6 +518,9 @@ export class Sphere {
   // Singleton
   private static instance: Sphere | null = null;
 
+  // One-time best-effort cleanup of the orphaned vesting cache (prior versions).
+  private static _orphanCacheCleaned = false;
+
   // State
   private _initialized = false;
   private _trackedAddressesLoaded = false;
@@ -607,7 +587,6 @@ export class Sphere {
   private _dmSince: number | null = null;
 
   // Stored configs for creating per-address modules
-  private _l1Config: L1Config | null | undefined;
   private _groupChatConfig: GroupChatModuleConfig | undefined;
   private _marketConfig: MarketModuleConfig | undefined;
   private _communicationsConfig: CommunicationsModuleConfig | undefined;
@@ -629,7 +608,6 @@ export class Sphere {
     transport: TransportProvider,
     oracle: OracleProvider,
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
-    l1Config?: L1Config | null,
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
     marketConfig?: MarketModuleConfig,
@@ -657,12 +635,11 @@ export class Sphere {
     }
 
     // Store configs for creating per-address modules
-    this._l1Config = l1Config;
     this._groupChatConfig = groupChatConfig;
     this._marketConfig = marketConfig;
     this._communicationsConfig = communicationsConfig;
 
-    this._payments = createPaymentsModule({ l1: l1Config });
+    this._payments = createPaymentsModule({});
     this._communications = createCommunicationsModule(communicationsConfig);
     this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
     this._market = marketConfig ? createMarketModule(marketConfig) : null;
@@ -761,7 +738,6 @@ export class Sphere {
         // composition to the legacy local-custody one — forward them always.
         delivery: options.delivery,
         walletApi: options.walletApi,
-        l1: options.l1,
         price: options.price,
         groupChat,
         market,
@@ -809,7 +785,6 @@ export class Sphere {
       walletApi: options.walletApi,
       derivationPath: options.derivationPath,
       nametag: options.nametag,
-      l1: options.l1,
       price: options.price,
       groupChat,
       market,
@@ -956,7 +931,6 @@ export class Sphere {
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1,
       options.price,
       groupChatConfig,
       marketConfig,
@@ -1059,7 +1033,6 @@ export class Sphere {
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1,
       options.price,
       groupChatConfig,
       marketConfig,
@@ -1165,7 +1138,6 @@ export class Sphere {
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1,
       options.price,
       groupChatConfig,
       marketConfig,
@@ -1314,17 +1286,13 @@ export class Sphere {
       logger.debug('Sphere', 'Sphere instance destroyed');
     }
 
-    // 2. Clear L1 vesting cache
-    logger.debug('Sphere', 'Clearing L1 vesting cache...');
-    await vestingClassifier.destroy();
-
-    // 3. Yield to let IndexedDB finalize pending transactions after close().
+    // 2. Yield to let IndexedDB finalize pending transactions after close().
     //    db.close() is synchronous but the connection isn't fully released
     //    until all in-flight transactions complete.
     logger.debug('Sphere', 'Yielding 50ms for IDB transaction settlement...');
     await new Promise((r) => setTimeout(r, 50));
 
-    // 4. Delete token databases (sphere-token-storage-*)
+    // 3. Delete token databases (sphere-token-storage-*)
     if (tokenStorage?.clear) {
       logger.debug('Sphere', 'Clearing token storage...');
       try {
@@ -1337,7 +1305,7 @@ export class Sphere {
       logger.debug('Sphere', 'No token storage provider to clear');
     }
 
-    // 5. Delete KV database (sphere-storage)
+    // 4. Delete KV database (sphere-storage)
     logger.debug('Sphere', 'Clearing KV storage...');
     if (!storage.isConnected()) {
       try {
@@ -1352,7 +1320,29 @@ export class Sphere {
     } else {
       logger.debug('Sphere', 'KV storage not connected, skipping');
     }
+
+    // 5. Best-effort: drop the orphaned vesting cache from prior versions.
+    Sphere.cleanupOrphanedVestingCache(false);
+
     logger.debug('Sphere', 'Done');
+  }
+
+  /**
+   * Best-effort delete of the orphaned `SphereVestingCacheV5` IndexedDB left by
+   * prior versions. Browser-only; never throws.
+   * @param once When true, runs at most once per process (load/init path); when
+   *             false, always runs (explicit clear()).
+   */
+  private static cleanupOrphanedVestingCache(once: boolean): void {
+    if (once) {
+      if (Sphere._orphanCacheCleaned) return;
+      Sphere._orphanCacheCleaned = true;
+    }
+    try {
+      if (typeof indexedDB !== 'undefined') {
+        indexedDB.deleteDatabase('SphereVestingCacheV5');
+      }
+    } catch { /* ignore — cleanup is best-effort */ }
   }
 
   /**
@@ -1388,7 +1378,7 @@ export class Sphere {
   // Public Properties - Modules
   // ===========================================================================
 
-  /** Payments module (L3 + L1) */
+  /** Payments module (L3) */
   get payments(): PaymentsModule {
     this.ensureReady();
     return this._payments;
@@ -1429,7 +1419,6 @@ export class Sphere {
     if (!this._identity) return null;
     return {
       chainPubkey: this._identity.chainPubkey,
-      l1Address: this._identity.l1Address,
       directAddress: this._identity.directAddress,
       ipnsName: this._identity.ipnsName,
       nametag: this._identity.nametag,
@@ -1625,10 +1614,10 @@ export class Sphere {
   getWalletInfo(): WalletInfo {
     let address0: string | null = null;
     try {
-      if (this._masterKey) {
-        address0 = this.deriveAddress(0).address;
-      } else if (this._identity) {
-        address0 = this._identity.l1Address;
+      if (this._identity) {
+        address0 = this._identity.chainPubkey;
+      } else if (this._masterKey) {
+        address0 = this.deriveAddress(0).publicKey;
       }
     } catch {
       // Ignore errors
@@ -1679,7 +1668,7 @@ export class Sphere {
       try {
         const addr = this.deriveAddress(i, false);
         addresses.push({
-          address: addr.address,
+          address: addr.publicKey,
           publicKey: addr.publicKey,
           path: addr.path,
           index: addr.index,
@@ -1688,7 +1677,7 @@ export class Sphere {
         // Stop if we can't derive more addresses (e.g., no masterKey)
         if (i === 0 && this._identity) {
           addresses.push({
-            address: this._identity.l1Address,
+            address: this._identity.chainPubkey,
             publicKey: this._identity.chainPubkey,
             path: this.getDefaultAddressPath(),
             index: 0,
@@ -1779,7 +1768,7 @@ export class Sphere {
       try {
         const addr = this.deriveAddress(i, false);
         addresses.push({
-          address: addr.address,
+          address: addr.publicKey,
           path: addr.path,
           index: addr.index,
           isChange: false,
@@ -1788,7 +1777,7 @@ export class Sphere {
         // Stop if we can't derive more addresses
         if (i === 0 && this._identity) {
           addresses.push({
-            address: this._identity.l1Address,
+            address: this._identity.chainPubkey,
             path: this.getDefaultAddressPath(),
             index: 0,
             isChange: false,
@@ -2358,7 +2347,7 @@ export class Sphere {
    * ```ts
    * // Switch to second address
    * await sphere.switchToAddress(1);
-   * console.log(sphere.identity?.address); // alpha1... (address at index 1)
+   * console.log(sphere.identity?.directAddress); // DIRECT://... (address at index 1)
    *
    * // Register nametag for this address
    * await sphere.registerNametag('bob');
@@ -2436,7 +2425,6 @@ export class Sphere {
     const newIdentity: MutableFullIdentity = {
       privateKey: addressInfo.privateKey,
       chainPubkey: addressInfo.publicKey,
-      l1Address: addressInfo.address,
       directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
       nametag,
@@ -2499,7 +2487,6 @@ export class Sphere {
           transport: addressTransport,
           oracle: this._oracle,
           emitEvent: this.emitEvent.bind(this),
-          chainCode: this._masterKey?.chainCode || undefined,
           price: this._priceProvider ?? undefined,
           tokenEngine: moduleSet.tokenEngine,
           delivery: moduleSet.delivery ?? undefined,
@@ -2567,14 +2554,13 @@ export class Sphere {
     }
 
     this.emitEvent('identity:changed', {
-      l1Address: this._identity.l1Address,
       directAddress: this._identity.directAddress,
       chainPubkey: this._identity.chainPubkey,
       nametag: this._identity.nametag,
       addressIndex: index,
     });
 
-    logger.debug('Sphere', `Switched to address ${index}:`, this._identity.l1Address);
+    logger.debug('Sphere', `Switched to address ${index}:`, this._identity.chainPubkey);
 
     // Run transport sync and nametag operations in background
     this.postSwitchSync(index, newNametag).catch(err => {
@@ -2584,7 +2570,7 @@ export class Sphere {
 
   /**
    * Background transport sync and nametag operations after address switch.
-   * Runs after switchToAddress returns so L1/L3 queries can start immediately.
+   * Runs after switchToAddress returns so L3 queries can start immediately.
    */
   private async postSwitchSync(index: number, newNametag?: string): Promise<void> {
     // Sync identity with transport — recovers nametag from existing Nostr bindings
@@ -2730,7 +2716,7 @@ export class Sphere {
     }
 
     // Create fresh module instances for this address
-    const payments = createPaymentsModule({ l1: this._l1Config });
+    const payments = createPaymentsModule({});
     const communications = createCommunicationsModule(this._communicationsConfig);
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
@@ -2751,7 +2737,6 @@ export class Sphere {
       transport: addressTransport,
       oracle: this._oracle,
       emitEvent,
-      chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
       tokenEngine,
       delivery: delivery ?? undefined,
@@ -2946,13 +2931,13 @@ export class Sphere {
    *
    * @param index - Address index (0, 1, 2, ...)
    * @param isChange - Whether this is a change address (default: false)
-   * @returns Address info with privateKey, publicKey, address, path, index
+   * @returns Address info with privateKey, publicKey, path, index
    *
    * @example
    * ```ts
    * // Derive first receiving address
    * const addr0 = sphere.deriveAddress(0);
-   * console.log(addr0.address); // alpha1...
+   * console.log(addr0.publicKey); // 02... (compressed chain pubkey)
    *
    * // Derive second receiving address
    * const addr1 = sphere.deriveAddress(1);
@@ -2997,18 +2982,12 @@ export class Sphere {
       return generateAddressFromMasterKey(this._masterKey.privateKey, index);
     }
 
-    const info = deriveAddressInfo(
+    return deriveAddressInfo(
       this._masterKey,
       this._basePath,
       index,
       isChange
     );
-
-    // Convert to proper bech32 address format
-    return {
-      ...info,
-      address: publicKeyToAddress(info.publicKey, 'alpha'),
-    };
   }
 
   /**
@@ -3044,7 +3023,6 @@ export class Sphere {
     return {
       privateKey: derived.privateKey,
       publicKey,
-      address: publicKeyToAddress(publicKey, 'alpha'),
       path,
       index,
     };
@@ -3083,49 +3061,6 @@ export class Sphere {
   }
 
   /**
-   * Scan blockchain addresses to discover used addresses with balances.
-   * Derives addresses sequentially and checks L1 balance via Fulcrum.
-   * Uses gap limit to stop after N consecutive empty addresses.
-   *
-   * @param options - Scanning options
-   * @returns Scan results with found addresses and total balance
-   *
-   * @example
-   * ```ts
-   * const result = await sphere.scanAddresses({
-   *   maxAddresses: 100,
-   *   gapLimit: 20,
-   *   onProgress: (p) => console.log(`Scanned ${p.scanned}/${p.total}, found ${p.foundCount}`),
-   * });
-   * console.log(`Found ${result.addresses.length} addresses, total: ${result.totalBalance} ALPHA`);
-   * ```
-   */
-  async scanAddresses(options: ScanAddressesOptions = {}): Promise<ScanAddressesResult> {
-    this.ensureReady();
-
-    if (!this._masterKey) {
-      throw new SphereError('Address scanning requires HD master key', 'INVALID_CONFIG');
-    }
-
-    // Auto-provide nametag resolver from transport if caller didn't supply one
-    const resolveNametag = options.resolveNametag ?? (
-      this._transport.resolveAddressInfo
-        ? async (l1Address: string): Promise<string | null> => {
-            try {
-              const info = await this._transport.resolveAddressInfo!(l1Address);
-              return info?.nametag ?? null;
-            } catch (err) { logger.debug('Sphere', 'Unicity ID resolution failed during scan', err); return null; }
-          }
-        : undefined
-    );
-
-    return scanAddressesImpl(
-      (index, isChange) => this._deriveAddressInternal(index, isChange),
-      { ...options, resolveNametag },
-    );
-  }
-
-  /**
    * Bulk-track scanned addresses with visibility and nametag data.
    * Selected addresses get `hidden: false`, unselected get `hidden: true`.
    * Performs only 2 storage writes total (tracked addresses + nametags).
@@ -3159,8 +3094,7 @@ export class Sphere {
   /**
    * Discover previously used HD addresses.
    *
-   * Primary: queries Nostr relay for identity binding events (fast, single batch query).
-   * Secondary: runs L1 balance scan to find legacy addresses with no binding event.
+   * Queries Nostr relay for identity binding events (fast, single batch query).
    *
    * @example
    * ```ts
@@ -3184,10 +3118,6 @@ export class Sphere {
       throw new SphereError('Transport provider does not support address discovery', 'INVALID_CONFIG');
     }
 
-    // Only run L1 balance scan when L1 is configured — avoids opening a
-    // Fulcrum WebSocket for apps that don't use L1 at all.
-    const includeL1Scan = (options.includeL1Scan ?? true) && !!this._l1Config;
-
     // Phase 1: Transport (Nostr) binding event scan
     const transportResult = await discoverAddressesImpl(
       (index: number) => {
@@ -3195,7 +3125,6 @@ export class Sphere {
         return {
           transportPubkey: addrInfo.publicKey.slice(2), // x-only 32 bytes
           chainPubkey: addrInfo.publicKey,
-          l1Address: addrInfo.address,
           directAddress: '', // not needed for discovery query
         };
       },
@@ -3203,57 +3132,7 @@ export class Sphere {
       options,
     );
 
-    // Phase 2: L1 balance scan (finds legacy addresses with no binding event)
-    if (includeL1Scan) {
-      try {
-        const l1Result = await this.scanAddresses({
-          maxAddresses: options.maxAddresses,
-          gapLimit: options.gapLimit,
-          signal: options.signal,
-          onProgress: options.onProgress
-            ? (p) => options.onProgress!({
-                currentBatch: 0,
-                totalBatches: 0,
-                discoveredCount: p.foundCount,
-                currentGap: p.currentGap,
-                phase: 'l1',
-              })
-            : undefined,
-        });
-
-        // Merge L1 results into transport results
-        for (const l1Addr of l1Result.addresses) {
-          if (l1Addr.isChange) continue;
-
-          const existing = transportResult.addresses.find(a => a.index === l1Addr.index);
-          if (existing) {
-            existing.l1Balance = l1Addr.balance;
-            existing.source = 'both';
-            if (!existing.nametag && l1Addr.nametag) {
-              existing.nametag = l1Addr.nametag;
-            }
-          } else {
-            // Address found via L1 only (legacy, no binding event)
-            const addrInfo = this._deriveAddressInternal(l1Addr.index, false);
-            transportResult.addresses.push({
-              index: l1Addr.index,
-              l1Address: l1Addr.address,
-              directAddress: '',
-              chainPubkey: addrInfo.publicKey,
-              nametag: l1Addr.nametag,
-              l1Balance: l1Addr.balance,
-              source: 'l1',
-            });
-          }
-        }
-
-        transportResult.addresses.sort((a, b) => a.index - b.index);
-      } catch (err) {
-        logger.warn('Sphere', 'L1 scan failed during discovery (non-fatal):', err);
-      }
-    }
-
-    // Phase 3: Auto-track if requested
+    // Phase 2: Auto-track if requested
     if (options.autoTrack && transportResult.addresses.length > 0) {
       await this.trackScannedAddresses(
         transportResult.addresses.map(a => ({
@@ -3309,21 +3188,6 @@ export class Sphere {
       transportMeta = { relays: { total, connected } };
     }
 
-    // L1 status
-    const l1Module = this._payments.l1;
-    const l1Providers: ProviderStatusInfo[] = [];
-    if (l1Module) {
-      const wsConnected = isWebSocketConnected();
-      l1Providers.push({
-        id: 'l1-alpha',
-        name: 'ALPHA L1',
-        role: 'l1',
-        status: wsConnected ? 'connected' : 'disconnected',
-        connected: wsConnected,
-        enabled: !this._disabledProviders.has('l1-alpha'),
-      });
-    }
-
     // Price
     const priceProviders: ProviderStatusInfo[] = [];
     if (this._priceProvider) {
@@ -3344,7 +3208,6 @@ export class Sphere {
       ),
       transport: [mkInfo(this._transport, 'transport', transportMeta)],
       oracle: [mkInfo(this._oracle, 'oracle')],
-      l1: l1Providers,
       price: priceProviders,
     };
   }
@@ -3379,7 +3242,7 @@ export class Sphere {
 
     try {
       if ('disable' in provider && typeof provider.disable === 'function') {
-        // L1PaymentsModule — dedicated disable that disconnects + blocks operations
+        // Provider with a dedicated disable() that disconnects + blocks operations
         provider.disable();
       } else if ('shutdown' in provider && typeof provider.shutdown === 'function') {
         await provider.shutdown();
@@ -3414,7 +3277,7 @@ export class Sphere {
 
     this._disabledProviders.delete(providerId);
 
-    // L1 — dedicated enable(), reconnects lazily on next operation
+    // Provider with a dedicated enable() that reconnects lazily on next operation
     if ('enable' in provider && typeof provider.enable === 'function') {
       provider.enable();
       this.emitEvent('connection:changed', {
@@ -3494,9 +3357,6 @@ export class Sphere {
     if (this._priceProvider && this._priceProviderId === providerId) {
       return this._priceProvider;
     }
-    if (providerId === 'l1-alpha' && this._payments.l1) {
-      return this._payments.l1;
-    }
     return null;
   }
 
@@ -3549,13 +3409,13 @@ export class Sphere {
 
   /**
    * Resolve any identifier to full peer information.
-   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, L1 address, or transport pubkey.
+   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, chain pubkey, or transport pubkey.
    *
    * @example
    * ```ts
    * const peer = await sphere.resolve('@alice');
    * const peer = await sphere.resolve('DIRECT://...');
-   * const peer = await sphere.resolve('alpha1...');
+   * const peer = await sphere.resolve('02ab12...'); // 33-byte compressed chain pubkey
    * const peer = await sphere.resolve('ab12cd...'); // 64-char hex transport pubkey
    * ```
    */
@@ -3624,7 +3484,6 @@ export class Sphere {
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
-        this._identity!.l1Address,
         this._identity!.directAddress || '',
         cleanNametag,
       );
@@ -3773,7 +3632,6 @@ export class Sphere {
           const entry: TrackedAddress = {
             ...stored,
             addressId,
-            l1Address: addrInfo.address,
             directAddress,
             chainPubkey: addrInfo.publicKey,
           };
@@ -3836,7 +3694,6 @@ export class Sphere {
           const entry: TrackedAddress = {
             index: i,
             addressId,
-            l1Address: addrInfo.address,
             directAddress,
             chainPubkey: addrInfo.publicKey,
             nametag: nametagMap.get(0),
@@ -3875,7 +3732,6 @@ export class Sphere {
     const entry: TrackedAddress = {
       index,
       addressId,
-      l1Address: addrInfo.address,
       directAddress,
       chainPubkey: addrInfo.publicKey,
       nametag,
@@ -3931,7 +3787,7 @@ export class Sphere {
 
   /**
    * Publish identity binding via transport.
-   * Always publishes base identity (chainPubkey, l1Address, directAddress).
+   * Always publishes base identity (chainPubkey, directAddress).
    * If nametag is set, also publishes nametag hash, proxy address, encrypted nametag.
    */
   private async syncIdentityWithTransport(): Promise<void> {
@@ -3984,7 +3840,6 @@ export class Sphere {
               if (fromLegacy) {
                 await this._transport.publishIdentityBinding!(
                   this._identity!.chainPubkey,
-                  this._identity!.l1Address,
                   this._identity!.directAddress || '',
                   recoveredNametag,
                 );
@@ -3996,7 +3851,6 @@ export class Sphere {
             // Check if existing binding is missing critical fields — re-publish if so
             const needsUpdate =
               !existing.directAddress ||
-              !existing.l1Address ||
               !existing.chainPubkey ||
               (this._identity?.nametag && !existing.nametag);
 
@@ -4004,7 +3858,6 @@ export class Sphere {
               logger.debug('Sphere', 'Existing binding incomplete, re-publishing with full data');
               await this._transport.publishIdentityBinding!(
                 this._identity!.chainPubkey,
-                this._identity!.l1Address,
                 this._identity!.directAddress || '',
                 this._identity?.nametag || existing.nametag || undefined,
               );
@@ -4027,7 +3880,6 @@ export class Sphere {
       const nametag = this._identity?.nametag;
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
-        this._identity!.l1Address,
         this._identity!.directAddress || '',
         nametag || undefined,
       );
@@ -4055,23 +3907,10 @@ export class Sphere {
 
     let recoveredNametag: string | null = null;
 
-    // Strategy 1: Decrypt nametag from own Nostr binding events (private-key based)
+    // Decrypt nametag from own Nostr binding events (private-key based)
     if (this._transport.recoverNametag) {
       try {
         recoveredNametag = await this._transport.recoverNametag();
-      } catch {
-        // Non-fatal — try fallback
-      }
-    }
-
-    // Strategy 2: Forward lookup by L1 address hash (public, same as scanAddresses).
-    // Covers edge cases where the encrypted binding event was lost from relay.
-    if (!recoveredNametag && this._transport.resolveAddressInfo && this._identity?.l1Address) {
-      try {
-        const info = await this._transport.resolveAddressInfo(this._identity.l1Address);
-        if (info?.nametag) {
-          recoveredNametag = info.nametag;
-        }
       } catch {
         // Non-fatal
       }
@@ -4347,13 +4186,12 @@ export class Sphere {
       this._identity = {
         privateKey: addressInfo.privateKey,
         chainPubkey: addressInfo.publicKey,
-        l1Address: addressInfo.address,
         directAddress: predicateAddress,
         ipnsName: '12D3KooW' + ipnsHash,
         nametag,
       };
       this._storage.setIdentity(this._identity);
-      logger.debug('Sphere', `Restored to address ${this._currentAddressIndex}:`, this._identity.l1Address);
+      logger.debug('Sphere', `Restored to address ${this._currentAddressIndex}:`, this._identity.chainPubkey);
     } else if (this._identity && nametag) {
       // Restore nametag from cache
       this._identity.nametag = nametag;
@@ -4381,9 +4219,6 @@ export class Sphere {
     // Get public key from derived private key
     const publicKey = getPublicKey(derivedKey.privateKey);
 
-    // Generate proper bech32 address
-    const address = publicKeyToAddress(publicKey, 'alpha');
-
     // Generate IPNS name from public key hash
     const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
 
@@ -4393,7 +4228,6 @@ export class Sphere {
     this._identity = {
       privateKey: derivedKey.privateKey,
       chainPubkey: publicKey,
-      l1Address: address,
       directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
@@ -4438,7 +4272,6 @@ export class Sphere {
     }
 
     const publicKey = getPublicKey(privateKey);
-    const address = publicKeyToAddress(publicKey, 'alpha');
     const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
 
     // Derive L3 predicate address (DIRECT://...)
@@ -4447,7 +4280,6 @@ export class Sphere {
     this._identity = {
       privateKey,
       chainPubkey: publicKey,
-      l1Address: address,
       directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
@@ -4458,6 +4290,9 @@ export class Sphere {
   // ===========================================================================
 
   private async initializeProviders(): Promise<void> {
+    // Best-effort one-time: drop the orphaned vesting cache from prior versions.
+    Sphere.cleanupOrphanedVestingCache(true);
+
     // Set identity on providers
     this._storage.setIdentity(this._identity!);
 
@@ -4641,8 +4476,6 @@ export class Sphere {
       transport: moduleTransport,
       oracle: this._oracle,
       emitEvent,
-      // Pass chain code for L1 HD derivation
-      chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
       disabledProviderIds: this._disabledProviders,
       tokenEngine,
