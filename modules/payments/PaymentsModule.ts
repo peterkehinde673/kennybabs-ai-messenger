@@ -1789,8 +1789,12 @@ export class PaymentsModule {
               { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex },
             );
           } catch (err) {
-            // #625: tag the conflicting source so the outer send() retry can demote it and re-plan.
-            if (err instanceof TransferConflictError) err.conflictedSourceId = tw.uiToken.id;
+            // #625: tag for self-healing ONLY when nothing has certified yet in this attempt — re-planning
+            // the full amount is then safe. If an earlier op already certified, the certified value has
+            // left the wallet, so a full-amount re-plan would over-request; leave it untagged (no retry).
+            if (err instanceof TransferConflictError && committedOnChainTokenIds.size === 0) {
+              err.conflictedSourceId = tw.uiToken.id;
+            }
             throw err;
           }
           // The source state is spent on-chain from here on.
@@ -1844,8 +1848,11 @@ export class PaymentsModule {
               },
             ));
           } catch (err) {
-            // #625: tag the conflicting split source so the outer send() retry can demote it and re-plan.
-            if (err instanceof TransferConflictError) err.conflictedSourceId = splitPlan.tokenToSplit.uiToken.id;
+            // #625: tag for self-healing only when nothing certified yet this attempt (see the direct-op
+            // note) — a split after already-certified direct ops must not trigger a full-amount re-plan.
+            if (err instanceof TransferConflictError && committedOnChainTokenIds.size === 0) {
+              err.conflictedSourceId = splitPlan.tokenToSplit.uiToken.id;
+            }
             throw err;
           }
           // The split source is burnt on-chain from here on. Journal the

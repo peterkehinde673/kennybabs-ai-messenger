@@ -961,6 +961,31 @@ describe('stale-inventory conflict self-heals (#625) + is SURFACED (#517 item 2)
     expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
   });
 
+  it('does NOT self-heal a conflict AFTER an earlier op certified — avoids a full-amount over-request re-plan (#625 safety)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-partial-1');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // amount 2000 needs BOTH sources (two direct ops). The first certifies; the second conflicts —
+    // so value has already left the wallet and a full-amount re-plan would over-request.
+    const orig = sender.engine.transfer.bind(sender.engine);
+    let calls = 0;
+    vi.spyOn(sender.engine, 'transfer').mockImplementation((...args: Parameters<typeof orig>) => {
+      calls += 1;
+      return calls === 2
+        ? Promise.reject(new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'))
+        : orig(...args);
+    });
+
+    // The conflict is NOT self-healed (an earlier op already certified) — it propagates, and nothing
+    // is demoted (no retry).
+    await expect(sender.module.send({ recipient: '@bob', amount: '2000', coinId: UCT }))
+      .rejects.toBeInstanceOf(TransferConflictError);
+    expect(sender.module.getTokens().filter((t) => t.suspectedSpent)).toHaveLength(0);
+  });
+
   it('a plain (non-conflict) send failure does NOT emit inventory:conflict', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-conf-2');
