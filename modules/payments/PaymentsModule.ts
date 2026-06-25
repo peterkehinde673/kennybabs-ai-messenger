@@ -4806,7 +4806,14 @@ export class PaymentsModule {
         );
       }
     }
-    await flush();
+    // A final-flush failure (transient claim/reject) is safe-by-replay — the entries are not in the
+    // seen-set, so the next pump re-lists and re-processes them. Degrade gracefully rather than
+    // propagating a pump crash (a 30s poll-restart).
+    try {
+      await flush();
+    } catch (err) {
+      logger.warn('Payments', 'Incoming ack flush failed — entries kept for the next pump (replay-safe):', err);
+    }
     return stored;
   }
 
