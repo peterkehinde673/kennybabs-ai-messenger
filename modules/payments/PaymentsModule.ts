@@ -5263,34 +5263,55 @@ export class PaymentsModule {
 
     let changeOutput: SphereToken | null = null;
     if (payload.split) {
-      const blob = await provider.getToken(payload.split.tokenId);
-      const source = await engine.decodeToken(blob);
-      const selfChainPubkey = hexToBytes(this.deps!.identity.chainPubkey);
-      const { outputs } = await engine.split(
-        {
-          token: source,
-          outputs: [
+      // Split opIndex follows the direct ops — replayed from the intent's order (§8.1).
+      const splitOpIndex = payload.direct.length;
+      const existingSplit = journaled.get(splitOpIndex);
+      if (existingSplit) {
+        // #621/#622-review: the split already certified in the original send — re-deliver the journaled
+        // recipient blob, never re-run engine.split on the spent source (it would TransferConflictError
+        // and wedge). The change output is handled by the conflict path below / a resync.
+        await deliverBlob(existingSplit.tokenBlob, splitOpIndex);
+      } else {
+        try {
+          const blob = await provider.getToken(payload.split.tokenId);
+          const source = await engine.decodeToken(blob);
+          const selfChainPubkey = hexToBytes(this.deps!.identity.chainPubkey);
+          const { outputs } = await engine.split(
             {
-              recipientPubkey: recipientChainPubkey,
-              coinId: payload.coinId,
-              amount: BigInt(payload.split.splitAmount),
-              data: memoData,
+              token: source,
+              outputs: [
+                {
+                  recipientPubkey: recipientChainPubkey,
+                  coinId: payload.coinId,
+                  amount: BigInt(payload.split.splitAmount),
+                  data: memoData,
+                },
+                {
+                  recipientPubkey: selfChainPubkey,
+                  coinId: payload.coinId,
+                  amount: BigInt(payload.split.remainderAmount),
+                },
+              ],
             },
-            {
-              recipientPubkey: selfChainPubkey,
-              coinId: payload.coinId,
-              amount: BigInt(payload.split.remainderAmount),
-            },
-          ],
-        },
-        // Split opIndex follows the direct ops — replayed from the intent's order (§8.1).
-        { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: payload.direct.length }
-      );
-      changeOutput = outputs[1];
-      // critical (#515 F2): own-storage custody — persist-or-stay-open; a
-      // throw keeps the intent open and the next sign-in re-runs it.
-      if (!serverApply) await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
-      await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0]))), payload.direct.length);
+            { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: splitOpIndex }
+          );
+          changeOutput = outputs[1];
+          // critical (#515 F2): own-storage custody — persist-or-stay-open; a
+          // throw keeps the intent open and the next sign-in re-runs it.
+          if (!serverApply) await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
+          await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0]))), splitOpIndex);
+        } catch (err) {
+          // #622-review: mirror the direct-op path for split. The split source is already spent on-chain
+          // (a crash certified it before this resume) — record the spend instead of wedging on the
+          // re-certification conflict. KNOWN LIMITATION: the change output is NOT journaled and cannot be
+          // re-derived here (re-running engine.split conflicts), so a split that crashed between
+          // certification and applyDelta recovers its change token via a full inventory resync. Surfaced
+          // (inventory:conflict prompts that refresh) — never silently lost.
+          if (!(err instanceof TransferConflictError)) throw err;
+          logger.warn('Payments', `Resume split op already certified — recording the spend; change token (if any) recovers on the next inventory resync (§3.1):`, err);
+          this.deps!.emitEvent('inventory:conflict', { transferId, coinId: payload.coinId, error: err.message });
+        }
+      }
       spent.push(payload.split.tokenId);
     }
 
@@ -5488,12 +5509,18 @@ export class PaymentsModule {
   private async tryDeliver(deliver: () => Promise<unknown>, tokenBlob: string): Promise<boolean> {
     try {
       await deliver();
-      await this.removePendingV2Delivery(tokenBlob);
-      return true;
     } catch (err) {
       logger.warn('Payments', 'Delivery deferred (kept journaled); sender not failed (§3.1):', err);
       return false;
     }
+    // Delivered. Clearing the journal is best-effort — a failure here is harmless (the idempotent
+    // replay re-removes it) and must NOT flip the result to delivery-pending (#622 review).
+    try {
+      await this.removePendingV2Delivery(tokenBlob);
+    } catch (err) {
+      logger.warn('Payments', 'Delivered, but journal cleanup failed (replay will re-remove):', err);
+    }
+    return true;
   }
 
   /**

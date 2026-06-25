@@ -780,6 +780,42 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
     expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
   });
+
+  it('resume of an already-certified SPLIT source records the spend instead of wedging (#622 review)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-rs-split-621');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const transferId = crypto.randomUUID();
+    const payload = {
+      v: 1,
+      recipient: RECIPIENT.chainPubkey,
+      coinId: UCT,
+      amount: '300',
+      direct: [],
+      split: { tokenId: sourceTokenId, splitAmount: '300', remainderAmount: '700' },
+    };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+    );
+
+    // The original send already certified the split — re-running engine.split conflicts. Without the
+    // #622-review fix this bubbles up, aborts, and wedges; the fix records the spend and completes.
+    vi.spyOn(sender.engine, 'split').mockRejectedValue(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: split source already spent'),
+    );
+
+    const outcome = await sender.module.resumeOpenIntents();
+    expect(outcome.resumed).toEqual([transferId]);
+    expect(outcome.conflicted).toEqual([]);
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+    // The change-token limitation is surfaced (prompts a resync) — never silently lost.
+    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'inventory:conflict')).toBe(true);
+  });
 });
 
 describe('replay classifies recipient-quota (429) as deferred, never poison (§3.1 #621)', () => {
