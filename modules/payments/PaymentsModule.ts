@@ -4796,12 +4796,12 @@ export class PaymentsModule {
         }
         if (claimed.length + rejected.length >= INCOMING_ACK_BATCH_SIZE) await flush();
       } catch (err) {
-        // Transient (network, blob fetch) or no-engine: leave THIS entry unacked — the next poll
-        // retries; discovery of LATER entries continues. Already-verified entries stay buffered and
-        // flush at the next threshold / at the end.
+        // Transient (network, blob fetch / no-engine on THIS entry, or a threshold batch-flush
+        // failure): leave the affected entr(ies) unacked — they are not in the seen-set, so the next
+        // poll re-lists and re-processes them. Discovery of LATER entries continues.
         logger.warn(
           'Payments',
-          `Incoming delivery ${incoming.deliveryId.slice(0, 12)}… failed transiently (will retry):`,
+          `Incoming delivery ${incoming.deliveryId.slice(0, 12)}… (or its batch flush) failed transiently — left unacked, retried next poll:`,
           err
         );
       }
