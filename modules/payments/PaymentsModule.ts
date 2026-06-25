@@ -1522,6 +1522,9 @@ export class PaymentsModule {
     // this send. The failure handler must never restore these as 'confirmed' —
     // their state is consumed; the finished output blob is journaled separately.
     const committedOnChainTokenIds = new Set<string>();
+    // §3.1 (#621): set when any leg's post-certification delivery is deferred (kept journaled).
+    // Scoped to the whole send so the resolve path below can mark the result delivery-pending.
+    let deliveryPending = false;
 
     try {
       // Resolve recipient
@@ -1719,8 +1722,8 @@ export class PaymentsModule {
             memo: request.memo,
             createdAt: Date.now(),
           });
-          await deliverBlob(tokenBlob);
-          await this.removePendingV2Delivery(tokenBlob);
+          // §3.1 (#621): a delivery failure after certification must NOT fail the sender.
+          if (!(await this.tryDeliver(() => deliverBlob(tokenBlob), tokenBlob))) deliveryPending = true;
           result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
           consumedSources.push({
             uiTokenId: tw.uiToken.id,
@@ -1779,8 +1782,8 @@ export class PaymentsModule {
             await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
           }
 
-          await deliverBlob(recipientBlob);
-          await this.removePendingV2Delivery(recipientBlob);
+          // §3.1 (#621): a delivery failure after certification must NOT fail the sender.
+          if (!(await this.tryDeliver(() => deliverBlob(recipientBlob), recipientBlob))) deliveryPending = true;
 
           result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
           consumedSources.push({
@@ -1870,7 +1873,17 @@ export class PaymentsModule {
       // Commit reservation — all tokens have been sent on-chain and removed.
       this.reservationLedger.commit(result.id);
 
-      this.deps!.emitEvent('transfer:confirmed', result);
+      // §3.1 (#621): the spend is final regardless of delivery. If any leg's delivery was
+      // deferred (recipient-side 429 / transient outage), resolve as delivery-pending — the
+      // blob stays journaled for (re-)delivery — rather than failing the sender.
+      if (deliveryPending) {
+        result.deliveryPending = true;
+        result.deliveryState = 'pending-delivery';
+      } else {
+        result.deliveryState = 'landed';
+      }
+
+      this.deps!.emitEvent(deliveryPending ? 'transfer:delivery_pending' : 'transfer:confirmed', result);
       return result;
     } catch (error) {
       // Cancel reservation — free reserved amounts for other sends
@@ -5406,6 +5419,25 @@ export class PaymentsModule {
         await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
       }
     });
+  }
+
+  /**
+   * Covenant §3.1 (#621): once the source is certified on-chain, a delivery failure must NEVER
+   * fail the sender. Recipient-side conditions (a full mailbox / 429 from a never-claiming recipient)
+   * and transient delivery-infra failures (5xx/network) both leave the finished blob JOURNALED for
+   * (re-)delivery — the send resolves as delivery-pending and the sender moves on. The blob is already
+   * journaled (savePendingV2Delivery ran before this); on success we clear the journal, on any failure
+   * we keep it. Returns true if delivered, false if deferred. Never throws.
+   */
+  private async tryDeliver(deliver: () => Promise<void>, tokenBlob: string): Promise<boolean> {
+    try {
+      await deliver();
+      await this.removePendingV2Delivery(tokenBlob);
+      return true;
+    } catch (err) {
+      logger.warn('Payments', 'Delivery deferred (kept journaled); sender not failed (§3.1):', err);
+      return false;
+    }
   }
 
   /**
