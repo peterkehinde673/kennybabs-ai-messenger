@@ -3073,6 +3073,9 @@ export class PaymentsModule {
     for (const token of this.tokens.values()) {
       // Skip spent and invalid tokens; transferring tokens are tracked separately.
       if (token.status === 'spent' || token.status === 'invalid') continue;
+      // #625: a suspected-spent source is excluded from spend selection, so it must not inflate the
+      // DISPLAYED spendable balance either (else the wallet shows a total it cannot actually send).
+      if (token.suspectedSpent) continue;
       if (coinId && token.coinId !== coinId) continue;
       this.accumulateToken(assetsMap, token);
     }
