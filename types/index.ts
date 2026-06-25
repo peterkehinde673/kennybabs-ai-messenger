@@ -415,6 +415,7 @@ export type SphereEventType =
   | 'storage:degraded'
   | 'inventory:conflict'
   | 'delivery:undeliverable'
+  | 'delivery:deferred'
   | 'walletapi:session'
   | 'realtime:status'
   | 'connection:changed'
@@ -530,6 +531,12 @@ export interface SphereEventMap {
    * is higher. Surfacing trips once `attempts` reaches the bounded budget.
    */
   'delivery:undeliverable': { transferId: string; recipientPubkey: string; attempts: number; error: string };
+  /**
+   * §3.1 (#621): a delivery was deferred because the recipient's mailbox is full (429 — a never-claimer
+   * or quota). NOT poison: kept journaled and retried after `deferredUntil`. UI: "recipient can't receive
+   * yet — will retry". The sender is NOT failed; the token is the recipient's on-chain.
+   */
+  'delivery:deferred': { transferId: string; recipientPubkey: string; reason: string; deferredUntil: number };
   /**
    * wallet-api session state change (#515 F3): 'offline' = sign-in failed and
    * the wallet runs degraded (no intents barrier, no server custody writes);

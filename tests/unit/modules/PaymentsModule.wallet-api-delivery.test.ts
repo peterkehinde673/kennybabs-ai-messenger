@@ -752,6 +752,71 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     const sent = fake.getHistoryRecords(SENDER.chainPubkey).find((r) => r.dedupKey === `SENT_transfer_${transferId}`);
     expect(sent).toBeDefined();
   });
+
+  it('resume of an already-certified source records the spend instead of wedging on a conflict (§3.1 #621)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-rs-621');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const transferId = crypto.randomUUID();
+    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+    );
+
+    // The original send already certified (and delivered) this source — the intent only failed to
+    // close on a later step. Re-running the engine on the spent source raises TransferConflictError.
+    // Old behavior wedged (conflicted + re-certify forever); the fix records the spend and completes.
+    vi.spyOn(sender.engine, 'transfer').mockRejectedValue(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'),
+    );
+
+    const outcome = await sender.module.resumeOpenIntents();
+    expect(outcome.resumed).toEqual([transferId]);
+    expect(outcome.conflicted).toEqual([]);
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+  });
+});
+
+describe('replay classifies recipient-quota (429) as deferred, never poison (§3.1 #621)', () => {
+  it('a recipient-full 429 blob is deferred (kept journaled, never poison) and lands once the recipient drains', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-defer-621');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    (sender.module as any).deliveryDeferralMs = 0; // re-eligible immediately — no real wait
+    (sender.module as any).replayBackoffBaseMs = 0;
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    const realDeliver = sender.delivery.deliver.bind(sender.delivery);
+    let recipientFull = true;
+    vi.spyOn(sender.delivery, 'deliver').mockImplementation((a, b, c) =>
+      recipientFull ? Promise.reject(new WalletApiError('quota (§5.5)', 'RATE_LIMITED', 429)) : realDeliver(a, b, c),
+    );
+
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    expect(result.deliveryPending).toBe(true);
+
+    // Drive far past the case-A poison budget (6) while the recipient stays full — never poison.
+    for (let i = 0; i < 8; i++) await (sender.module as any).replayPendingV2Deliveries();
+    const journaled = JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]');
+    expect(journaled).toHaveLength(1);
+    expect(journaled[0].undeliverable).toBeUndefined();
+    expect(journaled[0].deferredReason).toBe('recipient-quota');
+    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'delivery:deferred')).toBe(true);
+    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'delivery:undeliverable')).toBe(false);
+
+    // Recipient drains → next replay lands and clears the journal.
+    recipientFull = false;
+    await (sender.module as any).replayPendingV2Deliveries();
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
+    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
+  });
 });
 
 describe('stale-inventory conflict is SURFACED, not silent (#517 item 2)', () => {
