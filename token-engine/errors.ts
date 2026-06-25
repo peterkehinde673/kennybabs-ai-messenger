@@ -16,6 +16,12 @@ import { SphereError } from '../core/errors';
  * a NEW `transferId` (never reusing the old realization) — sdk-changes E.2.
  */
 export class TransferConflictError extends SphereError {
+  /**
+   * #625: the source token id (the caller's id, e.g. `v2_<genesis>`) whose state was already spent.
+   * Set by PaymentsModule at the engine call site so the self-healing retry can demote it and re-plan.
+   */
+  conflictedSourceId?: string;
+
   constructor(message: string, cause?: unknown) {
     super(message, 'TRANSFER_CONFLICT', cause);
     this.name = 'TransferConflictError';

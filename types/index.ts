@@ -77,6 +77,13 @@ export interface Token {
    * (`getToken`) only when the token is selected for a spend.
    */
   readonly lazy?: boolean;
+  /**
+   * #625 (self-healing coin selection): a send selected this source but its state was already spent
+   * on-chain (`TransferConflictError`). It is KEPT in inventory (visible, recoverable by a resync —
+   * never auto-removed) but EXCLUDED from spend selection, so coin-selection picks live tokens and the
+   * send self-heals instead of wedging on a stale source.
+   */
+  suspectedSpent?: boolean;
 }
 
 export interface Asset {
