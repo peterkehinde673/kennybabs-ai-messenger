@@ -912,30 +912,78 @@ describe('replay classifies recipient-quota (429) as deferred, never poison (§3
   });
 });
 
-describe('stale-inventory conflict is SURFACED, not silent (#517 item 2)', () => {
-  it('a send that loses the race on a stale source emits inventory:conflict (E.2 TransferConflictError)', async () => {
+describe('stale-inventory conflict self-heals (#625) + is SURFACED (#517 item 2)', () => {
+  it('the ONLY source being stale: demote it, re-plan, and surface a CLEAN SEND_INSUFFICIENT_BALANCE (not a raw conflict)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-conf-1');
-    await seedServerToken(fake, sender, SENDER, 1000n);
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
     await sender.module.load();
 
-    // Coin-selection planned from the lazy view, but another device already
-    // spent the source: the engine's match-verify raises TransferConflictError
-    // (Part E.2 — the predictable stale-view race the incident flagged).
+    // Another device already spent the only source: the engine's match-verify raises
+    // TransferConflictError on every certification attempt (Part E.2).
     vi.spyOn(sender.engine, 'transfer').mockRejectedValue(
       new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent')
     );
 
+    // #625: the send demotes the stale source and re-plans; with no live candidate left it exhausts to
+    // a CLEAN SEND_INSUFFICIENT_BALANCE — never an endless loop or a raw conflict to the caller.
     await expect(sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT }))
-      .rejects.toBeInstanceOf(TransferConflictError);
+      .rejects.toThrow(/insufficient balance/i);
 
-    // The recoverable condition is now OBSERVABLE — a distinct event, not just a
-    // generic transfer:failed buried in a string.
+    // The conflict is still surfaced (telemetry/UI awareness) — exactly once: the re-plan fails at
+    // SELECTION (the source is now excluded), not at certification, so no second conflict.
     const conflictCalls = sender.emitEvent.mock.calls.filter((c) => c[0] === 'inventory:conflict');
     expect(conflictCalls).toHaveLength(1);
-    expect(conflictCalls[0][1]).toMatchObject({ coinId: UCT });
-    expect(typeof conflictCalls[0][1].transferId).toBe('string');
     expect(conflictCalls[0][1].error).toContain('TRANSACTION_HASH_MISMATCH');
+
+    // The stale source is DEMOTED (suspectedSpent) but KEPT in inventory — never auto-removed.
+    const demoted = sender.module.getTokens().find((t) => t.id === `v2_${sourceTokenId}`);
+    expect(demoted?.suspectedSpent).toBe(true);
+  });
+
+  it('a stale source among live ones self-heals: demote the conflicted token, complete with the next candidate', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-heal-1');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await seedServerToken(fake, sender, SENDER, 1000n); // two interchangeable sources
+    await sender.module.load();
+
+    // The first-selected source is already spent: the engine conflicts ONCE, then certifies normally.
+    vi.spyOn(sender.engine, 'transfer').mockRejectedValueOnce(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent')
+    );
+
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    expect(result.status).toBe('completed');
+
+    // Exactly one source demoted (the conflicted one); the delivery landed via the live source.
+    expect(sender.module.getTokens().filter((t) => t.suspectedSpent)).toHaveLength(1);
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
+  });
+
+  it('does NOT self-heal a conflict AFTER an earlier op certified — avoids a full-amount over-request re-plan (#625 safety)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-partial-1');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // amount 2000 needs BOTH sources (two direct ops). The first certifies; the second conflicts —
+    // so value has already left the wallet and a full-amount re-plan would over-request.
+    const orig = sender.engine.transfer.bind(sender.engine);
+    let calls = 0;
+    vi.spyOn(sender.engine, 'transfer').mockImplementation((...args: Parameters<typeof orig>) => {
+      calls += 1;
+      return calls === 2
+        ? Promise.reject(new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'))
+        : orig(...args);
+    });
+
+    // The conflict is NOT self-healed (an earlier op already certified) — it propagates, and nothing
+    // is demoted (no retry).
+    await expect(sender.module.send({ recipient: '@bob', amount: '2000', coinId: UCT }))
+      .rejects.toBeInstanceOf(TransferConflictError);
+    expect(sender.module.getTokens().filter((t) => t.suspectedSpent)).toHaveLength(0);
   });
 
   it('a plain (non-conflict) send failure does NOT emit inventory:conflict', async () => {

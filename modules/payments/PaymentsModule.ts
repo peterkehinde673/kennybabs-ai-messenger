@@ -154,6 +154,9 @@ const MAX_DELIVERY_REPLAY_ATTEMPTS = 6;
 /** #623: incoming claim/reject are submitted in batches of this size (one request each) so a large
  * inbox drain doesn't fire one write per entry and trip the per-owner rate limit. */
 const INCOMING_ACK_BATCH_SIZE = 200;
+/** #625: max times send() re-plans after demoting an already-spent source (self-healing selection).
+ * A backstop — each retry permanently demotes one stale source, so convergence is fast. */
+const MAX_RESELECT_ATTEMPTS = 8;
 /** §3.1 (#621): how long a recipient-quota (429) delivery is deferred before the next replay attempt. */
 const DELIVERY_DEFERRAL_MS = 60 * 60 * 1000; // 1h
 const DELIVERY_REPLAY_BASE_DELAY_MS = 1_000;
@@ -1519,7 +1522,58 @@ export class PaymentsModule {
    *   `existingReservationId` and `existingSplitPlan` allow callers (e.g. instantSplitSend)
    *   to pass an already-acquired reservation, skipping the planSend() critical section.
    */
+  /**
+   * #625 — self-healing coin selection. If a selected source turns out already spent on-chain
+   * (`TransferConflictError`), demote it (durable `suspectedSpent` — kept in inventory, excluded from
+   * selection) and re-plan with the next candidate, bounded. A fixed plan (`instantSplitSend`) is not
+   * re-planned. Exhausting the live candidates surfaces a clean `SEND_INSUFFICIENT_BALANCE` (or the
+   * final conflict), never an endless loop.
+   */
   async send(
+    request: TransferRequest,
+    internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
+  ): Promise<TransferResult> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.sendOnce(request, internal);
+      } catch (err) {
+        const conflictedId = err instanceof TransferConflictError ? err.conflictedSourceId : undefined;
+        if (
+          conflictedId !== undefined &&
+          attempt < MAX_RESELECT_ATTEMPTS &&
+          internal?.existingSplitPlan === undefined &&
+          this.tokens.has(conflictedId)
+        ) {
+          await this.demoteSuspectedSpent(conflictedId);
+          logger.warn(
+            'Payments',
+            `Source ${conflictedId} already spent on-chain — demoted, re-planning with the next candidate (#625, attempt ${attempt + 1}/${MAX_RESELECT_ATTEMPTS})`,
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * #625: mark a source token suspected-spent (a `TransferConflictError` proved its state consumed
+   * on-chain). It stays in inventory (visible, recoverable by a resync — never auto-removed) but is
+   * excluded from spend selection (SpendQueue) so coin-selection picks live tokens instead.
+   */
+  private async demoteSuspectedSpent(tokenId: string): Promise<void> {
+    const token = this.tokens.get(tokenId);
+    if (!token) return;
+    token.suspectedSpent = true;
+    this.tokens.set(tokenId, token);
+    try {
+      await this.save();
+    } catch (err) {
+      logger.warn('Payments', `Failed to persist suspectedSpent for ${tokenId} (re-derived on the next conflict):`, err);
+    }
+  }
+
+  private async sendOnce(
     request: TransferRequest,
     internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
   ): Promise<TransferResult> {
@@ -1722,16 +1776,27 @@ export class PaymentsModule {
         // so any device holding the wallet seed can rebuild the identical
         // transactions and resume (Part E).
         for (const [opIndex, tw] of splitPlan.tokensToTransferDirectly.entries()) {
-          const finished = await engine.transfer(
-            {
-              token: tw.sdkToken as SphereToken,
-              recipientPubkey: recipientChainPubkey,
-              data: memoData,
-            },
-            // opIndex = position in the persisted intent's `direct` order — the
-            // stable (transferId, opIndex) pairing resume replays (§8.1).
-            { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex },
-          );
+          let finished;
+          try {
+            finished = await engine.transfer(
+              {
+                token: tw.sdkToken as SphereToken,
+                recipientPubkey: recipientChainPubkey,
+                data: memoData,
+              },
+              // opIndex = position in the persisted intent's `direct` order — the
+              // stable (transferId, opIndex) pairing resume replays (§8.1).
+              { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex },
+            );
+          } catch (err) {
+            // #625: tag for self-healing ONLY when nothing has certified yet in this attempt — re-planning
+            // the full amount is then safe. If an earlier op already certified, the certified value has
+            // left the wallet, so a full-amount re-plan would over-request; leave it untagged (no retry).
+            if (err instanceof TransferConflictError && committedOnChainTokenIds.size === 0) {
+              err.conflictedSourceId = tw.uiToken.id;
+            }
+            throw err;
+          }
           // The source state is spent on-chain from here on.
           committedOnChainTokenIds.add(tw.uiToken.id);
           // Journal the finished blob BEFORE delivery: a transport failure or a
@@ -1764,22 +1829,32 @@ export class PaymentsModule {
         let changeOutput: SphereToken | null = null;
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
           const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
-          const { outputs } = await engine.split(
-            {
-              token: splitPlan.tokenToSplit.sdkToken as SphereToken,
-              outputs: [
-                { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: splitPlan.splitAmount!, data: memoData },
-                { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
-              ],
-            },
-            // Same per-send seed; the split's opIndex follows the direct ops
-            // (stable across resume — it is derived from the intent's order).
-            {
-              signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS),
-              transferId: result.id,
-              opIndex: splitPlan.tokensToTransferDirectly.length,
-            },
-          );
+          let outputs;
+          try {
+            ({ outputs } = await engine.split(
+              {
+                token: splitPlan.tokenToSplit.sdkToken as SphereToken,
+                outputs: [
+                  { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: splitPlan.splitAmount!, data: memoData },
+                  { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
+                ],
+              },
+              // Same per-send seed; the split's opIndex follows the direct ops
+              // (stable across resume — it is derived from the intent's order).
+              {
+                signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS),
+                transferId: result.id,
+                opIndex: splitPlan.tokensToTransferDirectly.length,
+              },
+            ));
+          } catch (err) {
+            // #625: tag for self-healing only when nothing certified yet this attempt (see the direct-op
+            // note) — a split after already-certified direct ops must not trigger a full-amount re-plan.
+            if (err instanceof TransferConflictError && committedOnChainTokenIds.size === 0) {
+              err.conflictedSourceId = splitPlan.tokenToSplit.uiToken.id;
+            }
+            throw err;
+          }
           // The split source is burnt on-chain from here on. Journal the
           // recipient's blob BEFORE the delivery attempt.
           committedOnChainTokenIds.add(splitPlan.tokenToSplit.uiToken.id);
@@ -2998,6 +3073,9 @@ export class PaymentsModule {
     for (const token of this.tokens.values()) {
       // Skip spent and invalid tokens; transferring tokens are tracked separately.
       if (token.status === 'spent' || token.status === 'invalid') continue;
+      // #625: a suspected-spent source is excluded from spend selection, so it must not inflate the
+      // DISPLAYED spendable balance either (else the wallet shows a total it cannot actually send).
+      if (token.suspectedSpent) continue;
       if (coinId && token.coinId !== coinId) continue;
       this.accumulateToken(assetsMap, token);
     }

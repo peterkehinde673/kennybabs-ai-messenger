@@ -117,6 +117,7 @@ export class SpendPlanner {
     for (const t of tokens) {
       if (t.coinId !== coinId) continue;
       if (t.status !== 'confirmed') continue;
+      if (t.suspectedSpent) continue; // #625: demoted (already-spent on-chain) — kept in inventory, not spendable
       if (!t.sdkData) {
         // Lazy inventory record (sdk-changes S2): plan from the value
         // metadata; the blob (and SphereToken handle) is fetched on demand by
@@ -640,9 +641,9 @@ export class SpendQueue {
 
     for (const [tokenId, entry] of pool) {
       if (entry.token.coinId !== coinId) continue;
-      // Skip tokens removed or no longer confirmed in the live wallet
+      // Skip tokens removed, no longer confirmed, or demoted as suspected-spent (#625) in the live wallet
       const liveToken = liveTokens.get(tokenId);
-      if (!liveToken || liveToken.status !== 'confirmed') continue;
+      if (!liveToken || liveToken.status !== 'confirmed' || liveToken.suspectedSpent) continue;
       const freeAmount = this.ledger.getFreeAmount(entry.token.id, entry.amount);
       // Only include fully-free tokens — partially reserved tokens cannot be
       // used for direct transfers and would cause INSUFFICIENT_FREE_AMOUNT
