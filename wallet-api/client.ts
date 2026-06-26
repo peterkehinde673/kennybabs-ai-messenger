@@ -145,6 +145,11 @@ function defaultWebSocketFactory(url: string): import('./types').WebSocketLike {
   return new Ctor(url);
 }
 
+/** GET-only retry on a transient NETWORK failure (a dropped/reset connection — e.g. a backend under
+ * load resetting mid-read). Total attempts and exponential-backoff base. */
+const GET_RETRY_ATTEMPTS = 3;
+const GET_RETRY_BASE_MS = 200;
+
 export class WalletApiClient {
   /** Network name (also the blob-key prefix `<network>/t/<sha256>` — §5.2). */
   readonly network: string;
@@ -408,16 +413,41 @@ export class WalletApiClient {
   }
 
   /**
+   * GET-only retry on a transient NETWORK failure (a dropped/reset connection — e.g. a backend under
+   * load resetting mid-read). GETs are idempotent, so re-issuing is safe; non-GET methods are NEVER
+   * retried here because a lost-response retry could double-apply a write. Non-NETWORK outcomes (any
+   * HTTP status) come back as a response and are handled by the caller. Bounded exponential backoff.
+   */
+  private async rawFetchWithReadRetry(
+    method: string,
+    path: string,
+    body: unknown,
+    jwt: string
+  ): Promise<FetchResponseLike> {
+    const attempts = method === 'GET' ? GET_RETRY_ATTEMPTS : 1;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.rawFetch(method, path, body, jwt);
+      } catch (err) {
+        const transient = err instanceof WalletApiError && err.code === 'NETWORK';
+        if (!transient || attempt >= attempts) throw err;
+        await new Promise((resolve) => setTimeout(resolve, GET_RETRY_BASE_MS * 2 ** (attempt - 1)));
+      }
+    }
+  }
+
+  /**
    * Authenticated JSON request. A 401 triggers one silent re-auth
-   * (refresh → challenge fallback) and one retry.
+   * (refresh → challenge fallback) and one retry; idempotent GETs additionally retry a transient
+   * NETWORK failure (rawFetchWithReadRetry) so a single dropped connection doesn't fail the call.
    */
   private async requestJson(method: string, path: string, body?: unknown): Promise<unknown> {
     if (!this.jwt) await this.signIn();
-    let res = await this.rawFetch(method, path, body, this.jwt!);
+    let res = await this.rawFetchWithReadRetry(method, path, body, this.jwt!);
     if (res.status === 401) {
       this.jwt = null;
       await this.signIn();
-      res = await this.rawFetch(method, path, body, this.jwt!);
+      res = await this.rawFetchWithReadRetry(method, path, body, this.jwt!);
     }
     if (res.status === 204) return null;
     if (!res.ok) throw await this.toError(res, `${method} ${path}`);
