@@ -1,44 +1,5 @@
-# Dependencies
 node_modules/
-
-# Build output
 dist/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-npm-debug.log*
-
-# Test coverage
-coverage/
-
-# Environment
+*.db
+storage.json
 .env
-.env.local
-.env.*.local
-
-# Misc
-*.tgz
-ref_materials/
-
-# CLI wallet profiles and test wallets
-.sphere-cli*/
-
-# Test-run data dirs (any suite that writes a wallet/token fixture under tests/)
-tests/**/.test-*/
-.claude/
-
-# Superpowers specs/plans — local only, never committed
-docs/superpowers/
-
-# Test runner artifacts
-.vitest-result.json
