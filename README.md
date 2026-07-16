@@ -2,6 +2,9 @@
 
 An autonomous social messaging agent built for the **Unicity Sphere Network**.
 
+## 🌐 Live Web App
+**Visit the status page here:** [https://peterkehinde673.github.io/kennybabs-ai-messenger/](https://peterkehinde673.github.io/kennybabs-ai-messenger/)
+
 ## 🚀 Overview
 Kennybabs AI Messenger is a headless agent designed to run in a mobile Linux environment (Termux).
 
