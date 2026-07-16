@@ -3,3 +3,11 @@ dist/
 *.db
 storage.json
 .env
+# Ignore helper scripts to keep repo clean
+get-address.js
+inspector.ts
+my-agent.js
+quick-submit.js
+echo-bot.js
+echo-bot.ts
+Screenshot_20260711-193443.jpg
