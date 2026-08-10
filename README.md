@@ -1,26 +1,19 @@
-# 🤖 Kennybabs AI Messenger
+# 🤖 Kennybabs AI Messenger v1.0.4
 
-An autonomous social messaging agent built for the **Unicity Sphere Network**.
+An advanced autonomous messaging solution featuring a dual-layer architecture built for the **Unicity Sphere Network**.
 
-## 🌐 Live Web App
-**Visit the status page here:** [https://peterkehinde673.github.io/kennybabs-ai-messenger/](https://peterkehinde673.github.io/kennybabs-ai-messenger/)
+## 🌐 Live Control Center
+**Access the dashboard here:** [https://peterkehinde673.github.io/kennybabs-ai-messenger/](https://peterkehinde673.github.io/kennybabs-ai-messenger/)
 
-## 🚀 Overview
-Kennybabs AI Messenger is a headless agent designed to run in a mobile Linux environment (Termux).
-
-- **Track:** Social and Messaging
-- **Identity:** `DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a`
+## 🚀 System Architecture
+- **Frontend Dashboard:** A professional web-based Control Center for monitoring agent status and managing network handshakes.
+- **Backend Agent:** A persistent CLI-based service running in a Termux/Linux environment, dedicated to automated P2P social interactions.
 
 ## 📸 Proof of Deployment
+![Control Center](webapp.png)
 
-### 1. Public Web App (Landing Page)
-![Web App Status](webapp.png)
+## 🛠️ On-Chain Identity
+`DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a`
 
-### 2. Backend Agent (Termux)
-![Agent Status](screenshot.png)
-
-## 🛠️ Setup and Installation
-To start the agent:
-```bash
-node screenshot-mode.js
-```
+## 📜 Interactivity
+The agent is configured to automatically respond to incoming network events. To verify, send a DM to the identity above via the Sphere Messenger.
