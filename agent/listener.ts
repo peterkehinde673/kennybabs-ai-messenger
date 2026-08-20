@@ -11,6 +11,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
     try {
       const msgId = msg.id || `${msg.sender}-${msg.timestamp || Date.now()}`;
       
+      // Deduplication
       if (processedMessageIds.has(msgId)) {
         return;
       }
@@ -20,12 +21,12 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
         if (first) processedMessageIds.delete(first);
       }
 
-      if (msg.sender === directAddress || msg.sender === `@${config.nametag}`) {
-        return;
-      }
-
       const senderText = msg.text || msg.content || '';
-      console.log(`\n📩 [DM RECEIVED] From: ${msg.sender} | Content: "${senderText}"`);
+      console.log(`\n===========================================`);
+      console.log(`📩 [DM RECEIVED IN TERMINAL]`);
+      console.log(`From:    ${msg.sender}`);
+      console.log(`Content: "${senderText}"`);
+      console.log(`===========================================`);
 
       pushEvent({
         type: 'incoming_dm',
@@ -36,8 +37,10 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
 
       updateDMStats(true);
 
+      // Generate AI response
       const replyText = await generateAgentResponse(msg.sender, senderText, config);
 
+      // Send response back using official Sphere communications API
       let sent = false;
       let attempts = 0;
       while (!sent && attempts < 3) {
@@ -72,13 +75,18 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
     }
   };
 
-  // Register listeners on all available event hooks
+  // Register on all available communication hooks
   if (sphere.communications && typeof sphere.communications.onDirectMessage === 'function') {
     sphere.communications.onDirectMessage(handleIncomingMessage);
   }
   if (sphere.communications && typeof sphere.communications.on === 'function') {
     sphere.communications.on('message:incoming', handleIncomingMessage);
     sphere.communications.on('direct-message', handleIncomingMessage);
+    sphere.communications.on('message', handleIncomingMessage);
+  }
+  if (sphere.transport && typeof sphere.transport.on === 'function') {
+    sphere.transport.on('message:incoming', handleIncomingMessage);
+    sphere.transport.on('message', handleIncomingMessage);
   }
   if (typeof sphere.on === 'function') {
     sphere.on('message:incoming', handleIncomingMessage);

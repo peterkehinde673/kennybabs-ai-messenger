@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import path from 'path';
 
 export interface AgentRuntimeStats {
   status: string;
@@ -26,7 +27,7 @@ let lastOutgoingTime: string | null = null;
 
 let currentStats: AgentRuntimeStats = {
   status: 'initializing',
-  network: 'testnet',
+  network: 'testnet2',
   nametag: 'kennybabs',
   directAddress: '',
   chainPublicKey: '',
@@ -65,6 +66,13 @@ export function startStatusServer(port: number) {
   app.use(cors());
   app.use(express.json());
 
+  // Serve static visual dashboard files
+  app.use(express.static(path.resolve('frontend')));
+
+  app.get('/', (req, res) => {
+    res.sendFile(path.resolve('frontend/index.html'));
+  });
+
   app.get('/api/status', (req, res) => {
     const uptime = Math.floor((Date.now() - startTime) / 1000);
     res.json({
@@ -83,6 +91,7 @@ export function startStatusServer(port: number) {
   });
 
   app.listen(port, () => {
-    console.log(`🌐 Status API Server listening at http://localhost:${port}/api/status`);
+    console.log(`🌐 Control Center UI running at http://localhost:${port}`);
+    console.log(`🌐 Status API running at http://localhost:${port}/api/status`);
   });
 }
