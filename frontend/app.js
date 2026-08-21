@@ -1,6 +1,10 @@
+const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+    ? 'http://localhost:3001'
+    : 'https://12e71f6deb1549.lhr.life';
+
 async function updateDashboard() {
     try {
-        const res = await fetch('http://localhost:3001/api/status');
+        const res = await fetch(`${API_BASE_URL}/api/status`);
         if (!res.ok) throw new Error();
         const data = await res.json();
 
