@@ -21,7 +21,7 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
     fs.mkdirSync(walletDataDir, { recursive: true });
   }
 
-  // Persistent Device ID for Wallet API session consistency across restarts
+  // Persistent Device ID for Wallet API session stability across restarts
   const deviceIdFile = path.join(config.dataDir, 'device-id.json');
   let deviceId: string;
   if (fs.existsSync(deviceIdFile)) {
@@ -64,49 +64,26 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
 
   const sphere = (initResult as any).sphere || initResult;
 
-  // Extract real runtime identity from Sphere instance
-  let directAddress = '';
-  let chainPublicKey = '';
-  let transportPublicKey = '';
-
-  if (sphere.identity) {
-    directAddress = sphere.identity.directAddress || '';
-    chainPublicKey = sphere.identity.chainPubkey || '';
-    transportPublicKey = sphere.identity.transportPubkey || '';
-  }
-
-  if (!directAddress && typeof sphere.getAddress === 'function') {
-    directAddress = await sphere.getAddress();
-  }
-
-  if (!chainPublicKey && sphere.wallet && typeof sphere.wallet.getPublicKey === 'function') {
-    chainPublicKey = await sphere.wallet.getPublicKey();
-  }
+  // Canonical identity extraction directly from the initialized Sphere instance
+  const directAddress = sphere.identity?.directAddress;
+  const chainPublicKey = sphere.identity?.chainPubkey;
+  const transportPublicKey = sphere.identity?.transportPubkey || '';
+  const nametag = sphere.identity?.nametag || config.nametag;
 
   if (!directAddress) {
-    throw new Error('FATAL: Direct Address could not be resolved from the initialized Sphere instance.');
+    throw new Error('FATAL: sphere.identity.directAddress is undefined on initialized Sphere instance.');
   }
 
   if (!chainPublicKey) {
-    throw new Error('FATAL: Chain Public Key could not be resolved from the initialized Sphere instance.');
+    throw new Error('FATAL: sphere.identity.chainPubkey is undefined on initialized Sphere instance.');
   }
-
-  let currentNametag = config.nametag;
-  try {
-    if (sphere.wallet && typeof sphere.wallet.getNametag === 'function') {
-      const registered = await sphere.wallet.getNametag();
-      if (registered) currentNametag = registered;
-    } else if (sphere.identity?.nametag) {
-      currentNametag = sphere.identity.nametag;
-    }
-  } catch {}
 
   return {
     sphere,
     directAddress,
     chainPublicKey,
     transportPublicKey,
-    nametag: currentNametag,
+    nametag,
     isExisting
   };
 }
