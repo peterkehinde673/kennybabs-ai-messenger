@@ -7,13 +7,40 @@ interface MessageHistory {
 
 const senderHistories = new Map<string, MessageHistory[]>();
 const senderRateLimits = new Map<string, number[]>();
+let verifiedModel = '';
 
 const SYSTEM_PROMPT = `You are Kennybabs, an autonomous AI Agent operating on the Unicity Sphere Network.
 Instructions:
-- Provide direct, concise, and helpful answers to any question the user asks.
-- Keep answers clear and friendly for P2P direct messages.
+- Provide direct, concise, factual, and helpful answers to any question the user asks.
+- Keep responses friendly and suitable for P2P direct messages.
 - When asked who you are, identify yourself as @kennybabs AI Messenger on Unicity Sphere.
 - Never invent fake financial transactions.`;
+
+async function getLatestWorkingModel(apiKey: string, preferredModel: string): Promise<string[]> {
+  if (verifiedModel) return [verifiedModel, 'gemini-3.6-flash', 'gemini-3.5-flash'];
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    if (res.ok) {
+      const data = await res.json();
+      const available = (data.models || [])
+        .filter((m: any) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+        .map((m: any) => m.name.replace('models/', ''));
+
+      if (available.length > 0) {
+        const top = available.find((m: string) => m === 'gemini-3.6-flash') ||
+                    available.find((m: string) => m === 'gemini-3.5-flash') ||
+                    available.find((m: string) => m === 'gemini-2.5-flash') ||
+                    available.find((m: string) => m.includes('flash')) ||
+                    available[0];
+        verifiedModel = top;
+        return Array.from(new Set([top, preferredModel, ...available]));
+      }
+    }
+  } catch {}
+
+  return [preferredModel || 'gemini-3.6-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'];
+}
 
 export async function generateAgentResponse(
   sender: string,
@@ -23,7 +50,6 @@ export async function generateAgentResponse(
   const now = Date.now();
   const timestamps = (senderRateLimits.get(sender) || []).filter(t => now - t < 60000);
   if (timestamps.length >= 10) {
-    console.warn(`[RATE LIMIT] Sender ${sender} exceeded limit (max 10 DMs/min).`);
     return "⚠️ Rate limit reached (max 10 messages/min). Please wait a moment before sending another message.";
   }
   timestamps.push(now);
@@ -32,19 +58,19 @@ export async function generateAgentResponse(
   let history = senderHistories.get(sender) || [];
   if (history.length > 20) history = history.slice(-20);
 
-  const apiKey = config.geminiApiKey || process.env.GEMINI_API_KEY || '';
+  const rawKey = config.geminiApiKey || process.env.GEMINI_API_KEY || '';
+  const apiKey = rawKey.replace(/['"\s]/g, '');
 
   if (!apiKey) {
-    console.log('[GEMINI SKIPPED] No Gemini API key provided in .env.');
-    return `Hello! I am @${config.nametag} AI Messenger. I received your message: "${userMessage}". How can I assist you on Unicity today?`;
+    return `Hello! I am @${config.nametag} AI Messenger. I received your message: "${userMessage}". How can I help you on Unicity today?`;
   }
 
-  const models = [config.geminiModel, 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  const candidateModels = await getLatestWorkingModel(apiKey, config.geminiModel);
 
-  for (const model of Array.from(new Set(models.filter(Boolean)))) {
+  for (const model of candidateModels) {
     try {
       console.log(`[GEMINI REQUEST] Model: ${model} | Target: ${sender}`);
-
+      
       const payload = {
         contents: [
           ...history,
@@ -66,7 +92,9 @@ export async function generateAgentResponse(
         const data = await response.json();
         const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
         if (replyText) {
+          verifiedModel = model;
           console.log(`[GEMINI SUCCESS] Model: ${model}`);
+          console.log(`[GEMINI RESPONSE] "${replyText.trim().substring(0, 80)}..."`);
           history.push({ role: 'user', parts: [{ text: userMessage }] });
           history.push({ role: 'model', parts: [{ text: replyText }] });
           senderHistories.set(sender, history);
@@ -74,7 +102,7 @@ export async function generateAgentResponse(
         }
       } else {
         const errBody = await response.text();
-        console.warn(`[GEMINI FAILED] Model ${model} HTTP ${response.status}: ${errBody.substring(0, 150)}`);
+        console.warn(`[GEMINI FAILED] Model ${model} HTTP ${response.status}: ${errBody.substring(0, 120)}`);
       }
     } catch (err: any) {
       console.warn(`[GEMINI FAILED] Connection error for ${model}:`, err.message);
