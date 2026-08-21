@@ -25,15 +25,19 @@ export function loadConfig(): AgentConfig {
 
   const nametag = (process.env.UNICITY_NAMETAG || 'kennybabs').trim();
   const mnemonic = (process.env.UNICITY_MNEMONIC || '').trim().replace(/^["']|["']$/g, '');
-  const oracleApiKey = (process.env.UNICITY_ORACLE_API_KEY || 'sk_ddc3cfcc001e4a28ac3fad7407f99590').trim();
+  const oracleApiKey = (process.env.UNICITY_ORACLE_API_KEY || '').trim().replace(/^["']|["']$/g, '');
   const walletApiUrl = (process.env.UNICITY_WALLET_API_URL || 'https://wallet-api.unicity.network').trim();
   const geminiApiKey = (process.env.GEMINI_API_KEY || '').trim().replace(/['"\s]/g, '');
-  const geminiModel = (process.env.GEMINI_MODEL || 'gemini-1.5-flash').trim();
+  const geminiModel = (process.env.GEMINI_MODEL || 'gemini-3.6-flash').trim();
   const port = parseInt(process.env.PORT || '3001', 10);
   const dataDir = path.resolve(process.env.AGENT_DATA_DIR || './data');
 
   if (!mnemonic) {
-    throw new Error('FATAL: UNICITY_MNEMONIC is missing from .env.');
+    throw new Error('FATAL: UNICITY_MNEMONIC is missing from .env. A valid recovery mnemonic is required.');
+  }
+
+  if (!oracleApiKey) {
+    throw new Error('FATAL: UNICITY_ORACLE_API_KEY is missing from .env.');
   }
 
   return {

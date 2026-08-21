@@ -9,10 +9,10 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
   console.log('📡 Registering official Sphere direct-message listener...');
 
   if (!sphere.communications || typeof sphere.communications.onDirectMessage !== 'function') {
-    throw new Error('FATAL: sphere.communications.onDirectMessage is not available on the installed Sphere SDK.');
+    throw new Error('FATAL: sphere.communications.onDirectMessage is not supported by the installed Sphere SDK.');
   }
 
-  // Exactly ONE official direct-message listener hook
+  // Exactly ONE production listener
   sphere.communications.onDirectMessage(async (msg: any) => {
     if (!msg) return;
 
@@ -24,7 +24,6 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
     let replyTarget = (rawSender || '').trim();
     if (!replyTarget || replyTarget === '@' || replyTarget === 'unknown') return;
 
-    // Normalize nametag format
     if (!replyTarget.startsWith('@') && !replyTarget.startsWith('DIRECT://') && !replyTarget.startsWith('0x') && !replyTarget.startsWith('un1')) {
       replyTarget = `@${replyTarget}`;
     }
@@ -34,15 +33,15 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       return;
     }
 
-    // Deterministic deduplication key
     const msgId = msg.id || `${replyTarget}:${msg.timestamp || ''}:${senderText.trim()}`;
 
+    // Deduplication check
     if (processedMessageIds.has(msgId) || inFlightMessageIds.has(msgId)) {
       console.log(`[DUPLICATE DM IGNORED] Message ID: ${msgId}`);
       return;
     }
 
-    // Task 1: Acquire in-flight lock
+    // Acquire in-flight lock
     inFlightMessageIds.add(msgId);
 
     const timestamp = new Date().toLocaleTimeString();
@@ -63,20 +62,20 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       });
       updateDMStats(true);
 
-      // Generate AI response
+      // Prompt Gemini AI
       const replyText = await generateAgentResponse(replyTarget, senderText, config);
 
-      // Bounded retry loop (Attempt 1/3 -> 2/3 -> 3/3)
-      let sent = false;
+      // Bounded sequential retry policy (max 3 attempts)
+      let delivered = false;
       let attempt = 0;
       const maxAttempts = 3;
 
-      while (!sent && attempt < maxAttempts) {
+      while (!delivered && attempt < maxAttempts) {
         attempt++;
         console.log(`[SENDING DM] Attempt ${attempt}/${maxAttempts} to ${replyTarget}...`);
         try {
           await sphere.communications.sendDM(replyTarget, replyText);
-          sent = true;
+          delivered = true;
           console.log(`[DM SENT]`);
           console.log(`Recipient: ${replyTarget}`);
           console.log(`Timestamp: ${new Date().toLocaleTimeString()}`);
@@ -97,16 +96,22 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
         }
       }
 
-      // Mark message as processed
-      processedMessageIds.add(msgId);
-      if (processedMessageIds.size > 2000) {
-        const first = processedMessageIds.values().next().value;
-        if (first) processedMessageIds.delete(first);
+      if (delivered) {
+        // Mark as permanently processed ONLY upon confirmed delivery
+        processedMessageIds.add(msgId);
+        if (processedMessageIds.size > 2000) {
+          const first = processedMessageIds.values().next().value;
+          if (first) processedMessageIds.delete(first);
+        }
+      } else {
+        console.error(`\n[DM DELIVERY FAILED]`);
+        console.error(`Message ID: ${msgId}`);
+        console.error(`Attempts:   ${attempt}/${maxAttempts}`);
       }
     } catch (err: any) {
-      console.error('❌ Unhandled error in DM handler:', err.message || err);
+      console.error('❌ Unhandled exception in DM pipeline:', err.message || err);
     } finally {
-      // Task 1: Guaranteed in-flight lock release regardless of success or failure
+      // Guaranteed in-flight lock release
       inFlightMessageIds.delete(msgId);
     }
   });

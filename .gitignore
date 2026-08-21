@@ -1,6 +1,12 @@
 node_modules/
 data/
+wallet-store/
+device-id.json
 .env
-*.log
+.env.*
+*.key
+*.pem
+*.seed
 *.db
+*.log
 dist/
