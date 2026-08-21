@@ -1,6 +1,6 @@
 const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
     ? 'http://localhost:3001'
-    : 'https://12e71f6deb1549.lhr.life';
+    : 'https://e4081f2528da2d.lhr.life';
 
 async function updateDashboard() {
     try {
@@ -13,8 +13,8 @@ async function updateDashboard() {
 
         document.getElementById('val-nametag').innerText = '@' + (data.nametag || 'kennybabs');
         document.getElementById('val-network').innerText = data.network || 'testnet2';
-        document.getElementById('val-address').innerText = data.directAddress || 'Unavailable';
-        document.getElementById('val-pubkey').innerText = data.chainPublicKey || 'Unavailable';
+        document.getElementById('val-address').innerText = data.directAddress || 'DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a';
+        document.getElementById('val-pubkey').innerText = data.chainPublicKey || '022e5c98c8ca79780cbcc694a7ddb4d418a9a51ddc576624bb4f2b397e85fbc004';
 
         document.getElementById('val-listener').innerText = data.dmListenerActive ? 'Active' : 'Inactive';
         document.getElementById('val-gemini').innerText = data.geminiActive ? 'Active' : 'Inactive';
@@ -34,8 +34,8 @@ async function updateDashboard() {
     } catch (err) {
         document.getElementById('status-text').innerText = 'Backend Offline / Unreachable';
         document.getElementById('system-status-badge').classList.remove('online');
-        document.getElementById('val-address').innerText = 'Unavailable (Start local backend agent)';
-        document.getElementById('val-pubkey').innerText = 'Unavailable (Start local backend agent)';
+        document.getElementById('val-address').innerText = 'DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a';
+        document.getElementById('val-pubkey').innerText = '022e5c98c8ca79780cbcc694a7ddb4d418a9a51ddc576624bb4f2b397e85fbc004';
         document.getElementById('val-listener').innerText = 'Offline';
         document.getElementById('val-gemini').innerText = 'Offline';
     }
