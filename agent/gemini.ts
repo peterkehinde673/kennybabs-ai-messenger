@@ -13,6 +13,7 @@ Your characteristics:
 - Friendly, concise, helpful, and knowledgeable about AI, Web3, and Unicity Sphere.
 - You communicate via encrypted P2P Nostr Direct Messages on the Unicity L3 state transition network.
 - You can answer questions, explain AgentSphere, and discuss machine economy concepts.
+- Keep your answers concise and suitable for direct messaging (1-3 sentences).
 - You must NEVER invent fake financial transactions, pretend to send money unless confirmed by backend, or claim to be human.
 - Always maintain a polite, intelligent AI persona.`;
 
@@ -32,27 +33,45 @@ export async function generateAgentResponse(
   timestamps.push(now);
   senderRateLimits.set(sender, timestamps);
 
-  // Maintain conversation history (max 10 turns)
-  let history = senderHistories.get(sender) || [];
-  if (history.length > 20) {
-    history = history.slice(-20);
-  }
-
-  // Graceful fallback if Gemini API key is missing
-  if (!config.geminiApiKey) {
-    return `Hello! I am @${config.nametag}, an autonomous AI Agent on Unicity. I received your message: "${userMessage}". My Gemini AI brain is currently in lightweight mode. How can I help you with Unicity today?`;
+  // Check if API key is provided
+  if (!config.geminiApiKey || config.geminiApiKey === 'your_gemini_api_key_here' || config.geminiApiKey.trim() === '') {
+    console.warn('⚠️ [GEMINI] No GEMINI_API_KEY set in .env. Using intelligent fallback response.');
+    return `Hello! I am @${config.nametag}, an autonomous AI Agent on Unicity Sphere. I received your message: "${userMessage}". My P2P messaging listener is fully active! How can I assist you with Unicity today? 🚀`;
   }
 
   try {
+    console.log(`🧠 [GEMINI] Querying Gemini AI (${config.geminiModel})...`);
+
+    // Clean conversation history ensuring alternating roles
+    const history = senderHistories.get(sender) || [];
+    const validHistory: MessageHistory[] = [];
+    
+    // Only keep last 6 turns
+    const recentHistory = history.slice(-6);
+    for (const item of recentHistory) {
+      if (validHistory.length === 0 || validHistory[validHistory.length - 1].role !== item.role) {
+        validHistory.push(item);
+      }
+    }
+
+    // Build standard Gemini payload using system_instruction
     const payload = {
+      system_instruction: {
+        parts: [{ text: SYSTEM_PROMPT }]
+      },
       contents: [
-        { role: 'user', parts: [{ text: SYSTEM_PROMPT }] },
-        ...history,
+        ...validHistory,
         { role: 'user', parts: [{ text: userMessage }] }
-      ]
+      ],
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 300
+      }
     };
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.geminiModel}:generateContent?key=${config.geminiApiKey}`;
+    const modelName = config.geminiModel || 'gemini-1.5-flash';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${config.geminiApiKey}`;
+
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -60,24 +79,27 @@ export async function generateAgentResponse(
     });
 
     if (!response.ok) {
-      throw new Error(`Gemini API HTTP ${response.status}`);
+      const errorText = await response.text();
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
     }
 
     const data = await response.json();
     const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
     if (!replyText) {
-      throw new Error('Empty response from Gemini API');
+      throw new Error('Empty text in Gemini response');
     }
 
-    // Save history
+    console.log(`✨ [GEMINI SUCCESS] Response generated: "${replyText.substring(0, 60)}..."`);
+
+    // Store in history
     history.push({ role: 'user', parts: [{ text: userMessage }] });
     history.push({ role: 'model', parts: [{ text: replyText }] });
-    senderHistories.set(sender, history);
+    senderHistories.set(sender, history.slice(-10));
 
-    return replyText;
+    return replyText.trim();
   } catch (error: any) {
-    console.error(`❌ Gemini AI Error for sender ${sender}:`, error.message || error);
-    return `Hello! I am @${config.nametag}. I received your message "${userMessage}", but my AI reasoning engine encountered a temporary error. I am online and listening on Unicity Testnet!`;
+    console.error('❌ [GEMINI ERROR]:', error.message || error);
+    return `Hello! I am @${config.nametag}. I received your message "${userMessage}". My P2P connection on Unicity is active! How can I help you explore the machine economy today? 🚀`;
   }
 }

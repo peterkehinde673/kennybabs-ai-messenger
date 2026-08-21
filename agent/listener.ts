@@ -7,15 +7,30 @@ const processedMessageIds = new Set<string>();
 export function setupDMListener(sphere: any, config: AgentConfig, directAddress: string): void {
   console.log('📡 Subscribing to Unicity Nostr P2P relays...');
 
-  const handleIncomingMessage = async (msg: any) => {
+  const handleIncomingMessage = async (msg: any, rawData?: any) => {
     try {
-      if (!msg) return;
+      const payload = msg || rawData;
+      if (!payload) return;
 
-      const sender = msg.sender || msg.from || msg.pubkey || 'unknown';
-      const senderText = msg.text || msg.content || msg.message || (typeof msg === 'string' ? msg : JSON.stringify(msg));
-      const msgId = msg.id || `${sender}-${Date.now()}`;
+      console.log('🔍 [RAW NOSTR EVENT DETECTED]:', typeof payload === 'object' ? JSON.stringify(payload).substring(0, 150) : payload);
 
-      // Deduplication
+      // Extract sender and content across all SDK formats
+      let sender = payload.sender || payload.from || payload.pubkey || payload.author || 'unknown';
+      let senderText = payload.text || payload.content || payload.message || payload.memo || '';
+
+      if (typeof payload === 'string') {
+        senderText = payload;
+      } else if (payload.data && typeof payload.data === 'object') {
+        sender = payload.data.sender || payload.data.from || sender;
+        senderText = payload.data.text || payload.data.content || payload.data.memo || senderText;
+      }
+
+      if (!senderText) {
+        console.log('⚠️ Event received but no text payload found.');
+        return;
+      }
+
+      const msgId = payload.id || `${sender}-${senderText.substring(0, 10)}-${Date.now()}`;
       if (processedMessageIds.has(msgId)) return;
       processedMessageIds.add(msgId);
       if (processedMessageIds.size > 1000) {
@@ -23,17 +38,15 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
         if (first) processedMessageIds.delete(first);
       }
 
-      const isSelf = sender === directAddress || sender === `@${config.nametag}` || sender.includes('0000dca8924d');
-
       console.log(`\n======================================================`);
-      console.log(`📩 [${isSelf ? 'SELF-TEST DM' : 'INCOMING DM'} RECEIVED]`);
+      console.log(`📩 [INCOMING DM RECEIVED]`);
       console.log(`- From:    ${sender}`);
       console.log(`- Content: "${senderText}"`);
       console.log(`- Time:    ${new Date().toLocaleTimeString()}`);
       console.log(`======================================================`);
 
       pushEvent({
-        type: isSelf ? 'self_test_dm' : 'incoming_dm',
+        type: 'incoming_dm',
         sender: sender,
         text: senderText,
         timestamp: new Date().toISOString()
@@ -42,9 +55,9 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       updateDMStats(true);
 
       // Generate AI response
-      console.log('🧠 Querying Gemini AI for response...');
+      console.log('🧠 Generating Gemini AI response...');
       const replyText = await generateAgentResponse(sender, senderText, config);
-      console.log(`💬 AI Response generated: "${replyText.substring(0, 80)}..."`);
+      console.log(`💬 AI Reply: "${replyText.substring(0, 90)}..."`);
 
       // Send response back
       let sent = false;
@@ -81,26 +94,34 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
     }
   };
 
-  // Register on all possible Unicity SDK event channels
-  if (sphere.communications && typeof sphere.communications.onDirectMessage === 'function') {
-    sphere.communications.onDirectMessage(handleIncomingMessage);
-  }
-  if (sphere.communications && typeof sphere.communications.on === 'function') {
-    sphere.communications.on('message:incoming', handleIncomingMessage);
-    sphere.communications.on('direct-message', handleIncomingMessage);
-    sphere.communications.on('dm', handleIncomingMessage);
-  }
-  if (sphere.transport && typeof sphere.transport.on === 'function') {
-    sphere.transport.on('message:incoming', handleIncomingMessage);
-    sphere.transport.on('direct-message', handleIncomingMessage);
-  }
-  if (typeof sphere.on === 'function') {
-    sphere.on('message:incoming', handleIncomingMessage);
-    sphere.on('direct-message', handleIncomingMessage);
-    sphere.on('dm', handleIncomingMessage);
+  // Register listeners on all available event layers in Sphere SDK
+  const targets = [sphere, sphere.communications, sphere.transport, sphere.wallet].filter(Boolean);
+  const eventNames = [
+    'message:incoming',
+    'message',
+    'dm',
+    'direct-message',
+    'communications:message',
+    'transfer:incoming',
+    'event',
+    'data'
+  ];
+
+  for (const target of targets) {
+    for (const ev of eventNames) {
+      if (typeof target.on === 'function') {
+        target.on(ev, (data: any, extra: any) => handleIncomingMessage(data, extra));
+      }
+    }
+    if (typeof target.onDirectMessage === 'function') {
+      target.onDirectMessage((data: any) => handleIncomingMessage(data));
+    }
+    if (typeof target.onMessage === 'function') {
+      target.onMessage((data: any) => handleIncomingMessage(data));
+    }
   }
 
-  // Live Heartbeat every 30s to show active connection
+  // Live Heartbeat every 30s
   setInterval(() => {
     console.log(`💓 [HEARTBEAT ${new Date().toLocaleTimeString()}] Live on Unicity Nostr relay. Listening for DMs to @${config.nametag}...`);
   }, 30000);
