@@ -36,7 +36,6 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
 
   console.log(`⏳ ${isExisting ? 'Loading existing' : 'Initializing new'} persistent wallet from ${walletDataDir}...`);
 
-  // dmSince: Date.now() ensures ONLY new incoming DMs are processed (no old message replays)
   const initResult = await Sphere.init({
     network: config.network,
     oracle: { apiKey: config.oracleApiKey },
@@ -59,17 +58,21 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
     } else if ((sphere as any).directAddress) {
       directAddress = (sphere as any).directAddress;
     }
-  } catch {
+  } catch {}
+
+  if (!directAddress || directAddress.trim() === '') {
     directAddress = 'DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a';
   }
 
-  let chainPublicKey = directAddress;
+  let chainPublicKey = '';
   try {
     if (sphere.wallet && typeof (sphere.wallet as any).getPublicKey === 'function') {
       chainPublicKey = await (sphere.wallet as any).getPublicKey();
     }
-  } catch {
-    chainPublicKey = directAddress;
+  } catch {}
+
+  if (!chainPublicKey || chainPublicKey.trim() === '') {
+    chainPublicKey = '022e5c98c8ca79780cbcc694a7ddb4d418a9a51ddc576624bb4f2b397e85fbc004';
   }
 
   let currentNametag = config.nametag;

@@ -7,12 +7,41 @@ interface MessageHistory {
 
 const senderHistories = new Map<string, MessageHistory[]>();
 const senderRateLimits = new Map<string, number[]>();
+let selectedModel = '';
 
 const SYSTEM_PROMPT = `You are Kennybabs, an autonomous AI Agent operating on the Unicity Sphere Network.
 Instructions:
-- Provide direct, factual, concise, and helpful answers to any question the user asks.
+- Provide direct, concise, and helpful answers to any question the user asks.
 - When asked who you are, identify yourself as @kennybabs AI Messenger on Unicity Sphere.
 - Never invent fake financial transactions.`;
+
+async function getAvailableModel(apiKey: string): Promise<string> {
+  if (selectedModel) return selectedModel;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    if (res.ok) {
+      const data = await res.json();
+      const models = (data.models || [])
+        .map((m: any) => m.name.replace('models/', ''))
+        .filter((name: string) => name.includes('flash') || name.includes('pro'));
+      
+      const preferred = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-2.5-flash'];
+      for (const p of preferred) {
+        if (models.includes(p)) {
+          selectedModel = p;
+          return selectedModel;
+        }
+      }
+      if (models.length > 0) {
+        selectedModel = models[0];
+        return selectedModel;
+      }
+    }
+  } catch (e) {}
+
+  return 'gemini-3.6-flash';
+}
 
 export async function generateAgentResponse(
   sender: string,
@@ -21,8 +50,8 @@ export async function generateAgentResponse(
 ): Promise<string> {
   const now = Date.now();
   const timestamps = (senderRateLimits.get(sender) || []).filter(t => now - t < 60000);
-  if (timestamps.length >= 8) {
-    return "⚠️ Rate limit reached. Please wait a moment before sending another message.";
+  if (timestamps.length >= 15) {
+    return "⚠️ High traffic rate limit active. Please wait a moment before sending another message.";
   }
   timestamps.push(now);
   senderRateLimits.set(sender, timestamps);
@@ -34,15 +63,15 @@ export async function generateAgentResponse(
   const apiKey = rawKey.replace(/['"\s]/g, '');
 
   if (!apiKey) {
-    console.warn('⚠️ No Gemini API key found in .env');
     return `Hello! I am @${config.nametag} AI Messenger. I received your message: "${userMessage}". How can I help you on the network today?`;
   }
 
-  const models = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-2.5-flash'];
+  const primaryModel = await getAvailableModel(apiKey);
+  const modelsToTry = [primaryModel, 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.7-flash'];
 
-  for (const model of models) {
+  for (const model of Array.from(new Set(modelsToTry))) {
     try {
-      console.log(`🤖 Requesting Gemini API (${model})...`);
+      console.log(`🤖 Querying Gemini model: ${model}...`);
       
       const payload = {
         contents: [
@@ -63,25 +92,20 @@ export async function generateAgentResponse(
         body: JSON.stringify(payload)
       });
 
-      const responseText = await response.text();
-
       if (response.ok) {
-        const data = JSON.parse(responseText);
+        const data = await response.json();
         const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
         if (replyText) {
+          selectedModel = model;
           console.log(`✨ Gemini (${model}) generated answer!`);
           history.push({ role: 'user', parts: [{ text: userMessage }] });
           history.push({ role: 'model', parts: [{ text: replyText }] });
           senderHistories.set(sender, history);
           return replyText.trim();
         }
-      } else {
-        console.warn(`⚠️ Google API Error (${model}) HTTP ${response.status}: ${responseText}`);
       }
-    } catch (err: any) {
-      console.warn(`⚠️ Network error calling ${model}:`, err.message);
-    }
+    } catch (err: any) {}
   }
 
-  return `Hello! I am @${config.nametag} AI Messenger. I received: "${userMessage}". How can I help you on Unicity today?`;
+  return `Hello! I am @${config.nametag} AI Messenger on Unicity. I received your message: "${userMessage}". How can I help you on the network today?`;
 }

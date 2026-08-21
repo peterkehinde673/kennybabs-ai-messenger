@@ -12,13 +12,30 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       const payload = msg || extra;
       if (!payload) return;
 
-      let sender = payload.sender || payload.from || payload.pubkey || payload.author || (payload.data && payload.data.sender) || '';
-      let senderText = payload.text || payload.content || payload.message || payload.memo || (payload.data && payload.data.text) || '';
+      // Extract sender across all possible fields
+      let rawSender = payload.senderNametag || payload.sender || payload.from || payload.pubkey || payload.author || (payload.data && (payload.data.senderNametag || payload.data.sender || payload.data.from)) || '';
+      if (typeof rawSender !== 'string') rawSender = String(rawSender || '');
+      rawSender = rawSender.trim();
 
+      // Extract message text
+      let senderText = payload.text || payload.content || payload.message || payload.memo || (payload.data && payload.data.text) || '';
       if (typeof payload === 'string') senderText = payload;
       if (!senderText || typeof senderText !== 'string' || senderText.trim().length === 0) return;
 
-      const msgId = payload.id || `${sender}-${senderText.substring(0, 15)}-${payload.timestamp || Date.now()}`;
+      // Skip invalid senders
+      if (!rawSender || rawSender === '@' || rawSender === 'unknown' || rawSender === directAddress) {
+        return;
+      }
+
+      // Format recipient correctly
+      let replyTarget = rawSender;
+      if (!replyTarget.startsWith('@') && !replyTarget.startsWith('DIRECT://') && !replyTarget.startsWith('0x') && !replyTarget.startsWith('un1')) {
+        replyTarget = `@${replyTarget}`;
+      }
+
+      if (replyTarget === '@') return;
+
+      const msgId = payload.id || `${replyTarget}-${senderText.substring(0, 15)}-${payload.timestamp || Date.now()}`;
       if (processedMessageIds.has(msgId)) return;
       processedMessageIds.add(msgId);
       if (processedMessageIds.size > 1000) {
@@ -28,29 +45,23 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
 
       console.log(`\n======================================================`);
       console.log(`📩 [INCOMING DM RECEIVED]`);
-      console.log(`- From:    ${sender || 'Direct Address'}`);
+      console.log(`- From:    ${replyTarget}`);
       console.log(`- Content: "${senderText}"`);
       console.log(`- Time:    ${new Date().toLocaleTimeString()}`);
       console.log(`======================================================`);
 
       pushEvent({
         type: 'incoming_dm',
-        sender: sender || 'Unicity User',
+        sender: replyTarget,
         text: senderText,
         timestamp: new Date().toISOString()
       });
 
       updateDMStats(true);
 
-      // Normalize recipient address (ensures nametags have '@')
-      let replyTarget = sender;
-      if (!replyTarget.startsWith('@') && !replyTarget.startsWith('DIRECT://') && !replyTarget.startsWith('0x') && replyTarget.length < 50) {
-        replyTarget = `@${replyTarget}`;
-      }
-
-      // Generate AI response with Gemini
+      // Generate AI response
       const replyText = await generateAgentResponse(replyTarget, senderText, config);
-      console.log(`💬 Gemini AI Reply:\n"${replyText}"\n`);
+      console.log(`💬 AI Reply to deliver:\n"${replyText}"\n`);
 
       // Deliver response back via P2P DM
       let sent = false;
