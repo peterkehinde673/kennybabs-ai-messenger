@@ -1,5 +1,3 @@
-import path from 'path';
-import fs from 'fs';
 import { AgentConfig } from './config.js';
 import { generateAgentResponse } from './gemini.js';
 import { updateDMStats, pushEvent } from './server.js';
@@ -11,49 +9,52 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
   console.log('📡 Registering official Sphere direct-message listener...');
 
   if (!sphere.communications || typeof sphere.communications.onDirectMessage !== 'function') {
-    throw new Error('FATAL: sphere.communications.onDirectMessage is not supported by the installed Sphere SDK.');
+    throw new Error('FATAL: sphere.communications.onDirectMessage is not available on the installed Sphere SDK.');
   }
 
-  // Single official listener hook
+  // Exactly ONE official direct-message listener hook
   sphere.communications.onDirectMessage(async (msg: any) => {
+    if (!msg) return;
+
+    const rawSender = msg.senderNametag || msg.sender || msg.from || '';
+    const senderText = msg.content || msg.text || msg.message || '';
+
+    if (!senderText || typeof senderText !== 'string' || senderText.trim().length === 0) return;
+
+    let replyTarget = (rawSender || '').trim();
+    if (!replyTarget || replyTarget === '@' || replyTarget === 'unknown') return;
+
+    // Normalize nametag format
+    if (!replyTarget.startsWith('@') && !replyTarget.startsWith('DIRECT://') && !replyTarget.startsWith('0x') && !replyTarget.startsWith('un1')) {
+      replyTarget = `@${replyTarget}`;
+    }
+
+    // Ignore self-messages
+    if (replyTarget === `@${config.nametag}` || replyTarget === directAddress) {
+      return;
+    }
+
+    // Deterministic deduplication key
+    const msgId = msg.id || `${replyTarget}:${msg.timestamp || ''}:${senderText.trim()}`;
+
+    if (processedMessageIds.has(msgId) || inFlightMessageIds.has(msgId)) {
+      console.log(`[DUPLICATE DM IGNORED] Message ID: ${msgId}`);
+      return;
+    }
+
+    // Task 1: Acquire in-flight lock
+    inFlightMessageIds.add(msgId);
+
+    const timestamp = new Date().toLocaleTimeString();
+    console.log(`\n========================================`);
+    console.log(`[INCOMING DM]`);
+    console.log(`Sender:     ${replyTarget}`);
+    console.log(`Timestamp:  ${timestamp}`);
+    console.log(`Message ID: ${msgId}`);
+    console.log(`Content:    "${senderText}"`);
+    console.log(`========================================`);
+
     try {
-      if (!msg) return;
-
-      const rawSender = msg.senderNametag || msg.sender || msg.from || '';
-      const senderText = msg.content || msg.text || msg.message || '';
-
-      if (!senderText || typeof senderText !== 'string' || senderText.trim().length === 0) return;
-
-      let replyTarget = (rawSender || '').trim();
-      if (!replyTarget || replyTarget === '@' || replyTarget === 'unknown') return;
-
-      if (!replyTarget.startsWith('@') && !replyTarget.startsWith('DIRECT://') && !replyTarget.startsWith('0x') && !replyTarget.startsWith('un1')) {
-        replyTarget = `@${replyTarget}`;
-      }
-
-      // Ignore self-messages
-      if (replyTarget === `@${config.nametag}` || replyTarget === directAddress) {
-        return;
-      }
-
-      // Strict message ID deduplication and in-flight lock
-      const msgId = msg.id || `${replyTarget}:${msg.timestamp || ''}:${senderText.substring(0, 20)}`;
-      if (processedMessageIds.has(msgId) || inFlightMessageIds.has(msgId)) {
-        console.log(`[DUPLICATE DM IGNORED] Message ID: ${msgId}`);
-        return;
-      }
-
-      inFlightMessageIds.add(msgId);
-
-      const timestamp = new Date().toLocaleTimeString();
-      console.log(`\n========================================`);
-      console.log(`[INCOMING DM]`);
-      console.log(`Sender:     ${replyTarget}`);
-      console.log(`Timestamp:  ${timestamp}`);
-      console.log(`Message ID: ${msgId}`);
-      console.log(`Content:    "${senderText}"`);
-      console.log(`========================================`);
-
       pushEvent({
         type: 'incoming_dm',
         sender: replyTarget,
@@ -62,13 +63,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       });
       updateDMStats(true);
 
-      // Persist timestamp of latest processed message
-      try {
-        const lastTimestampFile = path.join(config.dataDir, 'last_dm_timestamp.json');
-        fs.writeFileSync(lastTimestampFile, JSON.stringify({ timestamp: Math.floor(Date.now() / 1000) }, null, 2));
-      } catch {}
-
-      // Prompt Gemini AI
+      // Generate AI response
       const replyText = await generateAgentResponse(replyTarget, senderText, config);
 
       // Bounded retry loop (Attempt 1/3 -> 2/3 -> 3/3)
@@ -95,22 +90,24 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
             timestamp: new Date().toISOString()
           });
         } catch (err: any) {
-          console.warn(`⚠️ Delivery attempt ${attempt} warning: ${err.message || err}`);
+          console.warn(`⚠️ Attempt ${attempt} failed: ${err.message || err}`);
           if (attempt < maxAttempts) {
             await new Promise(r => setTimeout(r, 2000 * attempt));
           }
         }
       }
 
-      // Mark completed & release in-flight lock
+      // Mark message as processed
       processedMessageIds.add(msgId);
-      inFlightMessageIds.delete(msgId);
       if (processedMessageIds.size > 2000) {
         const first = processedMessageIds.values().next().value;
         if (first) processedMessageIds.delete(first);
       }
     } catch (err: any) {
-      console.error('❌ Unhandled error processing incoming DM:', err.message || err);
+      console.error('❌ Unhandled error in DM handler:', err.message || err);
+    } finally {
+      // Task 1: Guaranteed in-flight lock release regardless of success or failure
+      inFlightMessageIds.delete(msgId);
     }
   });
 
