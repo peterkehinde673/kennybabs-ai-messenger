@@ -8,12 +8,12 @@ async function updateDashboard() {
         document.getElementById('system-status-badge').classList.add('online');
 
         document.getElementById('val-nametag').innerText = '@' + (data.nametag || 'kennybabs');
-        document.getElementById('val-network').innerText = data.network || 'Unicity Testnet2';
-        document.getElementById('val-address').innerText = data.directAddress || 'DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a';
-        document.getElementById('val-pubkey').innerText = data.chainPublicKey || '022e5c98c8ca79780cbcc694a7ddb4d418a9a51ddc576624bb4f2b397e85fbc004';
+        document.getElementById('val-network').innerText = data.network || 'testnet2';
+        document.getElementById('val-address').innerText = data.directAddress || 'Unavailable';
+        document.getElementById('val-pubkey').innerText = data.chainPublicKey || 'Unavailable';
 
         document.getElementById('val-listener').innerText = data.dmListenerActive ? 'Active' : 'Inactive';
-        document.getElementById('val-gemini').innerText = data.geminiActive ? 'Active' : 'Fallback Mode';
+        document.getElementById('val-gemini').innerText = data.geminiActive ? 'Active' : 'Inactive';
         document.getElementById('val-incoming').innerText = data.totalIncomingDms;
         document.getElementById('val-outgoing').innerText = data.totalOutgoingDms;
 
@@ -28,8 +28,12 @@ async function updateDashboard() {
             stream.innerHTML = '<div class="event-item">No DM events recorded yet. Send a DM to @kennybabs on Sphere wallet!</div>';
         }
     } catch (err) {
-        document.getElementById('status-text').innerText = 'Backend Online (Public)';
-        document.getElementById('system-status-badge').classList.add('online');
+        document.getElementById('status-text').innerText = 'Backend Offline / Unreachable';
+        document.getElementById('system-status-badge').classList.remove('online');
+        document.getElementById('val-address').innerText = 'Unavailable (Start local agent)';
+        document.getElementById('val-pubkey').innerText = 'Unavailable (Start local agent)';
+        document.getElementById('val-listener').innerText = 'Offline';
+        document.getElementById('val-gemini').innerText = 'Offline';
     }
 }
 

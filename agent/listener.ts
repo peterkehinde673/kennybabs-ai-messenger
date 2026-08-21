@@ -5,26 +5,20 @@ import { updateDMStats, pushEvent } from './server.js';
 const processedMessageIds = new Set<string>();
 
 export function setupDMListener(sphere: any, config: AgentConfig, directAddress: string): void {
-  console.log('📡 Subscribing to Unicity Nostr P2P relays and Mailbox queue...');
+  console.log('📡 Subscribing to Unicity Nostr P2P relays...');
 
-  const handleIncomingMessage = async (msg: any, extra?: any) => {
+  const handleIncomingMessage = async (msg: any) => {
     try {
-      const payload = msg || extra;
-      if (!payload) return;
+      if (!msg) return;
 
-      // Extract sender & text across all event structures
-      let sender = payload.sender || payload.from || payload.pubkey || payload.author || (payload.data && payload.data.sender) || '';
-      let senderText = payload.text || payload.content || payload.message || payload.memo || (payload.data && payload.data.text) || '';
-
-      if (typeof payload === 'string') {
-        senderText = payload;
-      }
+      const sender = msg.senderNametag || msg.sender || msg.from || (msg.data && msg.data.sender) || '';
+      const senderText = msg.content || msg.text || msg.message || (msg.data && msg.data.text) || (typeof msg === 'string' ? msg : '');
 
       if (!senderText || typeof senderText !== 'string' || senderText.trim().length === 0) {
         return;
       }
 
-      const msgId = payload.id || `${sender}-${senderText.substring(0, 15)}-${payload.timestamp || Date.now()}`;
+      const msgId = msg.id || `${sender}-${senderText.substring(0, 15)}-${Date.now()}`;
       if (processedMessageIds.has(msgId)) return;
       processedMessageIds.add(msgId);
       if (processedMessageIds.size > 1000) {
@@ -48,12 +42,13 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
 
       updateDMStats(true);
 
-      // Generate AI response with Gemini
+      // Generate AI response
       const replyTarget = sender || directAddress;
       const replyText = await generateAgentResponse(replyTarget, senderText, config);
-      console.log(`💬 Gemini AI Reply:\n"${replyText}"\n`);
 
-      // Deliver response back via P2P DM
+      console.log(`[AI RESPONSE] Target: ${replyTarget}\n"${replyText}"\n`);
+
+      // Send reply
       let sent = false;
       let attempts = 0;
       while (!sent && attempts < 3) {
@@ -66,7 +61,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
             await sphere.sendDM(replyTarget, replyText);
           }
           sent = true;
-          console.log(`✅ [DM SENT] Auto-reply delivered to ${replyTarget}!`);
+          console.log(`✅ [DM SENT] Auto-reply successfully delivered to ${replyTarget}!`);
 
           updateDMStats(false);
 
@@ -84,45 +79,33 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
         }
       }
     } catch (err: any) {
-      console.error('❌ Error handling incoming message:', err.message || err);
+      console.error('❌ Error handling incoming DM:', err.message || err);
     }
   };
 
-  // 1. Wire all event hooks on sphere and communications
-  const eventTargets = [sphere, sphere.communications, sphere.transport, sphere.wallet].filter(Boolean);
-  const eventNames = ['message:incoming', 'message', 'dm', 'direct-message', 'communications:message', 'transfer:incoming'];
-
-  for (const target of eventTargets) {
-    for (const ev of eventNames) {
-      if (typeof target.on === 'function') {
-        target.on(ev, (data: any, extra: any) => handleIncomingMessage(data, extra));
-      }
-    }
-    if (typeof target.onDirectMessage === 'function') {
-      target.onDirectMessage((data: any) => handleIncomingMessage(data));
-    }
+  if (sphere.communications && typeof sphere.communications.onDirectMessage === 'function') {
+    sphere.communications.onDirectMessage(handleIncomingMessage);
+  }
+  if (sphere.communications && typeof sphere.communications.on === 'function') {
+    sphere.communications.on('message:incoming', handleIncomingMessage);
+  }
+  if (typeof sphere.on === 'function') {
+    sphere.on('message:incoming', handleIncomingMessage);
   }
 
-  // 2. Active Mailbox Polling & Sync Loop (Drains web wallet messages every 3s)
+  // Periodic Mailbox & Transport sync
   setInterval(async () => {
     try {
       if (sphere.receive && typeof sphere.receive === 'function') {
         await sphere.receive();
-      } else if (sphere.sync && typeof sphere.sync === 'function') {
-        await sphere.sync();
       }
-      if (sphere.communications && typeof sphere.communications.sync === 'function') {
-        await sphere.communications.sync();
-      }
-    } catch (e) {
-      // Background sync tick
-    }
-  }, 3000);
+    } catch {}
+  }, 4000);
 
-  // 3. Heartbeat every 30s
+  // Heartbeat every 30s
   setInterval(() => {
     console.log(`💓 [HEARTBEAT ${new Date().toLocaleTimeString()}] Live on Unicity Testnet2. Listening for DMs to @${config.nametag}...`);
   }, 30000);
 
-  console.log('✅ Real Unicity DM & Mailbox listener active on all channels.');
+  console.log('✅ Real Unicity DM Listener is active and listening on Nostr relays.');
 }

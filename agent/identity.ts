@@ -9,7 +9,6 @@ export interface WalletIdentity {
   sphere: any;
   directAddress: string;
   chainPublicKey: string;
-  transportPublicKey: string;
   nametag: string;
   isExisting: boolean;
 }
@@ -26,7 +25,6 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
 
   const baseProviders = createNodeProviders({
     network: config.network,
-    oracleApiKey: config.oracleApiKey,
     storage
   } as any);
 
@@ -38,48 +36,54 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
 
   console.log(`⏳ ${isExisting ? 'Loading existing' : 'Initializing new'} persistent wallet from ${walletDataDir}...`);
 
-  let sphere: any = null;
-  let lastError: any = null;
-  const maxAttempts = 3;
+  const initResult = await Sphere.init({
+    network: config.network,
+    oracle: { apiKey: config.oracleApiKey },
+    ...providers,
+    autoGenerate: false,
+    mnemonic: config.mnemonic,
+    dmSince: Math.floor(Date.now() / 1000) - 3600
+  });
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      if (attempt > 1) {
-        console.log(`🔄 Nostr Transport retry attempt ${attempt}/${maxAttempts}...`);
-      }
-      sphere = await Sphere.init({
-        network: config.network,
-        oracle: { apiKey: config.oracleApiKey },
-        ...providers,
-        autoGenerate: false,
-        mnemonic: config.mnemonic
-      });
-      break;
-    } catch (err: any) {
-      lastError = err;
-      console.warn(`⚠️ Transport connection attempt ${attempt} failed: ${err.message || err}`);
-      if (attempt < maxAttempts) {
-        console.log(`⏱️ Waiting 4 seconds before reconnecting...`);
-        await new Promise(r => setTimeout(r, 4000));
-      }
+  const sphere = (initResult as any).sphere || initResult;
+
+  let directAddress = '';
+  try {
+    if (typeof (sphere as any).getAddress === 'function') {
+      directAddress = await (sphere as any).getAddress();
+    } else if (sphere.wallet && typeof (sphere.wallet as any).getAddress === 'function') {
+      directAddress = await (sphere.wallet as any).getAddress();
+    } else if (sphere.wallet && typeof (sphere.wallet as any).getPublicKey === 'function') {
+      directAddress = await (sphere.wallet as any).getPublicKey();
+    } else if ((sphere as any).directAddress) {
+      directAddress = (sphere as any).directAddress;
     }
+  } catch {
+    directAddress = 'DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a';
   }
 
-  if (!sphere) {
-    throw lastError || new Error('Failed to initialize Sphere after multiple transport attempts.');
+  let chainPublicKey = directAddress;
+  try {
+    if (sphere.wallet && typeof (sphere.wallet as any).getPublicKey === 'function') {
+      chainPublicKey = await (sphere.wallet as any).getPublicKey();
+    }
+  } catch {
+    chainPublicKey = directAddress;
   }
 
-  // Exact keys from your Sphere Wallet settings
-  const directAddress = "DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a";
-  const chainPublicKey = "022e5c98c8ca79780cbcc694a7ddb4d418a9a51ddc576624bb4f2b397e85fbc004";
-  const transportPublicKey = "2e5c98c8ca79780cbcc694a7ddb4d418a9a51ddc576624bb4f2b397e85fbc004";
+  let currentNametag = config.nametag;
+  try {
+    if (sphere.wallet && typeof (sphere.wallet as any).getNametag === 'function') {
+      const registered = await (sphere.wallet as any).getNametag();
+      if (registered) currentNametag = registered;
+    }
+  } catch {}
 
   return {
     sphere,
     directAddress,
     chainPublicKey,
-    transportPublicKey,
-    nametag: config.nametag,
+    nametag: currentNametag,
     isExisting
   };
 }
