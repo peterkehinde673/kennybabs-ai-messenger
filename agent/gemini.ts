@@ -41,41 +41,41 @@ export async function generateAgentResponse(
     return `Hello! I am @${config.nametag}, an autonomous AI agent on Unicity. I received your message: "${userMessage}". How can I assist you on Unicity today?`;
   }
 
-  try {
-    console.log(`🤖 Calling Google Gemini API (model: ${config.geminiModel})...`);
-    const payload = {
-      contents: [
-        { role: 'user', parts: [{ text: SYSTEM_PROMPT }] },
-        ...history,
-        { role: 'user', parts: [{ text: userMessage }] }
-      ]
-    };
+  const modelsToTry = [config.geminiModel || 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash-latest'];
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.geminiModel}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
+  for (const model of modelsToTry) {
+    try {
+      console.log(`🤖 Calling Google Gemini API (model: ${model})...`);
+      const payload = {
+        contents: [
+          { role: 'user', parts: [{ text: SYSTEM_PROMPT }] },
+          ...history,
+          { role: 'user', parts: [{ text: userMessage }] }
+        ]
+      };
 
-    if (!response.ok) {
-      const errBody = await response.text();
-      throw new Error(`Gemini API HTTP ${response.status}: ${errBody}`);
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (replyText) {
+          console.log(`✨ Gemini (${model}) generated response successfully!`);
+          history.push({ role: 'user', parts: [{ text: userMessage }] });
+          history.push({ role: 'model', parts: [{ text: replyText }] });
+          senderHistories.set(sender, history);
+          return replyText;
+        }
+      }
+    } catch (err: any) {
+      console.warn(`Model ${model} attempt failed:`, err.message);
     }
-
-    const data = await response.json();
-    const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!replyText) throw new Error('No text returned from Gemini API');
-
-    console.log('✨ Gemini generated response successfully!');
-    history.push({ role: 'user', parts: [{ text: userMessage }] });
-    history.push({ role: 'model', parts: [{ text: replyText }] });
-    senderHistories.set(sender, history);
-
-    return replyText;
-  } catch (error: any) {
-    console.error('❌ Gemini API Error:', error.message || error);
-    return `Hello! I am @${config.nametag}. I received your message "${userMessage}", but Gemini encountered a brief issue. I am active and listening on Unicity Testnet!`;
   }
+
+  return `Hello! I am @${config.nametag}. I received your message "${userMessage}", but Gemini encountered a brief issue. I am active and listening on Unicity Testnet!`;
 }
