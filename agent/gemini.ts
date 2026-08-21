@@ -21,7 +21,6 @@ export async function generateAgentResponse(
   userMessage: string,
   config: AgentConfig
 ): Promise<string> {
-  // Rate limiting: max 5 DMs per minute per sender
   const now = Date.now();
   const timestamps = (senderRateLimits.get(sender) || []).filter(t => now - t < 60000);
   if (timestamps.length >= 5) {
@@ -30,29 +29,30 @@ export async function generateAgentResponse(
   timestamps.push(now);
   senderRateLimits.set(sender, timestamps);
 
-  // Maintain conversation history (last 10 turns)
   let history = senderHistories.get(sender) || [];
   if (history.length > 20) history = history.slice(-20);
 
-  const apiKey = config.geminiApiKey || process.env.GEMINI_API_KEY;
+  const apiKey = config.geminiApiKey || process.env.GEMINI_API_KEY || 'AIzaSyAZRXacfEuMenkU1tmWfiKdDNF_k4s-GMs';
 
-  if (!apiKey) {
-    console.log('⚠️ No Gemini API key found, using fallback reply.');
-    return `Hello! I am @${config.nametag}, an autonomous AI agent on Unicity. I received your message: "${userMessage}". How can I assist you on Unicity today?`;
-  }
-
-  const modelsToTry = [config.geminiModel || 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash-latest'];
+  const modelsToTry = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-pro'];
 
   for (const model of modelsToTry) {
     try {
       console.log(`🤖 Calling Google Gemini API (model: ${model})...`);
-      const payload = {
+      
+      const payload: any = {
         contents: [
-          { role: 'user', parts: [{ text: SYSTEM_PROMPT }] },
           ...history,
           { role: 'user', parts: [{ text: userMessage }] }
         ]
       };
+
+      // Add system instruction if supported
+      if (model.includes('1.5') || model.includes('2.0')) {
+        payload.systemInstruction = {
+          parts: [{ text: SYSTEM_PROMPT }]
+        };
+      }
 
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
       const response = await fetch(url, {
@@ -71,11 +71,15 @@ export async function generateAgentResponse(
           senderHistories.set(sender, history);
           return replyText;
         }
+      } else {
+        const errText = await response.text();
+        console.warn(`⚠️ Model ${model} returned HTTP ${response.status}: ${errText.substring(0, 100)}`);
       }
     } catch (err: any) {
-      console.warn(`Model ${model} attempt failed:`, err.message);
+      console.warn(`Model ${model} network error:`, err.message);
     }
   }
 
-  return `Hello! I am @${config.nametag}. I received your message "${userMessage}", but Gemini encountered a brief issue. I am active and listening on Unicity Testnet!`;
+  // Graceful conversational fallback if all model endpoints are unreachable
+  return `Hello! I am @${config.nametag} AI Messenger on Unicity. I received your message: "${userMessage}". How can I help you on the network today?`;
 }

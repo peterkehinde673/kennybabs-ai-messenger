@@ -36,13 +36,14 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
 
   console.log(`⏳ ${isExisting ? 'Loading existing' : 'Initializing new'} persistent wallet from ${walletDataDir}...`);
 
+  // dmSince: Date.now() ensures ONLY new incoming DMs are processed (no old message replays)
   const initResult = await Sphere.init({
     network: config.network,
     oracle: { apiKey: config.oracleApiKey },
     ...providers,
     autoGenerate: false,
     mnemonic: config.mnemonic,
-    dmSince: Math.floor(Date.now() / 1000) - 3600
+    dmSince: Math.floor(Date.now() / 1000)
   });
 
   const sphere = (initResult as any).sphere || initResult;

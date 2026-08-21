@@ -7,18 +7,18 @@ const processedMessageIds = new Set<string>();
 export function setupDMListener(sphere: any, config: AgentConfig, directAddress: string): void {
   console.log('📡 Subscribing to Unicity Nostr P2P relays...');
 
-  const handleIncomingMessage = async (msg: any) => {
+  const handleIncomingMessage = async (msg: any, extra?: any) => {
     try {
-      if (!msg) return;
+      const payload = msg || extra;
+      if (!payload) return;
 
-      const sender = msg.senderNametag || msg.sender || msg.from || (msg.data && msg.data.sender) || '';
-      const senderText = msg.content || msg.text || msg.message || (msg.data && msg.data.text) || (typeof msg === 'string' ? msg : '');
+      let sender = payload.sender || payload.from || payload.pubkey || payload.author || (payload.data && payload.data.sender) || '';
+      let senderText = payload.text || payload.content || payload.message || payload.memo || (payload.data && payload.data.text) || '';
 
-      if (!senderText || typeof senderText !== 'string' || senderText.trim().length === 0) {
-        return;
-      }
+      if (typeof payload === 'string') senderText = payload;
+      if (!senderText || typeof senderText !== 'string' || senderText.trim().length === 0) return;
 
-      const msgId = msg.id || `${sender}-${senderText.substring(0, 15)}-${Date.now()}`;
+      const msgId = payload.id || `${sender}-${senderText.substring(0, 15)}-${payload.timestamp || Date.now()}`;
       if (processedMessageIds.has(msgId)) return;
       processedMessageIds.add(msgId);
       if (processedMessageIds.size > 1000) {
@@ -42,13 +42,17 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
 
       updateDMStats(true);
 
-      // Generate AI response
-      const replyTarget = sender || directAddress;
+      // Normalize recipient address (ensures nametags have '@')
+      let replyTarget = sender;
+      if (!replyTarget.startsWith('@') && !replyTarget.startsWith('DIRECT://') && !replyTarget.startsWith('0x') && replyTarget.length < 50) {
+        replyTarget = `@${replyTarget}`;
+      }
+
+      // Generate AI response with Gemini
       const replyText = await generateAgentResponse(replyTarget, senderText, config);
+      console.log(`💬 Gemini AI Reply:\n"${replyText}"\n`);
 
-      console.log(`[AI RESPONSE] Target: ${replyTarget}\n"${replyText}"\n`);
-
-      // Send reply
+      // Deliver response back via P2P DM
       let sent = false;
       let attempts = 0;
       while (!sent && attempts < 3) {
@@ -79,7 +83,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
         }
       }
     } catch (err: any) {
-      console.error('❌ Error handling incoming DM:', err.message || err);
+      console.error('❌ Error handling incoming message:', err.message || err);
     }
   };
 
@@ -93,19 +97,19 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
     sphere.on('message:incoming', handleIncomingMessage);
   }
 
-  // Periodic Mailbox & Transport sync
+  // Periodic Mailbox & Transport sync every 15s
   setInterval(async () => {
     try {
       if (sphere.receive && typeof sphere.receive === 'function') {
         await sphere.receive();
       }
     } catch {}
-  }, 4000);
+  }, 15000);
 
   // Heartbeat every 30s
   setInterval(() => {
     console.log(`💓 [HEARTBEAT ${new Date().toLocaleTimeString()}] Live on Unicity Testnet2. Listening for DMs to @${config.nametag}...`);
   }, 30000);
 
-  console.log('✅ Real Unicity DM Listener is active and listening on Nostr relays.');
+  console.log('✅ Real Unicity DM Listener active on all channels.');
 }
