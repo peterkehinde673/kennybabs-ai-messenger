@@ -30,8 +30,8 @@ async function updateDashboard() {
     } catch (err) {
         document.getElementById('status-text').innerText = 'Backend Offline / Unreachable';
         document.getElementById('system-status-badge').classList.remove('online');
-        document.getElementById('val-address').innerText = 'Unavailable (Start local agent)';
-        document.getElementById('val-pubkey').innerText = 'Unavailable (Start local agent)';
+        document.getElementById('val-address').innerText = 'Unavailable (Start local backend agent)';
+        document.getElementById('val-pubkey').innerText = 'Unavailable (Start local backend agent)';
         document.getElementById('val-listener').innerText = 'Offline';
         document.getElementById('val-gemini').innerText = 'Offline';
     }

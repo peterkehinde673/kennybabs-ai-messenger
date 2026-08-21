@@ -47,32 +47,29 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
 
   const sphere = (initResult as any).sphere || initResult;
 
+  // Extract actual runtime identity from the Sphere instance (No hardcoded fallbacks)
   let directAddress = '';
-  try {
-    if (typeof (sphere as any).getAddress === 'function') {
-      directAddress = await (sphere as any).getAddress();
-    } else if (sphere.wallet && typeof (sphere.wallet as any).getAddress === 'function') {
-      directAddress = await (sphere.wallet as any).getAddress();
-    } else if (sphere.wallet && typeof (sphere.wallet as any).getPublicKey === 'function') {
-      directAddress = await (sphere.wallet as any).getPublicKey();
-    } else if ((sphere as any).directAddress) {
-      directAddress = (sphere as any).directAddress;
-    }
-  } catch {}
-
-  if (!directAddress || directAddress.trim() === '') {
-    directAddress = 'DIRECT://0000dca8924d716c3ce65db592d9f8d62153837af7a83073f20e1a3efd4806f682e0e7ee421a';
+  if (typeof (sphere as any).getAddress === 'function') {
+    directAddress = await (sphere as any).getAddress();
+  } else if (sphere.wallet && typeof (sphere.wallet as any).getAddress === 'function') {
+    directAddress = await (sphere.wallet as any).getAddress();
+  } else if ((sphere as any).identity?.directAddress) {
+    directAddress = (sphere as any).identity.directAddress;
+  } else if ((sphere as any).directAddress) {
+    directAddress = (sphere as any).directAddress;
   }
 
   let chainPublicKey = '';
-  try {
-    if (sphere.wallet && typeof (sphere.wallet as any).getPublicKey === 'function') {
-      chainPublicKey = await (sphere.wallet as any).getPublicKey();
-    }
-  } catch {}
+  if (sphere.wallet && typeof (sphere.wallet as any).getPublicKey === 'function') {
+    chainPublicKey = await (sphere.wallet as any).getPublicKey();
+  } else if ((sphere as any).identity?.chainPubkey) {
+    chainPublicKey = (sphere as any).identity.chainPubkey;
+  } else {
+    chainPublicKey = directAddress;
+  }
 
-  if (!chainPublicKey || chainPublicKey.trim() === '') {
-    chainPublicKey = '022e5c98c8ca79780cbcc694a7ddb4d418a9a51ddc576624bb4f2b397e85fbc004';
+  if (!directAddress) {
+    throw new Error('FATAL: Could not resolve Direct Address from initialized Sphere wallet.');
   }
 
   let currentNametag = config.nametag;
@@ -80,6 +77,8 @@ export async function initializePersistentIdentity(config: AgentConfig): Promise
     if (sphere.wallet && typeof (sphere.wallet as any).getNametag === 'function') {
       const registered = await (sphere.wallet as any).getNametag();
       if (registered) currentNametag = registered;
+    } else if ((sphere as any).identity?.nametag) {
+      currentNametag = (sphere as any).identity.nametag;
     }
   } catch {}
 

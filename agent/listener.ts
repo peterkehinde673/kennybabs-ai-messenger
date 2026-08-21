@@ -3,52 +3,54 @@ import { generateAgentResponse } from './gemini.js';
 import { updateDMStats, pushEvent } from './server.js';
 
 const processedMessageIds = new Set<string>();
+const inFlightMessageIds = new Set<string>();
 
 export function setupDMListener(sphere: any, config: AgentConfig, directAddress: string): void {
-  console.log('📡 Subscribing to Unicity Nostr P2P relays...');
+  console.log('📡 Registering official Sphere direct-message listener...');
 
-  const handleIncomingMessage = async (msg: any, extra?: any) => {
+  if (!sphere.communications || typeof sphere.communications.onDirectMessage !== 'function') {
+    throw new Error('FATAL: sphere.communications.onDirectMessage API is not available on this SDK instance.');
+  }
+
+  // Single official listener hook
+  sphere.communications.onDirectMessage(async (msg: any) => {
     try {
-      const payload = msg || extra;
-      if (!payload) return;
+      if (!msg) return;
 
-      // Extract sender across all possible fields
-      let rawSender = payload.senderNametag || payload.sender || payload.from || payload.pubkey || payload.author || (payload.data && (payload.data.senderNametag || payload.data.sender || payload.data.from)) || '';
-      if (typeof rawSender !== 'string') rawSender = String(rawSender || '');
-      rawSender = rawSender.trim();
+      const rawSender = msg.senderNametag || msg.sender || msg.from || '';
+      const senderText = msg.content || msg.text || msg.message || '';
 
-      // Extract message text
-      let senderText = payload.text || payload.content || payload.message || payload.memo || (payload.data && payload.data.text) || '';
-      if (typeof payload === 'string') senderText = payload;
       if (!senderText || typeof senderText !== 'string' || senderText.trim().length === 0) return;
 
-      // Skip invalid senders
-      if (!rawSender || rawSender === '@' || rawSender === 'unknown' || rawSender === directAddress) {
-        return;
-      }
+      let replyTarget = (rawSender || '').trim();
+      if (!replyTarget || replyTarget === '@' || replyTarget === 'unknown') return;
 
-      // Format recipient correctly
-      let replyTarget = rawSender;
+      // Ensure proper prefix
       if (!replyTarget.startsWith('@') && !replyTarget.startsWith('DIRECT://') && !replyTarget.startsWith('0x') && !replyTarget.startsWith('un1')) {
         replyTarget = `@${replyTarget}`;
       }
 
-      if (replyTarget === '@') return;
-
-      const msgId = payload.id || `${replyTarget}-${senderText.substring(0, 15)}-${payload.timestamp || Date.now()}`;
-      if (processedMessageIds.has(msgId)) return;
-      processedMessageIds.add(msgId);
-      if (processedMessageIds.size > 1000) {
-        const first = processedMessageIds.values().next().value;
-        if (first) processedMessageIds.delete(first);
+      // Ignore self-messages
+      if (replyTarget === `@${config.nametag}` || replyTarget === directAddress) {
+        return;
       }
 
-      console.log(`\n======================================================`);
-      console.log(`📩 [INCOMING DM RECEIVED]`);
-      console.log(`- From:    ${replyTarget}`);
-      console.log(`- Content: "${senderText}"`);
-      console.log(`- Time:    ${new Date().toLocaleTimeString()}`);
-      console.log(`======================================================`);
+      // Deduplication & in-flight locking
+      const msgId = msg.id || `${replyTarget}:${senderText}`;
+      if (processedMessageIds.has(msgId) || inFlightMessageIds.has(msgId)) {
+        console.log(`[DUPLICATE DM IGNORED] Message ID: ${msgId}`);
+        return;
+      }
+
+      inFlightMessageIds.add(msgId);
+
+      console.log(`\n========================================`);
+      console.log(`[INCOMING DM]`);
+      console.log(`Sender:     ${replyTarget}`);
+      console.log(`Timestamp:  ${new Date().toLocaleTimeString()}`);
+      console.log(`Message ID: ${msgId}`);
+      console.log(`Content:    "${senderText}"`);
+      console.log(`========================================`);
 
       pushEvent({
         type: 'incoming_dm',
@@ -56,30 +58,28 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
         text: senderText,
         timestamp: new Date().toISOString()
       });
-
       updateDMStats(true);
 
       // Generate AI response
       const replyText = await generateAgentResponse(replyTarget, senderText, config);
-      console.log(`💬 AI Reply to deliver:\n"${replyText}"\n`);
 
-      // Deliver response back via P2P DM
+      // Sequential retry loop (Attempt 1/3 -> 2/3 -> 3/3)
       let sent = false;
-      let attempts = 0;
-      while (!sent && attempts < 3) {
-        attempts++;
+      let attempt = 0;
+      const maxAttempts = 3;
+
+      while (!sent && attempt < maxAttempts) {
+        attempt++;
+        console.log(`[SENDING DM] Attempt ${attempt}/${maxAttempts} to ${replyTarget}...`);
         try {
-          console.log(`📤 [SENDING DM] Attempt ${attempts}/3 to ${replyTarget}...`);
-          if (sphere.communications && typeof sphere.communications.sendDM === 'function') {
-            await sphere.communications.sendDM(replyTarget, replyText);
-          } else if (typeof sphere.sendDM === 'function') {
-            await sphere.sendDM(replyTarget, replyText);
-          }
+          await sphere.communications.sendDM(replyTarget, replyText);
           sent = true;
-          console.log(`✅ [DM SENT] Auto-reply successfully delivered to ${replyTarget}!`);
+          console.log(`[DM SENT]`);
+          console.log(`Recipient: ${replyTarget}`);
+          console.log(`Timestamp: ${new Date().toLocaleTimeString()}`);
+          console.log(`Success:   true`);
 
           updateDMStats(false);
-
           pushEvent({
             type: 'outgoing_dm',
             recipient: replyTarget,
@@ -87,40 +87,29 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
             timestamp: new Date().toISOString()
           });
         } catch (err: any) {
-          console.warn(`⚠️ Delivery attempt ${attempts} warning:`, err.message || err);
-          if (attempts < 3) {
-            await new Promise(r => setTimeout(r, 2000 * attempts));
+          console.warn(`⚠️ Attempt ${attempt} failed: ${err.message || err}`);
+          if (attempt < maxAttempts) {
+            await new Promise(r => setTimeout(r, 2000 * attempt));
           }
         }
       }
-    } catch (err: any) {
-      console.error('❌ Error handling incoming message:', err.message || err);
-    }
-  };
 
-  if (sphere.communications && typeof sphere.communications.onDirectMessage === 'function') {
-    sphere.communications.onDirectMessage(handleIncomingMessage);
-  }
-  if (sphere.communications && typeof sphere.communications.on === 'function') {
-    sphere.communications.on('message:incoming', handleIncomingMessage);
-  }
-  if (typeof sphere.on === 'function') {
-    sphere.on('message:incoming', handleIncomingMessage);
-  }
-
-  // Periodic Mailbox & Transport sync every 15s
-  setInterval(async () => {
-    try {
-      if (sphere.receive && typeof sphere.receive === 'function') {
-        await sphere.receive();
+      // Mark message as permanently processed and release in-flight lock
+      processedMessageIds.add(msgId);
+      inFlightMessageIds.delete(msgId);
+      if (processedMessageIds.size > 2000) {
+        const first = processedMessageIds.values().next().value;
+        if (first) processedMessageIds.delete(first);
       }
-    } catch {}
-  }, 15000);
+    } catch (err: any) {
+      console.error('❌ Unhandled error in DM handler:', err.message || err);
+    }
+  });
 
   // Heartbeat every 30s
   setInterval(() => {
-    console.log(`💓 [HEARTBEAT ${new Date().toLocaleTimeString()}] Live on Unicity Testnet2. Listening for DMs to @${config.nametag}...`);
+    console.log(`💓 [HEARTBEAT ${new Date().toLocaleTimeString()}] Connected to Unicity Testnet2 relay. Listening for DMs to @${config.nametag}...`);
   }, 30000);
 
-  console.log('✅ Real Unicity DM Listener active on all channels.');
+  console.log('✅ Official Unicity DM listener registered successfully.');
 }
