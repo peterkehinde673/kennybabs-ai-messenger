@@ -1,3 +1,5 @@
+import path from 'path';
+import fs from 'fs';
 import { AgentConfig } from './config.js';
 import { generateAgentResponse } from './gemini.js';
 import { updateDMStats, pushEvent } from './server.js';
@@ -9,7 +11,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
   console.log('📡 Registering official Sphere direct-message listener...');
 
   if (!sphere.communications || typeof sphere.communications.onDirectMessage !== 'function') {
-    throw new Error('FATAL: sphere.communications.onDirectMessage API is not available on this SDK instance.');
+    throw new Error('FATAL: sphere.communications.onDirectMessage is not supported by the installed Sphere SDK.');
   }
 
   // Single official listener hook
@@ -25,7 +27,6 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       let replyTarget = (rawSender || '').trim();
       if (!replyTarget || replyTarget === '@' || replyTarget === 'unknown') return;
 
-      // Ensure proper prefix
       if (!replyTarget.startsWith('@') && !replyTarget.startsWith('DIRECT://') && !replyTarget.startsWith('0x') && !replyTarget.startsWith('un1')) {
         replyTarget = `@${replyTarget}`;
       }
@@ -35,8 +36,8 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
         return;
       }
 
-      // Deduplication & in-flight locking
-      const msgId = msg.id || `${replyTarget}:${senderText}`;
+      // Strict message ID deduplication and in-flight lock
+      const msgId = msg.id || `${replyTarget}:${msg.timestamp || ''}:${senderText.substring(0, 20)}`;
       if (processedMessageIds.has(msgId) || inFlightMessageIds.has(msgId)) {
         console.log(`[DUPLICATE DM IGNORED] Message ID: ${msgId}`);
         return;
@@ -44,10 +45,11 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
 
       inFlightMessageIds.add(msgId);
 
+      const timestamp = new Date().toLocaleTimeString();
       console.log(`\n========================================`);
       console.log(`[INCOMING DM]`);
       console.log(`Sender:     ${replyTarget}`);
-      console.log(`Timestamp:  ${new Date().toLocaleTimeString()}`);
+      console.log(`Timestamp:  ${timestamp}`);
       console.log(`Message ID: ${msgId}`);
       console.log(`Content:    "${senderText}"`);
       console.log(`========================================`);
@@ -60,10 +62,16 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       });
       updateDMStats(true);
 
-      // Generate AI response
+      // Persist timestamp of latest processed message
+      try {
+        const lastTimestampFile = path.join(config.dataDir, 'last_dm_timestamp.json');
+        fs.writeFileSync(lastTimestampFile, JSON.stringify({ timestamp: Math.floor(Date.now() / 1000) }, null, 2));
+      } catch {}
+
+      // Prompt Gemini AI
       const replyText = await generateAgentResponse(replyTarget, senderText, config);
 
-      // Sequential retry loop (Attempt 1/3 -> 2/3 -> 3/3)
+      // Bounded retry loop (Attempt 1/3 -> 2/3 -> 3/3)
       let sent = false;
       let attempt = 0;
       const maxAttempts = 3;
@@ -87,14 +95,14 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
             timestamp: new Date().toISOString()
           });
         } catch (err: any) {
-          console.warn(`⚠️ Attempt ${attempt} failed: ${err.message || err}`);
+          console.warn(`⚠️ Delivery attempt ${attempt} warning: ${err.message || err}`);
           if (attempt < maxAttempts) {
             await new Promise(r => setTimeout(r, 2000 * attempt));
           }
         }
       }
 
-      // Mark message as permanently processed and release in-flight lock
+      // Mark completed & release in-flight lock
       processedMessageIds.add(msgId);
       inFlightMessageIds.delete(msgId);
       if (processedMessageIds.size > 2000) {
@@ -102,7 +110,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
         if (first) processedMessageIds.delete(first);
       }
     } catch (err: any) {
-      console.error('❌ Unhandled error in DM handler:', err.message || err);
+      console.error('❌ Unhandled error processing incoming DM:', err.message || err);
     }
   });
 
@@ -111,5 +119,5 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
     console.log(`💓 [HEARTBEAT ${new Date().toLocaleTimeString()}] Connected to Unicity Testnet2 relay. Listening for DMs to @${config.nametag}...`);
   }, 30000);
 
-  console.log('✅ Official Unicity DM listener registered successfully.');
+  console.log('✅ Official Sphere DM listener registered successfully.');
 }
