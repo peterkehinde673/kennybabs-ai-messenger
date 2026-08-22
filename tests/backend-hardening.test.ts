@@ -5,22 +5,25 @@ import { AgentConfig } from '../agent/config.js';
 async function runUnitTests() {
   console.log('🧪 Running Backend Hardening Unit Tests...\n');
 
-  const fallbackConfig: AgentConfig = {
+  const mockConfig: AgentConfig = {
     network: 'testnet2',
     nametag: 'kennybabs',
     mnemonic: 'test mnemonic',
     oracleApiKey: 'test-key',
     walletApiUrl: 'https://wallet-api.unicity.network',
     geminiApiKey: '',
-    geminiModel: 'gemini-3.6-flash',
+    geminiModel: 'gemini-2.5-flash',
+    geminiMaxRetries: 2,
+    dmConcurrency: 1,
     port: 3001,
     dataDir: './data'
   };
 
   // Test 1: Gemini Fallback on Missing Key
   console.log('1. Testing Gemini transparent fallback handling...');
-  const fallbackReply = await generateAgentResponse('@testuser', 'Hello bot', fallbackConfig);
-  assert(fallbackReply.includes('@kennybabs'), 'Fallback must identify as @kennybabs');
+  const fallbackResult = await generateAgentResponse('@testuser', 'Hello bot', mockConfig);
+  assert(fallbackResult.text.includes('@kennybabs'), 'Fallback must identify as @kennybabs');
+  assert(fallbackResult.success === false, 'Fallback must indicate success: false');
   console.log('   ✅ PASS: Fallback response handled transparently.');
 
   // Test 2: In-Flight Lock & Deduplication
@@ -41,7 +44,7 @@ async function runUnitTests() {
   assert(processedIds.has(testMsgId), 'Message must be cached in processed set');
   console.log('   ✅ PASS: In-flight locks and duplicate rejection verified.');
 
-  // Test 3: Failed Delivery State Handling
+  // Test 3: Failed Delivery State Isolation
   console.log('3. Testing Failed Delivery State Logic...');
   let delivered = false;
   let attempts = 0;
@@ -50,7 +53,6 @@ async function runUnitTests() {
 
   while (!delivered && attempts < maxAttempts) {
     attempts++;
-    // Simulate transient send failure
   }
 
   if (delivered) {

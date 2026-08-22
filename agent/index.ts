@@ -23,9 +23,12 @@ async function main() {
   console.log(`Persistent Wallet:  ACTIVE (${identity.isExisting ? 'Existing' : 'Created'})`);
   console.log(`DM Listener:        ACTIVE`);
   console.log(`Gemini AI:          ${config.geminiApiKey ? 'ACTIVE' : 'FALLBACK'}`);
+  console.log(`Gemini Model:       ${config.geminiModel}`);
+  console.log(`DM Concurrency:     ${config.dmConcurrency}`);
+  console.log(`Gemini Retry Limit: ${config.geminiMaxRetries}`);
   console.log('========================================\n');
 
-  // Register single direct-message listener
+  // Register single direct-message listener with controlled queue
   setupDMListener(identity.sphere, config, identity.directAddress);
 
   // Update server status state

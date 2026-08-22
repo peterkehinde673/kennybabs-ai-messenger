@@ -13,6 +13,8 @@ export interface AgentConfig {
   walletApiUrl: string;
   geminiApiKey: string;
   geminiModel: string;
+  geminiMaxRetries: number;
+  dmConcurrency: number;
   port: number;
   dataDir: string;
 }
@@ -28,12 +30,14 @@ export function loadConfig(): AgentConfig {
   const oracleApiKey = (process.env.UNICITY_ORACLE_API_KEY || '').trim().replace(/^["']|["']$/g, '');
   const walletApiUrl = (process.env.UNICITY_WALLET_API_URL || 'https://wallet-api.unicity.network').trim();
   const geminiApiKey = (process.env.GEMINI_API_KEY || '').trim().replace(/['"\s]/g, '');
-  const geminiModel = (process.env.GEMINI_MODEL || 'gemini-3.6-flash').trim();
+  const geminiModel = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+  const geminiMaxRetries = parseInt(process.env.GEMINI_MAX_RETRIES || '3', 10);
+  const dmConcurrency = parseInt(process.env.DM_CONCURRENCY || '1', 10);
   const port = parseInt(process.env.PORT || '3001', 10);
   const dataDir = path.resolve(process.env.AGENT_DATA_DIR || './data');
 
   if (!mnemonic) {
-    throw new Error('FATAL: UNICITY_MNEMONIC is missing from .env. A valid recovery mnemonic is required.');
+    throw new Error('FATAL: UNICITY_MNEMONIC is missing from .env.');
   }
 
   if (!oracleApiKey) {
@@ -48,6 +52,8 @@ export function loadConfig(): AgentConfig {
     walletApiUrl,
     geminiApiKey,
     geminiModel,
+    geminiMaxRetries,
+    dmConcurrency,
     port,
     dataDir
   };
