@@ -16,21 +16,27 @@ Instructions:
 - Never invent fake financial transactions.
 - Do NOT output prompt templates, persona prefixes, or internal metadata.`;
 
-// Allowed pure text-generation models only - NEVER TTS, image, or multimodal output models
-const ALLOWED_TEXT_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+export interface GeminiResponseResult {
+  text: string | null;
+  success: boolean;
+  modelUsed?: string;
+  error?: string;
+}
 
 export async function generateAgentResponse(
   sender: string,
   userMessage: string,
-  config: AgentConfig
-): Promise<{ text: string; success: boolean; modelUsed?: string }> {
+  config: AgentConfig,
+  fetchFn: typeof fetch = fetch
+): Promise<GeminiResponseResult> {
   const now = Date.now();
   const timestamps = (senderRateLimits.get(sender) || []).filter(t => now - t < 60000);
   if (timestamps.length >= 10) {
     console.warn(`[RATE LIMIT] Sender ${sender} exceeded limit (max 10 DMs/min).`);
     return {
-      text: "⚠️ Rate limit reached (max 10 messages/min). Please wait a moment before sending another message.",
-      success: false
+      text: null,
+      success: false,
+      error: 'RATE_LIMIT_EXCEEDED'
     };
   }
   timestamps.push(now);
@@ -42,96 +48,112 @@ export async function generateAgentResponse(
   const apiKey = config.geminiApiKey || process.env.GEMINI_API_KEY || '';
 
   if (!apiKey) {
-    console.log(`[GEMINI] No API key configured. Returning service fallback for ${sender}.`);
+    console.warn(`[GEMINI] No API key configured. Cannot process request for ${sender}.`);
     return {
-      text: `Hello! I am @${config.nametag} AI Messenger. I received your message: "${userMessage}". How can I help you on Unicity today?`,
-      success: false
+      text: null,
+      success: false,
+      error: 'NO_API_KEY'
     };
   }
 
-  // Small, explicit list of text models: configured model first, then safe text fallbacks
-  const configuredModel = config.geminiModel || 'gemini-2.5-flash';
-  const modelsToTry = Array.from(new Set([configuredModel, ...ALLOWED_TEXT_MODELS]));
+  // Exactly ONE configured model - ZERO fallback array, ZERO model switching
+  const model = config.geminiModel || 'gemini-3.6-flash';
+  const maxRetries = Math.max(1, config.geminiMaxRetries || 3);
+  let attempt = 0;
 
-  for (const model of modelsToTry) {
-    let attempts = 0;
-    const maxRetries = config.geminiMaxRetries || 3;
+  while (attempt < maxRetries) {
+    attempt++;
+    console.log(`[GEMINI REQUEST] Model: ${model} | Target: ${sender} | Attempt: ${attempt}/${maxRetries}`);
 
-    while (attempts < maxRetries) {
-      attempts++;
-      try {
-        console.log(`[GEMINI REQUEST] Model: ${model} | Target: ${sender} | Attempt: ${attempts}/${maxRetries}`);
-
-        const payload = {
-          systemInstruction: {
-            parts: [{ text: SYSTEM_PROMPT }]
-          },
-          contents: [
-            ...history,
-            {
-              role: 'user',
-              parts: [{ text: userMessage }]
-            }
-          ]
-        };
-
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-
-        if (response.status === 429) {
-          const retryAfterHeader = response.headers.get('retry-after');
-          const waitSec = retryAfterHeader ? parseInt(retryAfterHeader, 10) || 2 : Math.min(Math.pow(2, attempts), 8);
-          console.warn(`[GEMINI] Rate limited (429) on ${model}. Retrying in ${waitSec}s... (Attempt ${attempts}/${maxRetries})`);
-          if (attempts < maxRetries) {
-            await new Promise(r => setTimeout(r, waitSec * 1000));
-            continue;
-          } else {
-            console.warn(`[GEMINI] Rate limit retries exhausted for ${model}.`);
-            break;
+    try {
+      const payload = {
+        systemInstruction: {
+          parts: [{ text: SYSTEM_PROMPT }]
+        },
+        contents: [
+          ...history,
+          {
+            role: 'user',
+            parts: [{ text: userMessage }]
           }
-        }
+        ]
+      };
 
-        if (response.status === 404) {
-          console.warn(`[GEMINI FAILED] Model ${model} returned HTTP 404 (Not Found). Skipping to next configured text model.`);
-          break;
-        }
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const response = await fetchFn(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
 
-        if (response.ok) {
-          const data = await response.json();
-          const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (replyText) {
-            const cleanText = replyText.trim();
-            console.log(`[GEMINI SUCCESS] Model: ${model}`);
-            history.push({ role: 'user', parts: [{ text: userMessage }] });
-            history.push({ role: 'model', parts: [{ text: cleanText }] });
-            senderHistories.set(sender, history);
-            return {
-              text: cleanText,
-              success: true,
-              modelUsed: model
-            };
-          }
+      if (response.status === 429) {
+        const retryAfterHeader = response.headers.get('retry-after');
+        const waitSec = retryAfterHeader ? parseInt(retryAfterHeader, 10) || 2 : Math.min(Math.pow(2, attempt), 8);
+        console.warn(`[GEMINI] Rate limited (429) on ${model}. Retrying in ${waitSec}s... (Attempt ${attempt}/${maxRetries})`);
+        
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, waitSec * 1000));
+          continue; // Retries the SAME model only
         } else {
-          const errBody = await response.text();
-          console.warn(`[GEMINI FAILED] Model ${model} HTTP ${response.status}: ${errBody.substring(0, 150)}`);
-          break;
+          console.warn(`[GEMINI] Rate limit retries exhausted for ${model} (${maxRetries}/${maxRetries}). Stopping.`);
+          return {
+            text: null,
+            success: false,
+            error: 'HTTP_429_QUOTA_EXHAUSTED'
+          };
         }
-      } catch (err: any) {
-        console.warn(`[GEMINI FAILED] Network error on ${model} (attempt ${attempts}):`, err.message);
-        if (attempts < maxRetries) {
-          await new Promise(r => setTimeout(r, 1500 * attempts));
+      }
+
+      if (response.status === 404) {
+        console.warn(`[GEMINI FAILED] Model ${model} returned HTTP 404 (Not Found). Stopping.`);
+        return {
+          text: null,
+          success: false,
+          error: `MODEL_NOT_FOUND: ${model}`
+        };
+      }
+
+      if (response.ok) {
+        const data = await response.json();
+        const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (replyText) {
+          const cleanText = replyText.trim();
+          console.log(`[GEMINI SUCCESS] Model: ${model}`);
+          history.push({ role: 'user', parts: [{ text: userMessage }] });
+          history.push({ role: 'model', parts: [{ text: cleanText }] });
+          senderHistories.set(sender, history);
+          return {
+            text: cleanText,
+            success: true,
+            modelUsed: model
+          };
         }
+      } else {
+        const errBody = await response.text();
+        console.warn(`[GEMINI FAILED] Model ${model} returned HTTP ${response.status}: ${errBody.substring(0, 150)}`);
+        return {
+          text: null,
+          success: false,
+          error: `HTTP_${response.status}`
+        };
+      }
+    } catch (err: any) {
+      console.warn(`[GEMINI FAILED] Network error on ${model} (Attempt ${attempt}/${maxRetries}):`, err.message);
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 1500 * attempt));
+      } else {
+        return {
+          text: null,
+          success: false,
+          error: err.message
+        };
       }
     }
   }
 
-  console.warn(`[GEMINI] All configured text models exhausted for ${sender}.`);
   return {
-    text: "Sorry, my AI service is temporarily unavailable. Please try again shortly.",
-    success: false
+    text: null,
+    success: false,
+    error: 'MAX_RETRIES_EXCEEDED'
   };
 }

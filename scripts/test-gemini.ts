@@ -8,15 +8,21 @@ async function run() {
   
   console.log(`========================================`);
   console.log(`❓ USER QUESTION: "${question}"`);
+  console.log(`🤖 CONFIGURED MODEL: ${config.geminiModel}`);
   console.log(`🔑 API KEY LOADED: ${key ? key.substring(0, 10) + '...' : 'NONE'}`);
   console.log(`========================================`);
 
-  const reply = await generateAgentResponse('@test-user', question, config);
+  const result = await generateAgentResponse('@test-user', question, config);
   
-  console.log(`\n💬 GEMINI AI ANSWER:`);
-  console.log(reply);
+  console.log(`\n💬 GEMINI AI RESULT:`);
+  console.log(`Success: ${result.success}`);
+  if (result.success && result.text) {
+    console.log(`Answer:\n${result.text}`);
+  } else {
+    console.log(`Error: ${result.error}`);
+  }
   console.log(`========================================\n`);
-  process.exit(0);
+  process.exit(result.success ? 0 : 1);
 }
 
 run().catch(console.error);

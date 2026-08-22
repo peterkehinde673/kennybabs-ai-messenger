@@ -12,7 +12,7 @@ interface DMQueueItem {
   timestamp: string;
 }
 
-class DMQueue {
+export class DMQueue {
   private queue: DMQueueItem[] = [];
   private activeWorkers = 0;
   private maxConcurrency: number;
@@ -26,6 +26,14 @@ class DMQueue {
   push(item: DMQueueItem) {
     this.queue.push(item);
     this.drain();
+  }
+
+  get length(): number {
+    return this.queue.length;
+  }
+
+  get active(): number {
+    return this.activeWorkers;
   }
 
   private drain() {
@@ -68,11 +76,18 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       });
       updateDMStats(true);
 
-      // Controlled Gemini invocation
+      // Controlled single-model Gemini invocation
       const aiResult = await generateAgentResponse(replyTarget, senderText, config);
+
+      // CRITICAL: If Gemini failed, DO NOT send a DM or report [DM SENT]
+      if (!aiResult.success || !aiResult.text) {
+        console.warn(`[DM] No AI response generated for ${replyTarget} (${aiResult.error || 'generation failed'}). No outbound AI DM will be sent.`);
+        return;
+      }
+
       const replyText = aiResult.text;
 
-      // Sequential bounded retry loop (max 3 attempts)
+      // Sequential bounded retry loop for sendDM (max 3 attempts)
       let delivered = false;
       let attempt = 0;
       const maxAttempts = 3;
