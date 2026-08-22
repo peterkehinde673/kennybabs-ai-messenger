@@ -13,8 +13,10 @@ async function runUnitTests() {
     oracleApiKey: 'test-key',
     walletApiUrl: 'https://wallet-api.unicity.network',
     geminiApiKey: 'TEST_API_KEY',
-    geminiModel: 'gemini-3.6-flash',
+    geminiModel: 'gemini-2.5-flash',
+    geminiFallbackModel: '',
     geminiMaxRetries: 3,
+    geminiRetryDelayMs: 500,
     dmConcurrency: 1,
     port: 3001,
     dataDir: './data'
@@ -28,19 +30,19 @@ async function runUnitTests() {
       ok: true,
       headers: new Headers(),
       json: async () => ({
-        candidates: [{ content: { parts: [{ text: 'Yes, I am online on Unicity Sphere.' }] } }]
+        candidates: [{ content: { parts: [{ text: 'Yes, I am online on Unicity Sphere testnet2.' }] } }]
       })
     } as unknown as Response;
   };
 
   const result1 = await generateAgentResponse('@user1', 'Are you online?', baseConfig, mockFetchSuccess as any);
   assert.strictEqual(result1.success, true);
-  assert.strictEqual(result1.text, 'Yes, I am online on Unicity Sphere.');
-  assert.strictEqual(result1.modelUsed, 'gemini-3.6-flash');
+  assert.strictEqual(result1.text, 'Yes, I am online on Unicity Sphere testnet2.');
+  assert.strictEqual(result1.modelUsed, 'gemini-2.5-flash');
   console.log('   ✅ PASS: Gemini success returned clean response.\n');
 
-  // TEST 2: Gemini 429 -> exactly 3 attempts against SAME model, zero fallback models
-  console.log('TEST 2: Verifying HTTP 429 retries same model exactly 3 times with NO model switching...');
+  // TEST 2: Gemini 429 -> exactly 3 attempts against SAME model, ZERO model switching, returns success: false
+  console.log('TEST 2: Verifying HTTP 429 retries same model exactly 3 times with ZERO fallback model switching...');
   const requestedUrls429: string[] = [];
   const mockFetch429 = async (url: string | URL | Request) => {
     requestedUrls429.push(url.toString());
@@ -55,18 +57,18 @@ async function runUnitTests() {
   const result2 = await generateAgentResponse('@user2', 'Hello', baseConfig, mockFetch429 as any);
   assert.strictEqual(result2.success, false);
   assert.strictEqual(result2.text, null);
-  assert.strictEqual(result2.error, 'HTTP_429_QUOTA_EXHAUSTED');
+  assert.strictEqual(result2.error, 'GENERATION_FAILED_QUOTA_OR_UNAVAILABLE');
   assert.strictEqual(requestedUrls429.length, 3, 'Must attempt exactly 3 retries');
   for (const url of requestedUrls429) {
-    assert(url.includes('models/gemini-3.6-flash:generateContent'), 'Every attempt must be against gemini-3.6-flash');
-    assert(!url.includes('gemini-2.5-flash'), 'Must not attempt gemini-2.5-flash');
-    assert(!url.includes('gemini-2.0-flash'), 'Must not attempt gemini-2.0-flash');
-    assert(!url.includes('gemini-1.5-flash'), 'Must not attempt gemini-1.5-flash');
+    assert(url.includes('models/gemini-2.5-flash:generateContent'), 'Every attempt must be against gemini-2.5-flash');
+    assert(!url.includes('gemini-1.5-flash'), 'Must not attempt obsolete gemini-1.5-flash');
+    assert(!url.includes('gemini-2.0-flash'), 'Must not attempt obsolete gemini-2.0-flash');
+    assert(!url.includes('tts'), 'Must not attempt TTS models');
   }
   console.log('   ✅ PASS: HTTP 429 retried same model 3 times with 0 fallback model attempts.\n');
 
-  // TEST 3: Gemini 404 -> exactly 1 attempt against configured model, zero fallback models
-  console.log('TEST 3: Verifying HTTP 404 fails immediately with NO fallback model loop...');
+  // TEST 3: Gemini 404 -> exactly 1 attempt against configured model, zero fallback cascade
+  console.log('TEST 3: Verifying HTTP 404 fails immediately with ZERO fallback model cascade...');
   const requestedUrls404: string[] = [];
   const mockFetch404 = async (url: string | URL | Request) => {
     requestedUrls404.push(url.toString());
@@ -82,7 +84,7 @@ async function runUnitTests() {
   assert.strictEqual(result3.success, false);
   assert.strictEqual(result3.text, null);
   assert.strictEqual(requestedUrls404.length, 1, 'Must attempt exactly 1 model');
-  assert(requestedUrls404[0].includes('models/gemini-3.6-flash:generateContent'));
+  assert(requestedUrls404[0].includes('models/gemini-2.5-flash:generateContent'));
   console.log('   ✅ PASS: HTTP 404 failed cleanly without fallback storm.\n');
 
   // TEST 4: Duplicate message ID -> zero additional Gemini processing

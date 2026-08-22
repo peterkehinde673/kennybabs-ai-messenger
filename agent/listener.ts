@@ -79,9 +79,9 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       // Controlled single-model Gemini invocation
       const aiResult = await generateAgentResponse(replyTarget, senderText, config);
 
-      // CRITICAL: If Gemini failed, DO NOT send a DM or report [DM SENT]
+      // CRITICAL: If Gemini failed to generate a response, DO NOT send a DM or report [DM SENT]
       if (!aiResult.success || !aiResult.text) {
-        console.warn(`[DM] No AI response generated for ${replyTarget} (${aiResult.error || 'generation failed'}). No outbound AI DM will be sent.`);
+        console.warn(`[DM] No AI response generated for ${replyTarget} (${aiResult.error || 'failure'}). No outbound AI DM will be sent.`);
         return;
       }
 

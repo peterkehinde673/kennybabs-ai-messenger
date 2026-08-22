@@ -22,9 +22,11 @@ async function main() {
   console.log(`Chain Public Key:   ${identity.chainPublicKey}`);
   console.log(`Persistent Wallet:  ACTIVE (${identity.isExisting ? 'Existing' : 'Created'})`);
   console.log(`DM Listener:        ACTIVE`);
-  console.log(`Gemini AI:          ${config.geminiApiKey ? 'ACTIVE' : 'FALLBACK'}`);
-  console.log(`Gemini Model:       ${config.geminiModel}`);
+  console.log(`AI Provider:        Gemini`);
+  console.log(`AI Model:           ${config.geminiModel}`);
+  console.log(`DM Queue:           ACTIVE`);
   console.log(`DM Concurrency:     ${config.dmConcurrency}`);
+  console.log(`Deduplication:      ACTIVE`);
   console.log(`Gemini Retry Limit: ${config.geminiMaxRetries}`);
   console.log('========================================\n');
 
