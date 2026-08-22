@@ -13,9 +13,8 @@ export interface AgentConfig {
   walletApiUrl: string;
   geminiApiKey: string;
   geminiModel: string;
-  geminiFallbackModel: string;
+  geminiCooldownMs: number;
   geminiMaxRetries: number;
-  geminiRetryDelayMs: number;
   dmConcurrency: number;
   port: number;
   dataDir: string;
@@ -33,9 +32,8 @@ export function loadConfig(): AgentConfig {
   const walletApiUrl = (process.env.UNICITY_WALLET_API_URL || 'https://wallet-api.unicity.network').trim();
   const geminiApiKey = (process.env.GEMINI_API_KEY || '').trim().replace(/['"\s]/g, '');
   const geminiModel = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
-  const geminiFallbackModel = (process.env.GEMINI_FALLBACK_MODEL || '').trim();
-  const geminiMaxRetries = Math.max(1, parseInt(process.env.GEMINI_MAX_RETRIES || '3', 10));
-  const geminiRetryDelayMs = Math.max(500, parseInt(process.env.GEMINI_RETRY_DELAY_MS || '2000', 10));
+  const geminiCooldownMs = Math.max(10000, parseInt(process.env.GEMINI_COOLDOWN_MS || '60000', 10));
+  const geminiMaxRetries = Math.max(1, parseInt(process.env.GEMINI_MAX_RETRIES || '2', 10));
   const dmConcurrency = Math.max(1, parseInt(process.env.DM_CONCURRENCY || '1', 10));
   const port = parseInt(process.env.PORT || '3001', 10);
   const dataDir = path.resolve(process.env.AGENT_DATA_DIR || './data');
@@ -52,9 +50,8 @@ export function loadConfig(): AgentConfig {
     walletApiUrl,
     geminiApiKey,
     geminiModel,
-    geminiFallbackModel,
+    geminiCooldownMs,
     geminiMaxRetries,
-    geminiRetryDelayMs,
     dmConcurrency,
     port,
     dataDir

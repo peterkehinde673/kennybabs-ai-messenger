@@ -1,18 +1,18 @@
 import { loadConfig } from '../agent/config.js';
-import { generateAgentResponse } from '../agent/gemini.js';
+import { resolveAgentMessage } from '../agent/aiRouter.js';
 import { initializePersistentIdentity } from '../agent/identity.js';
 
 async function testDMAndAI() {
   console.log('🧪 Testing Gemini AI and P2P DM Subsystem...');
   const config = loadConfig();
 
-  console.log('\n1. Testing Google Gemini AI Connection with your API Key...');
+  console.log('\n1. Testing AI Router...');
   const testSender = '@kennybabs';
   const testQuestion = 'Hello Kennybabs! What is Unicity Sphere?';
   console.log(`   User Question: "${testQuestion}"`);
 
-  const aiReply = await generateAgentResponse(testSender, testQuestion, config);
-  console.log(`   🤖 Gemini AI Reply:\n   "${aiReply}"\n`);
+  const aiReply = await resolveAgentMessage(testSender, testQuestion, config);
+  console.log(`   🤖 Agent Reply (Source: ${aiReply.source}):\n   "${aiReply.text}"\n`);
 
   console.log('2. Initializing Persistent Identity...');
   const identity = await initializePersistentIdentity(config);

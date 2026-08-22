@@ -1,5 +1,5 @@
 import { AgentConfig } from './config.js';
-import { generateAgentResponse } from './gemini.js';
+import { resolveAgentMessage } from './aiRouter.js';
 import { updateDMStats, pushEvent } from './server.js';
 
 const processedMessageIds = new Set<string>();
@@ -76,16 +76,9 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
       });
       updateDMStats(true);
 
-      // Controlled single-model Gemini invocation
-      const aiResult = await generateAgentResponse(replyTarget, senderText, config);
-
-      // CRITICAL: If Gemini failed to generate a response, DO NOT send a DM or report [DM SENT]
-      if (!aiResult.success || !aiResult.text) {
-        console.warn(`[DM] No AI response generated for ${replyTarget} (${aiResult.error || 'failure'}). No outbound AI DM will be sent.`);
-        return;
-      }
-
-      const replyText = aiResult.text;
+      // Resolve response via Router (Local -> Gemini -> Fallback)
+      const routeResult = await resolveAgentMessage(replyTarget, senderText, config);
+      const replyText = routeResult.text;
 
       // Sequential bounded retry loop for sendDM (max 3 attempts)
       let delivered = false;
@@ -100,6 +93,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
           delivered = true;
           console.log(`[DM SENT]`);
           console.log(`Recipient: ${replyTarget}`);
+          console.log(`Source:    ${routeResult.source}`);
           console.log(`Timestamp: ${new Date().toLocaleTimeString()}`);
           console.log(`Success:   true`);
 
@@ -108,6 +102,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
             type: 'outgoing_dm',
             recipient: replyTarget,
             text: replyText,
+            source: routeResult.source,
             timestamp: new Date().toISOString()
           });
         } catch (err: any) {
@@ -125,9 +120,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
           if (first) processedMessageIds.delete(first);
         }
       } else {
-        console.error(`\n[DM DELIVERY FAILED]`);
-        console.error(`Message ID: ${msgId}`);
-        console.error(`Attempts:   ${attempt}/${maxAttempts}`);
+        console.error(`\n[DM DELIVERY FAILED] Message ID: ${msgId} | Attempts: ${attempt}/${maxAttempts}`);
       }
     } catch (err: any) {
       console.error('❌ Unhandled exception in DM pipeline:', err.message || err);
@@ -168,7 +161,7 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
 
     inFlightMessageIds.add(msgId);
 
-    // Enqueue for controlled sequential processing
+    // Enqueue for sequential processing
     queue.push({
       msgId,
       replyTarget,
@@ -182,5 +175,5 @@ export function setupDMListener(sphere: any, config: AgentConfig, directAddress:
     console.log(`💓 [HEARTBEAT ${new Date().toLocaleTimeString()}] Connected to Unicity Testnet2 relay. Listening for DMs to @${config.nametag}...`);
   }, 30000);
 
-  console.log('✅ Official Sphere DM listener registered with controlled concurrency queue.');
+  console.log('✅ Official Sphere DM listener registered with resilient AI router.');
 }

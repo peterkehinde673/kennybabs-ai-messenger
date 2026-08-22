@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import { getGeminiCooldownRemaining } from './gemini.js';
 
 export interface AgentRuntimeStats {
   status: string;
@@ -10,6 +11,10 @@ export interface AgentRuntimeStats {
   chainPublicKey: string;
   dmListenerActive: boolean;
   geminiActive: boolean;
+  geminiModel: string;
+  geminiCooldownRemainingSec: number;
+  fallbackActive: boolean;
+  dmConcurrency: number;
   uptimeSeconds: number;
   totalIncomingDms: number;
   totalOutgoingDms: number;
@@ -33,6 +38,10 @@ let currentStats: AgentRuntimeStats = {
   chainPublicKey: '',
   dmListenerActive: false,
   geminiActive: false,
+  geminiModel: 'gemini-2.5-flash',
+  geminiCooldownRemainingSec: 0,
+  fallbackActive: true,
+  dmConcurrency: 1,
   uptimeSeconds: 0,
   totalIncomingDms: 0,
   totalOutgoingDms: 0,
@@ -66,7 +75,6 @@ export function startStatusServer(port: number) {
   app.use(cors());
   app.use(express.json());
 
-  // Serve static visual dashboard files
   app.use(express.static(path.resolve('frontend')));
 
   app.get('/', (req, res) => {
@@ -75,9 +83,13 @@ export function startStatusServer(port: number) {
 
   app.get('/api/status', (req, res) => {
     const uptime = Math.floor((Date.now() - startTime) / 1000);
+    const cooldownRemaining = Math.ceil(getGeminiCooldownRemaining() / 1000);
+
     res.json({
       ...currentStats,
       uptimeSeconds: uptime,
+      geminiCooldownRemainingSec: cooldownRemaining,
+      geminiStatus: cooldownRemaining > 0 ? 'COOLDOWN' : (currentStats.geminiActive ? 'ACTIVE' : 'NO_KEY'),
       totalIncomingDms: incomingCount,
       totalOutgoingDms: outgoingCount,
       lastIncomingTimestamp: lastIncomingTime,

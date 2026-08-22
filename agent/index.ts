@@ -6,10 +6,10 @@ import { startStatusServer, updateRuntimeStats } from './server.js';
 async function main() {
   const config = loadConfig();
 
-  // Start local status API server on port 3001
+  // Start status server on port 3001
   startStatusServer(config.port);
 
-  // Initialize persistent wallet identity from SDK
+  // Initialize persistent wallet identity
   const identity = await initializePersistentIdentity(config);
 
   console.log('\n========================================');
@@ -24,16 +24,17 @@ async function main() {
   console.log(`DM Listener:        ACTIVE`);
   console.log(`AI Provider:        Gemini`);
   console.log(`AI Model:           ${config.geminiModel}`);
+  console.log(`AI Fallback Engine: ACTIVE (Deterministic Local + Contextual)`);
+  console.log(`Gemini Cooldown:    ${config.geminiCooldownMs / 1000}s`);
   console.log(`DM Queue:           ACTIVE`);
   console.log(`DM Concurrency:     ${config.dmConcurrency}`);
   console.log(`Deduplication:      ACTIVE`);
-  console.log(`Gemini Retry Limit: ${config.geminiMaxRetries}`);
   console.log('========================================\n');
 
-  // Register single direct-message listener with controlled queue
+  // Register single DM listener
   setupDMListener(identity.sphere, config, identity.directAddress);
 
-  // Update server status state
+  // Update server state
   updateRuntimeStats({
     status: 'online',
     network: config.network,
@@ -41,7 +42,9 @@ async function main() {
     directAddress: identity.directAddress,
     chainPublicKey: identity.chainPublicKey,
     dmListenerActive: true,
-    geminiActive: !!config.geminiApiKey
+    geminiActive: !!config.geminiApiKey,
+    geminiModel: config.geminiModel,
+    dmConcurrency: config.dmConcurrency
   });
 }
 
